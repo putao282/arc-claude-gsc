@@ -94,6 +94,10 @@ RETRYABLE_MARKERS = (
     "status 503",
     "status 504",
     "status 529",
+    # Autocompact thrash / rapid refill: retry with preserved workspace (self-heal).
+    "rapid_refill",
+    "autocompact is thrashing",
+    "context refilled",
 )
 
 NON_RETRYABLE_MARKERS = (
@@ -969,7 +973,7 @@ def ensure_gsc_spec(output_dir: Path, module: RequirementModule) -> Path:
         f'    <section id="s-req" data-section="requirements" data-req="{_html_escape(module.node_id)}" '
         'data-req-status="unknown" data-req-domain="arcbench">\n'
         f"      <h2>{title}</h2>\n"
-        "      <p>Implement from the task JSON in the agent prompt. Prefer GSC MCP SPEC tools when available.</p>\n"
+        "      <p>Implement from the task JSON in the agent prompt. Prefer GSC MCP SPEC tools when available.</p>\n"        "      <p data-arc-spawn>ARC: implement in the main session; avoid Agent/Task spawn. If you must spawn a coding subagent, include a literal ## TASK-HEADER block (task/domain/archaeology/reuse-decision/scope/completion/retry/stop). WaitForMcpServers at most once. Harness vitest/npm test grants green.</p>\n"
         f"      <p data-arc-brief>{brief}</p>\n"
         "    </section>\n"
         "  </main>\n"
@@ -978,6 +982,37 @@ def ensure_gsc_spec(output_dir: Path, module: RequirementModule) -> Path:
         encoding="utf-8",
     )
     return html_path
+
+
+def ensure_arc_spawn_gate_softener(output_dir: Path) -> None:
+    """Soften GSC SPAWN-GATE without disabling MCP.
+
+    GSC PreToolUse[Agent|Task] hard-denies coding spawns missing ## TASK-HEADER
+    (REQ-AGENTGOV-2). On ARC smoke that burns turns/tokens and feeds autocompact
+    rapid_refill. Official escape hatch: .claude/spawn-gate-off (requires CLAUDE.md
+    so findProjectRoot resolves). Also keep a short CLAUDE.md that *encourages*
+    GSC MCP rather than banning it.
+    """
+    claude_md = output_dir / "CLAUDE.md"
+    if not claude_md.exists():
+        claude_md.write_text(
+            "# ARC-Bench project\n\n"
+            "Use GSC MCP SPEC / planning tools when available.\n"
+            "Prefer implementing in the main Claude session.\n"
+            "Do not spawn Agent/Task subagents for this ARC module unless a full "
+            "`## TASK-HEADER` block is included.\n"
+            "If WaitForMcpServers appears, wait once then continue.\n"
+            "Harness local tests (frontend vitest/npm test) grant green — not MCP alone.\n",
+            encoding="utf-8",
+        )
+    off = output_dir / ".claude" / "spawn-gate-off"
+    off.parent.mkdir(parents=True, exist_ok=True)
+    if not off.exists():
+        off.write_text(
+            "# ARC packaged runtime: disable SPAWN-GATE hard deny (REQ-AGENTGOV-2).\n"
+            "# MCP stays ON. Soft reminders may still appear if Agent is used.\n",
+            encoding="utf-8",
+        )
 
 
 def module_prompt(
@@ -1019,7 +1054,10 @@ def module_prompt(
 
         The current working directory is the persistent generated project. Preserve working features from earlier modules.
         Use GSC actively (including GSC MCP SPEC / planning / validation tools) for requirements, implementation planning, coding, validation, and state tracking rather than bypassing it.
+        Prefer the HTML SPEC under SPEC/arcbench/ via GSC MCP spec_read/spec_write; do not invent Markdown SPEC that forces migrate.
         If WaitForMcpServers appears, wait once for GSC MCP readiness then continue implementation; do not loop reconnecting or dump huge unrelated context.
+        SPAWN thrash control: implement this module in the main Claude session. Do NOT spawn Agent/Task subagents. If a coding spawn is unavoidable, the prompt MUST start with a literal line "## TASK-HEADER" (no trailing colon) plus task/domain/archaeology/reuse-decision/scope/completion/retry/stop fields — otherwise GSC SPAWN-GATE fail-closes.
+        Keep tool outputs small: read files in chunks, avoid pasting huge lockfiles/schemas into the conversation (prevents autocompact rapid_refill_breaker).
 
         {skills_text}
         If ARC skills are present, read the runtime-signals, traceability, and checkpoint skill instructions and record detailed requirement-to-interface/file/test traceability.
@@ -1214,6 +1252,14 @@ def main() -> int:
                 "mcp_enabled": enable_mcp,
                 "mcp_config": str(mcp_config_path) if mcp_config_path else None,
                 "mcp_timeout_ms": mcp_timeout_ms,
+                "thrash_mitigations": [
+                    "spawn_gate_off",
+                    "disallow_Agent_Task",
+                    "WaitForMcpServers_once_guidance",
+                    "html_spec",
+                    "autocompact_120000",
+                    "rapid_refill_retryable",
+                ],
             },
             ensure_ascii=False,
         ),
@@ -1240,6 +1286,7 @@ def main() -> int:
 
             print(f"[arc-claude-gsc] module {module.index}/{module.total}: {module.node_id} - {module.name}", flush=True)
             spec_path = ensure_gsc_spec(output_dir, module)
+            ensure_arc_spawn_gate_softener(output_dir)
             runtime.events.mark_design_started(module.node_id, f"Planning {module.name} from {spec_path.relative_to(output_dir)}")
             runtime.events.mark_design_done(module.node_id, f"Delegated {module.name} to Claude Code + GSC")
 
@@ -1305,6 +1352,10 @@ def main() -> int:
                     *claude_mcp_cli_args(enabled=enable_mcp, mcp_config=mcp_config_path),
                     "--model",
                     model,
+                    "--disallowedTools",
+                    "Agent,Task",
+                    "--autocompact",
+                    "120000",
                     "--permission-mode",
                     "bypassPermissions",
                     "--no-session-persistence",
