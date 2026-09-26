@@ -193,5 +193,39 @@ class SelfHealTests(unittest.TestCase):
         )
 
 
+    def test_rapid_refill_stops_before_full_retry_budget(self):
+        calls = {"n": 0}
+
+        def run_attempt(attempt):
+            calls["n"] += 1
+            return mod.ClaudeRunResult(
+                returncode=1,
+                is_error=True,
+                terminal_reason="rapid_refill_breaker",
+                subtype="success",
+                api_error_status=None,
+                tail="autocompact is thrashing: rapid_refill",
+            )
+
+        old = mod.os.environ.get("ARC_RAPID_REFILL_MAX_ATTEMPTS")
+        try:
+            mod.os.environ["ARC_RAPID_REFILL_MAX_ATTEMPTS"] = "2"
+            result, attempts = mod.execute_with_retry(
+                run_attempt,
+                max_retries=5,
+                base_seconds=0,
+                max_seconds=0,
+                sleep_fn=lambda _s: None,
+            )
+        finally:
+            if old is None:
+                mod.os.environ.pop("ARC_RAPID_REFILL_MAX_ATTEMPTS", None)
+            else:
+                mod.os.environ["ARC_RAPID_REFILL_MAX_ATTEMPTS"] = old
+        self.assertEqual(attempts, 2)
+        self.assertEqual(calls["n"], 2)
+        self.assertEqual(result.terminal_reason, "rapid_refill_breaker")
+
+
 if __name__ == "__main__":
     unittest.main()

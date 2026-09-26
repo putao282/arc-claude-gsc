@@ -85,6 +85,10 @@ class McpRestoreTests(unittest.TestCase):
             self.assertEqual(server["command"], "node")
             self.assertEqual(server["args"], [str(bootstrap)])
             self.assertEqual(server["env"]["CLAUDE_PLUGIN_ROOT"], str(gsc))
+            self.assertIn("allowedTools", server)
+            self.assertIn("spec_read", server["allowedTools"])
+            self.assertIn("spec_write", server["allowedTools"])
+            self.assertLessEqual(len(server["allowedTools"]), 20)
 
     def test_claude_mcp_cli_args_default_enables_gsc(self):
         cfg = Path("/tmp/gsc-mcp.json")

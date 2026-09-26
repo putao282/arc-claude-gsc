@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import atexit
 from collections import deque
 import hashlib
 import importlib.metadata
@@ -146,17 +147,96 @@ def env_bool(name: str, default: bool = True) -> bool:
     die(f"{name} must be a boolean (1/0 true/false), got {raw!r}")
 
 
+
+
+def _arc_maybe_start_anthropic_proxy(base_url: str, api_key: str, model: str) -> subprocess.Popen | None:
+    """Claude Messages -> OpenAI chat. Client auth MUST be ANTHROPIC_API_KEY=arc-local."""
+    gateway_bin = SUBMISSION_DIR / "runtime" / "gateway" / "anthropic-proxy"
+    if not gateway_bin.is_file() or env_bool("ARC_DISABLE_ANTHROPIC_PROXY", False):
+        return None
+    gateway_bin.chmod(0o755)
+    chat = base_url.rstrip("/")
+    if not chat.endswith("/chat/completions"):
+        chat = chat + ("/chat/completions" if chat.endswith("/v1") else "/v1/chat/completions")
+    artifacts = Path(os.environ.get("ARCBENCH_ARTIFACTS_DIR", "/tmp/arcbench-artifacts"))
+    artifacts.mkdir(parents=True, exist_ok=True)
+    log_path = artifacts / "anthropic-proxy.log"
+    env = os.environ.copy()
+    env.update({
+        "ANTHROPIC_PROXY_LISTEN_ADDR": "127.0.0.1:8787",
+        "ANTHROPIC_PROXY_UPSTREAM_URL": chat,
+        "ANTHROPIC_PROXY_UPSTREAM_API_KEY": api_key,
+        "ANTHROPIC_PROXY_DEFAULT_MODEL": model,
+        "ANTHROPIC_PROXY_FORCE_MODEL": "1",
+        "ANTHROPIC_PROXY_TOOL_FORMAT": "native",
+        "ANTHROPIC_PROXY_CLIENT_KEY": "arc-local",
+        "ANTHROPIC_PROXY_LOG_LEVEL": os.environ.get("ARC_GATEWAY_LOG_LEVEL", "info"),
+        "ANTHROPIC_PROXY_REQUEST_TIMEOUT_SEC": "600",
+    })
+    logf = open(log_path, "w", encoding="utf-8")
+    proc = subprocess.Popen([str(gateway_bin), "serve"], cwd=str(SUBMISSION_DIR), env=env, stdout=logf, stderr=subprocess.STDOUT)
+    import urllib.request
+    deadline = time.time() + 20
+    last_err = None
+    while time.time() < deadline:
+        if proc.poll() is not None:
+            raise RuntimeError(f"anthropic-proxy exited early rc={proc.returncode}; see {log_path}")
+        try:
+            with urllib.request.urlopen("http://127.0.0.1:8787/health", timeout=1) as resp:
+                if resp.status < 500:
+                    print(json.dumps({"event":"anthropic_proxy","action":"started","listen":"127.0.0.1:8787","upstream_chat":chat,"upstream_host":upstream_host(base_url),"client_key":"arc-local","log":str(log_path)}, ensure_ascii=False), flush=True)
+                    return proc
+        except Exception as exc:
+            last_err = exc
+            time.sleep(0.2)
+    proc.kill()
+    raise RuntimeError(f"anthropic-proxy health check failed: {last_err}")
+
+
 def mcp_enabled() -> bool:
     """GSC MCP is ON by default. Set ARC_ENABLE_MCP=0 only as an explicit escape hatch."""
     return env_bool("ARC_ENABLE_MCP", True)
 
 
+# GSC MCP exposes ~70 tools (~63k schema tokens). Autocompact then re-injects
+# them and trips rapid_refill_breaker. Keep MCP ON but advertise only SPEC/state
+# essentials via Claude mcp-config allowedTools (server stays connected).
+DEFAULT_GSC_MCP_ALLOWED_TOOLS = (
+    "spec_read",
+    "spec_write",
+    "state_read",
+    "state_update",
+    "lifecycle",
+    "query",
+    "artifact_read",
+    "artifact_grep",
+    "commit_gate",
+    "workflow_guard",
+    "prd",
+)
+
+
+def gsc_mcp_allowed_tools() -> list[str]:
+    """MCP tool allowlist (short names). Override with ARC_MCP_ALLOWED_TOOLS=a,b,c."""
+    raw = os.environ.get("ARC_MCP_ALLOWED_TOOLS", "").strip()
+    if raw:
+        tools = [part.strip() for part in raw.replace(";", ",").split(",") if part.strip()]
+        if tools:
+            return tools
+    return list(DEFAULT_GSC_MCP_ALLOWED_TOOLS)
+
+
 def write_gsc_mcp_config(gsc_dir: Path, dest_dir: Path) -> Path:
-    """Write a Claude --mcp-config that points at the packaged GSC bootstrap."""
+    """Write a Claude --mcp-config that points at the packaged GSC bootstrap.
+
+    Includes allowedTools so Claude loads SPEC/state schemas only — MCP stays
+    connected (WaitForMcpServers still allowed) without the full ~70-tool surface.
+    """
     dest_dir.mkdir(parents=True, exist_ok=True)
     bootstrap = gsc_dir / "mcp" / "src" / "bootstrap.mjs"
     require_file(bootstrap, "GSC MCP bootstrap")
     config_path = dest_dir / "gsc-mcp.json"
+    allowed = gsc_mcp_allowed_tools()
     payload = {
         "mcpServers": {
             "arch": {
@@ -167,6 +247,7 @@ def write_gsc_mcp_config(gsc_dir: Path, dest_dir: Path) -> Path:
                     "GSC_ARC_PACKAGED_RUNTIME": "1",
                     "GSC_RUNTIME_SERVER_BIN": str(gsc_dir / "bin" / "gsc-spec-server"),
                 },
+                "allowedTools": allowed,
             }
         }
     }
@@ -284,6 +365,13 @@ def execute_with_retry(
     sleep_fn=time.sleep,
 ) -> tuple[ClaudeRunResult, int]:
     total_attempts = max_retries + 1
+    # Cap rapid_refill self-heal: schema refill usually repeats every attempt and
+    # burned ~$2 on 6 doomed loops in v5e. Prefer tool-surface shrink; this is the
+    # budget backstop (default 2 attempts = 1 + 1 retry).
+    max_rapid_refill_attempts = env_int(
+        "ARC_RAPID_REFILL_MAX_ATTEMPTS", 2, minimum=1, maximum=total_attempts
+    )
+    rapid_refill_hits = 0
     last_result: ClaudeRunResult | None = None
     for attempt in range(1, total_attempts + 1):
         result = run_attempt(attempt)
@@ -291,6 +379,25 @@ def execute_with_retry(
         classification = classify_claude_failure(result)
         if not (result.returncode != 0 or result.is_error):
             return result, attempt
+        if "rapid_refill" in classification.reason:
+            rapid_refill_hits += 1
+            if rapid_refill_hits >= max_rapid_refill_attempts:
+                print(
+                    json.dumps(
+                        {
+                            "event": "rapid_refill_budget_exhausted",
+                            "attempt": attempt,
+                            "rapid_refill_hits": rapid_refill_hits,
+                            "max_rapid_refill_attempts": max_rapid_refill_attempts,
+                            "classification": classification.reason,
+                            "terminal_reason": result.terminal_reason or "unknown",
+                            "note": "stopping self-heal to avoid doomed refill loops; MCP stays ON",
+                        },
+                        ensure_ascii=False,
+                    ),
+                    flush=True,
+                )
+                return result, attempt
         if not classification.retryable or attempt >= total_attempts:
             return result, attempt
         delay = retry_delay_seconds(attempt, base_seconds, max_seconds)
@@ -997,11 +1104,11 @@ def ensure_arc_spawn_gate_softener(output_dir: Path) -> None:
     if not claude_md.exists():
         claude_md.write_text(
             "# ARC-Bench project\n\n"
-            "Use GSC MCP SPEC / planning tools when available.\n"
-            "Prefer implementing in the main Claude session.\n"
+            "Use GSC MCP SPEC tools (spec_read/spec_write/state_*) when available.\n"
+            "Prefer implementing in the main Claude session with Bash/Edit/Write/Read.\n"
             "Do not spawn Agent/Task subagents for this ARC module unless a full "
             "`## TASK-HEADER` block is included.\n"
-            "If WaitForMcpServers appears, wait once then continue.\n"
+            "If WaitForMcpServers appears, wait once then continue; do not dump schemas.\n"
             "Harness local tests (frontend vitest/npm test) grant green — not MCP alone.\n",
             encoding="utf-8",
         )
@@ -1039,9 +1146,10 @@ def module_prompt(
         )
     elif attempt > 1:
         recovery_text = (
-            f"RECOVERY ATTEMPT {attempt}: the previous Claude process ended because of a transient upstream/API failure. "
-            "The workspace, GSC state, and all files were intentionally preserved. Inspect the current workspace first, "
-            "continue this same requirement from the existing partial implementation, and do not redo previously passed ROOT modules."
+            f"RECOVERY ATTEMPT {attempt}: previous Claude ended on a transient failure (often autocompact "
+            "rapid_refill). Workspace files were preserved. Inspect existing files first; continue this module; "
+            "do not redo passed ROOT modules. Prefer Bash/Edit/Write/Read plus GSC MCP spec_read/spec_write/"
+            "state_*; do not dump lockfiles or re-list huge tool schemas."
         )
     return textwrap.dedent(f"""
         You are implementing an ARC-Bench Agentic Software Factory task using original Claude Code with the GSC plugin and GSC MCP loaded.
@@ -1212,13 +1320,26 @@ def main() -> int:
     env["MCP_TIMEOUT"] = str(mcp_timeout_ms)
     env["PATH"] = os.pathsep.join([str(gsc_dir / "bin"), str(gsc_dir / "lsp" / "web" / "node_modules" / ".bin"), env.get("PATH", "")])
 
-    # ARC-Bench's official Claude starter maps the injected OpenAI-compatible
-    # credentials directly to Claude Code's Anthropic environment. This removes
-    # the protocol bridge from the uploaded agent.
+    gateway_proc = _arc_maybe_start_anthropic_proxy(base_url, api_key, model)
     claude_env = env.copy()
-    claude_env["ANTHROPIC_BASE_URL"] = base_url
-    claude_env["ANTHROPIC_AUTH_TOKEN"] = api_key
-    claude_env["ANTHROPIC_API_KEY"] = ""
+    if gateway_proc is not None:
+        claude_env["ANTHROPIC_BASE_URL"] = "http://127.0.0.1:8787"
+        claude_env["ANTHROPIC_API_KEY"] = "arc-local"
+        for _k in ("ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY_OLD", "CLAUDE_CODE_API_KEY"):
+            claude_env.pop(_k, None)
+    else:
+        claude_env["ANTHROPIC_BASE_URL"] = base_url
+        claude_env["ANTHROPIC_AUTH_TOKEN"] = api_key
+        claude_env["ANTHROPIC_API_KEY"] = ""
+    if gateway_proc is not None:
+        def _stop_gateway(proc=gateway_proc):
+            if proc.poll() is None:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=5)
+                except Exception:
+                    proc.kill()
+        atexit.register(_stop_gateway)
     for key in ("SUDO_USER", "SUDO_UID", "SUDO_GID"):
         claude_env.pop(key, None)
     if identity is not None:
@@ -1252,13 +1373,17 @@ def main() -> int:
                 "mcp_enabled": enable_mcp,
                 "mcp_config": str(mcp_config_path) if mcp_config_path else None,
                 "mcp_timeout_ms": mcp_timeout_ms,
+                "anthropic_proxy": gateway_proc is not None,
+                "mcp_allowed_tools": gsc_mcp_allowed_tools() if enable_mcp else [],
                 "thrash_mitigations": [
                     "spawn_gate_off",
-                    "disallow_Agent_Task",
+                    "disallow_Agent_Task_and_bloat_builtins",
+                    "mcp_allowedTools_spec_subset",
                     "WaitForMcpServers_once_guidance",
                     "html_spec",
-                    "autocompact_120000",
-                    "rapid_refill_retryable",
+                    "disable_slash_commands",
+                    "autocompact_200000",
+                    "rapid_refill_retryable_capped",
                 ],
             },
             ensure_ascii=False,
@@ -1351,11 +1476,19 @@ def main() -> int:
                     str(gsc_dir),
                     *claude_mcp_cli_args(enabled=enable_mcp, mcp_config=mcp_config_path),
                     "--model",
-                    model,
+                    ("sonnet" if gateway_proc is not None else model),
+                    # Keep MCP ON; shrink builtin bloat. WaitForMcpServers NOT banned.
+                    # MCP schema shrink is via mcp-config allowedTools (SPEC subset).
                     "--disallowedTools",
-                    "Agent,Task",
+                    (
+                        "Agent,Task,Skill,WebSearch,WebFetch,"
+                        "CronCreate,CronDelete,CronList,NotebookEdit,"
+                        "EnterWorktree,ExitWorktree,ListAgents,"
+                        "ScheduleWakeup,SendMessage,Workflow,DesignSync,ReportFindings"
+                    ),
+                    "--disable-slash-commands",
                     "--autocompact",
-                    "120000",
+                    "200000",
                     "--permission-mode",
                     "bypassPermissions",
                     "--no-session-persistence",
@@ -1366,7 +1499,8 @@ def main() -> int:
                 if max_budget_usd:
                     command.extend(["--max-budget-usd", max_budget_usd])
                 attempt_env = claude_env.copy()
-                attempt_env["ANTHROPIC_BASE_URL"] = attempt_base_url
+                if gateway_proc is None:
+                    attempt_env["ANTHROPIC_BASE_URL"] = attempt_base_url
                 return run_claude_streaming(
                     command,
                     cwd=output_dir,
