@@ -4,6 +4,35 @@ import sys
 import unittest
 from pathlib import Path
 
+
+
+def _install_test_stubs():
+    """Allow loading main.py when ARC/Claude runtime wheels are absent."""
+    import sys
+    import types
+    try:
+        import claude_agent_sdk  # noqa: F401
+    except ImportError:
+        sys.modules["claude_agent_sdk"] = types.ModuleType("claude_agent_sdk")
+    try:
+        import arcbench_agent_runtime  # noqa: F401
+    except ImportError:
+        runtime = types.ModuleType("arcbench_agent_runtime")
+        class AgentRuntime:  # noqa: D401
+            """Test stub."""
+        runtime.AgentRuntime = AgentRuntime
+        sys.modules["arcbench_agent_runtime"] = runtime
+    try:
+        import yaml  # noqa: F401
+    except ImportError:
+        yaml_mod = types.ModuleType("yaml")
+        def safe_load(text):
+            raise RuntimeError("PyYAML not installed in this test environment")
+        yaml_mod.safe_load = safe_load
+        sys.modules["yaml"] = yaml_mod
+
+_install_test_stubs()
+
 ROOT = Path(__file__).resolve().parents[2]
 if not (ROOT / "main.py").is_file() and Path("/workspace/submission/main.py").is_file():
     ROOT = Path("/workspace/submission")
@@ -64,6 +93,9 @@ class SelfHealTests(unittest.TestCase):
         self.assertFalse(c.retryable)
 
     def test_passed_module_is_skipped_on_resume(self):
+        import tempfile
+        from pathlib import Path
+
         class Traceability:
             @staticmethod
             def get_node_state(node_id):
@@ -72,7 +104,16 @@ class SelfHealTests(unittest.TestCase):
         class Runtime:
             traceability = Traceability()
 
-        self.assertTrue(mod.module_already_passed(Runtime(), "REQ-1"))
+        # PASSED without harness receipt must NOT skip (anti false-green freeze).
+        self.assertFalse(mod.module_already_passed(Runtime(), "REQ-1"))
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp)
+            self.assertFalse(mod.module_already_passed(Runtime(), "REQ-1", output))
+            ok = mod.ValidationResult(
+                True, 0, ["npx", "--yes", "vitest", "run"], "ok", "harness local validation passed", str(output)
+            )
+            mod.write_validation_receipt(output, "REQ-1", ok)
+            self.assertTrue(mod.module_already_passed(Runtime(), "REQ-1", output))
 
     def test_explicit_fallback_switches_only_when_configured(self):
         old = mod.os.environ.get("ARC_FALLBACK_BASE_URLS")

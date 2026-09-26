@@ -66,7 +66,7 @@ The adapter treats transient model-gateway failures as recoverable at the ROOT-c
 
 Retryable examples include upstream connection resets, timeouts, HTTP 429, and HTTP 5xx/529. Authentication failures, invalid API keys, invalid model/configuration errors, context-limit failures, and `budget_exhausted` stop immediately. A `400` response is only retried when its error text contains a transient upstream/network marker.
 
-Every retry preserves the current output worktree and GSC state. The retry prompt tells Claude Code to inspect and continue the partially implemented requirement instead of restarting previous modules. If `main.py` is launched again against the same workspace, a one-time initialization marker prevents the starter template from overwriting existing work, and requirements whose ARC node state is already `PASSED` are skipped.
+Every retry preserves the current output worktree and GSC state. The retry prompt tells Claude Code to inspect and continue the partially implemented requirement instead of restarting previous modules. If `main.py` is launched again against the same workspace, a one-time initialization marker prevents the starter template from overwriting existing work, and requirements whose ARC node state is already `PASSED` **and** that have a harness validation receipt are skipped (see anti-false-green section).
 
 Runtime controls:
 
@@ -77,6 +77,9 @@ ARC_RETRY_MAX_SECONDS=60
 ARC_MAX_BUDGET_USD=50
 ARC_ENABLE_MCP=1
 MCP_TIMEOUT=60000
+ARC_VALIDATION_MAX_REPAIRS=2
+ARC_VALIDATION_TIMEOUT_SECONDS=300
+ARC_FORCE_REVALIDATE=0
 ```
 
 GSC MCP is **enabled by default**. `main.py` writes an explicit Claude `--mcp-config` pointing at the packaged GSC `mcp/src/bootstrap.mjs`, and pairs it with `--strict-mcp-config` so only that GSC server is loaded (hooks still come from `--plugin-dir`). Claude `-p` waits for MCP connect up to `MCP_TIMEOUT` ms before the first turn — a softer thrash mitigation than banning `WaitForMcpServers` / MCP tools. Set `ARC_ENABLE_MCP=0` only as an explicit escape hatch (still does not inject "do not use MCP" prompt bans). SPEC scaffolds are HTML 2.0 so GSC MCP can use `spec_read`/`spec_write` without the Markdown migrate dead-end.
@@ -88,6 +91,30 @@ ARC_FALLBACK_BASE_URLS=https://backup.example/v1,https://backup2.example/v1
 ```
 
 There is no implicit fallback to another provider. Logs emit only upstream host names, retry counts, status/classification, backoff duration, and whether the next attempt switches hosts; API keys are never logged.
+
+
+## Harness local validation (anti-false-green)
+
+Claude session success (`returncode==0` and `!is_error`) is **not** enough for `mark_test_passed`. After each successful ROOT-module Claude session, the harness itself runs local validation:
+
+1. Prefer `frontend/` (else output root) `package.json`.
+2. Require at least one test file (`*.test.*` / `*.spec.*` / `__tests__`); **zero tests cannot green**.
+3. Run `npx vitest run` when vitest is configured, otherwise `npm test`.
+4. Only on exit 0: `mark_implementation_done` + `mark_test_passed(..., "Harness local validation passed")`, and write receipt:
+   - `.arc/validation/<safe_node_id>.ok`
+   - `.arc/validation/<safe_node_id>.json` (cmd, exit_code, log tail)
+
+On validation failure the harness calls `mark_test_failed` and enters a **repair loop separate from API self-heal**:
+
+- `ARC_VALIDATION_MAX_REPAIRS` (default **2**) = max **repair Claude sessions** after the first validation failure.
+- Total validation attempts = `1 + ARC_VALIDATION_MAX_REPAIRS` (default 3).
+- Failure logs are injected into the next Claude prompt (`VALIDATION REPAIR N`).
+- Validation failures are classified `non-retryable:validation` and are **never** treated as API/connection retries.
+- When repairs are exhausted the module stays test-failed / run-failed — **no fake green**.
+
+Resume skip (`module_already_passed`) only applies when node state is `PASSED` **and** a validation receipt `.ok` exists. Set `ARC_FORCE_REVALIDATE=1` to ignore skip and re-run Claude + validation.
+
+GSC MCP remains enabled by default; MCP SPEC status helps planning but does **not** grant harness green or platform score.
 
 ## Pinned components
 
@@ -163,7 +190,8 @@ The smoke verifies:
 - `SPEC/arcbench/*`, runner events, traceability, and git checkpoints are produced;
 - a real Claude Code tool call modifies the requested output directory;
 - an injected `400 upstream ... connection reset by peer` terminates the first Claude process, triggers module-level retry, observes a recovery prompt on the second process, and still completes successfully;
-- retry classification unit tests cover reset/429/5xx, non-retryable 400/auth/budget errors, capped backoff, explicit fallback routing, and PASSED-module resume behavior.
+- retry classification unit tests cover reset/429/5xx, non-retryable 400/auth/budget errors, capped backoff, explicit fallback routing, and PASSED-module resume behavior;
+- false-green gate unit tests cover Claude-success-alone ≠ green, validation fail/repair/exhaust, validation pass → green + receipt, and prompt harness-bar wording.
 
 The smoke uses `anthropic-proxy` only to emulate ARC's Anthropic-compatible endpoint in front of a deterministic local OpenAI mock. The proxy is test-only and is not packaged.
 

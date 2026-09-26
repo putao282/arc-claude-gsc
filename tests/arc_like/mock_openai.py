@@ -64,18 +64,33 @@ class Handler(BaseHTTPRequestHandler):
         if has_tool_result:
             return self.respond_text(stream, "Done. The requested file has been created.")
 
-        tool_name = next((name for name in names if name == "Write"), None)
+        # Prefer Bash so smoke can also plant a minimal frontend test tree for the
+        # harness validation gate (Claude success alone must not mark_test_passed).
+        tool_name = next((name for name in names if name == "Bash"), None)
         arguments = None
+        smoke_setup = (
+            "mkdir -p /workspace/output/frontend/tests && "
+            "printf 'ARC_CLAUDE_GSC_OK\\n' > /workspace/output/ARC_SMOKE.txt && "
+            "printf '%s\\n' "
+            "'{\"name\":\"arc-smoke-frontend\",\"private\":true,"
+            "\"scripts\":{\"test\":\"node ./tests/smoke.test.js\"}}' "
+            "> /workspace/output/frontend/package.json && "
+            "printf '%s\\n' "
+            "'const fs=require(\"fs\");"
+            "const p=require(\"path\").resolve(__dirname,\"..\",\"..\",\"ARC_SMOKE.txt\");"
+            "if(!fs.existsSync(p)||fs.readFileSync(p,\"utf8\").trim()!==\"ARC_CLAUDE_GSC_OK\")"
+            "{console.error(\"bad marker\");process.exit(1)}"
+            "console.log(\"smoke harness validation ok\");' "
+            "> /workspace/output/frontend/tests/smoke.test.js"
+        )
         if tool_name:
-            arguments = {
-                "file_path": "/workspace/output/ARC_SMOKE.txt",
-                "content": "ARC_CLAUDE_GSC_OK\n",
-            }
+            arguments = {"command": smoke_setup}
         else:
-            tool_name = next((name for name in names if name == "Bash"), None)
+            tool_name = next((name for name in names if name == "Write"), None)
             if tool_name:
                 arguments = {
-                    "command": "printf 'ARC_CLAUDE_GSC_OK\\n' > /workspace/output/ARC_SMOKE.txt"
+                    "file_path": "/workspace/output/ARC_SMOKE.txt",
+                    "content": "ARC_CLAUDE_GSC_OK\n",
                 }
 
         if not tool_name:

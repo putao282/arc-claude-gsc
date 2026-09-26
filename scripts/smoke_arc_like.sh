@@ -62,6 +62,35 @@ if [[ -d "$WORK" ]]; then
 fi
 mkdir -p "$WORK"/{submission,requirements,output,tests,artifacts}
 
+# Minimal frontend test tree so harness validation (anti-false-green) can pass in smoke.
+# Production runs still require Claude to create real tests; smoke only proves the gate path.
+mkdir -p "$WORK/output/frontend/tests"
+cat > "$WORK/output/frontend/package.json" <<'PKG'
+{
+  "name": "arc-smoke-frontend",
+  "private": true,
+  "scripts": {
+    "test": "node ./tests/smoke.test.js"
+  }
+}
+PKG
+cat > "$WORK/output/frontend/tests/smoke.test.js" <<'JS'
+const fs = require("fs");
+const path = require("path");
+const marker = path.resolve(__dirname, "..", "..", "ARC_SMOKE.txt");
+if (!fs.existsSync(marker)) {
+  console.error("ARC_SMOKE.txt missing; Claude module work not present yet");
+  process.exit(1);
+}
+const body = fs.readFileSync(marker, "utf8").trim();
+if (body !== "ARC_CLAUDE_GSC_OK") {
+  console.error("unexpected ARC_SMOKE.txt contents:", body);
+  process.exit(1);
+}
+console.log("smoke harness validation ok");
+process.exit(0);
+JS
+
 python3 - "$DIST/submission.zip" "$WORK/submission" <<'PY'
 import sys, zipfile
 with zipfile.ZipFile(sys.argv[1]) as zf:
@@ -73,6 +102,7 @@ cp "$ROOT/tests/arc_like/mock_openai.py" \
    "$ROOT/tests/arc_like/arcbench_runtime_sha256.json" \
    "$ROOT/tests/arc_like/test_self_heal.py" \
    "$ROOT/tests/arc_like/test_mcp_restore.py" \
+   "$ROOT/tests/arc_like/test_false_green_gate.py" \
    "$WORK/tests/"
 
 # The production slim agent talks directly to ARC-Bench's Anthropic-compatible
@@ -125,6 +155,7 @@ cd /workspace/output
 python3 /workspace/tests/verify_arcbench_runtime.py
 python3 /workspace/tests/test_self_heal.py
 python3 /workspace/tests/test_mcp_restore.py
+python3 /workspace/tests/test_false_green_gate.py
 
 ARC_MOCK_REQUIRE_RECOVERY=1 python3 /workspace/tests/mock_openai.py >/workspace/artifacts/mock.log 2>&1 &
 mockpid=$!
@@ -179,6 +210,9 @@ require_grep 'connection reset' "$WORK/artifacts/mock.log" "fault injection did 
 require_grep 'recovery prompt observed' "$WORK/artifacts/mock.log" "recovery attempt did not reach mock"
 require_grep '"state": "paused"' "$WORK/output/.arc/runner-events.jsonl" "runner pause event missing"
 require_grep '"state": "resumed"' "$WORK/output/.arc/runner-events.jsonl" "runner resume event missing"
+require_grep '"event": "module_validation"' "$WORK/artifacts/main.out" "module_validation event missing"
+require_file "$WORK/output/.arc/validation/REQ-SMOKE-A.ok"
+require_file "$WORK/output/.arc/validation/REQ-SMOKE-B.ok"
 
 commit_count="$(git -c safe.directory="$WORK/output" -C "$WORK/output" rev-list --count HEAD)"
 [[ "$commit_count" -ge 3 ]] || {

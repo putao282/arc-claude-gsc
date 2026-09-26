@@ -58,6 +58,17 @@ class FailureClassification:
     reason: str
 
 
+@dataclass(frozen=True)
+class ValidationResult:
+    """Harness-owned local test gate result (Claude exit alone is never enough)."""
+    ok: bool
+    exit_code: int
+    cmd: list[str]
+    log_tail: str
+    reason: str
+    project_dir: str = ""
+
+
 RETRYABLE_MARKERS = (
     "connection reset",
     "econnreset",
@@ -341,12 +352,302 @@ def run_claude_streaming(
     )
 
 
-def module_already_passed(runtime: AgentRuntime, node_id: str) -> bool:
+def safe_node_id(node_id: str) -> str:
+    return "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in node_id)
+
+
+def validation_receipt_dir(output_dir: Path) -> Path:
+    return output_dir / ".arc" / "validation"
+
+
+def validation_receipt_ok_path(output_dir: Path, node_id: str) -> Path:
+    return validation_receipt_dir(output_dir) / f"{safe_node_id(node_id)}.ok"
+
+
+def validation_receipt_json_path(output_dir: Path, node_id: str) -> Path:
+    return validation_receipt_dir(output_dir) / f"{safe_node_id(node_id)}.json"
+
+
+def has_validation_receipt(output_dir: Path, node_id: str) -> bool:
+    return validation_receipt_ok_path(output_dir, node_id).is_file()
+
+
+def write_validation_receipt(output_dir: Path, node_id: str, result: ValidationResult) -> None:
+    dest = validation_receipt_dir(output_dir)
+    dest.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "ok": result.ok,
+        "exit_code": result.exit_code,
+        "cmd": result.cmd,
+        "reason": result.reason,
+        "project_dir": result.project_dir,
+        "log_tail": result.log_tail[-4000:],
+        "node_id": node_id,
+    }
+    validation_receipt_json_path(output_dir, node_id).write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    if result.ok:
+        validation_receipt_ok_path(output_dir, node_id).write_text(
+            f"ok exit={result.exit_code} cmd={' '.join(result.cmd)}\n",
+            encoding="utf-8",
+        )
+    else:
+        ok_path = validation_receipt_ok_path(output_dir, node_id)
+        if ok_path.exists():
+            ok_path.unlink()
+
+
+def clear_validation_receipt(output_dir: Path, node_id: str) -> None:
+    for path in (
+        validation_receipt_ok_path(output_dir, node_id),
+        validation_receipt_json_path(output_dir, node_id),
+    ):
+        if path.exists():
+            path.unlink()
+
+
+def module_already_passed(
+    runtime: AgentRuntime,
+    node_id: str,
+    output_dir: Path | None = None,
+) -> bool:
+    """Skip only when PASSED *and* a harness validation receipt exists.
+
+    Set ARC_FORCE_REVALIDATE=1 to ignore skip (forces re-run + re-validate).
+    """
+    if env_bool("ARC_FORCE_REVALIDATE", False):
+        return False
     try:
         state = runtime.traceability.get_node_state(node_id)
     except Exception:
         return False
-    return bool(state and str(state.get("state") or "").upper() == "PASSED")
+    if not (state and str(state.get("state") or "").upper() == "PASSED"):
+        return False
+    if output_dir is None:
+        return False
+    return has_validation_receipt(output_dir, node_id)
+
+
+def discover_test_project(output_dir: Path) -> Path | None:
+    """Prefer frontend/ with package.json; else output_dir package.json."""
+    for candidate in (output_dir / "frontend", output_dir):
+        if (candidate / "package.json").is_file():
+            return candidate
+    return None
+
+
+def package_scripts(project_dir: Path) -> dict[str, str]:
+    try:
+        payload = json.loads((project_dir / "package.json").read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    scripts = payload.get("scripts") if isinstance(payload, dict) else None
+    if not isinstance(scripts, dict):
+        return {}
+    return {str(k): str(v) for k, v in scripts.items() if isinstance(v, str)}
+
+
+def find_test_files(project_dir: Path) -> list[Path]:
+    patterns = (
+        "**/*.test.ts",
+        "**/*.test.tsx",
+        "**/*.test.js",
+        "**/*.test.jsx",
+        "**/*.test.mjs",
+        "**/*.test.cjs",
+        "**/*.spec.ts",
+        "**/*.spec.tsx",
+        "**/*.spec.js",
+        "**/*.spec.jsx",
+        "**/__tests__/**/*.ts",
+        "**/__tests__/**/*.tsx",
+        "**/__tests__/**/*.js",
+        "**/__tests__/**/*.jsx",
+    )
+    found: list[Path] = []
+    skip_parts = {"node_modules", ".git", "dist", "build", "coverage", ".next"}
+    for pattern in patterns:
+        for path in project_dir.glob(pattern):
+            if not path.is_file():
+                continue
+            if any(part in skip_parts for part in path.parts):
+                continue
+            found.append(path)
+    # de-dupe while preserving order
+    seen: set[Path] = set()
+    unique: list[Path] = []
+    for path in found:
+        resolved = path.resolve()
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        unique.append(path)
+    return unique
+
+
+def resolve_validation_command(project_dir: Path) -> list[str] | None:
+    scripts = package_scripts(project_dir)
+    # Prefer explicit vitest via npx when available or when scripts mention vitest.
+    test_script = scripts.get("test", "")
+    lower = test_script.lower()
+    if "vitest" in lower or (project_dir / "node_modules" / ".bin" / "vitest").exists():
+        return ["npx", "--yes", "vitest", "run"]
+    if "test" in scripts:
+        return ["npm", "test"]
+    if (project_dir / "vitest.config.ts").exists() or (project_dir / "vitest.config.js").exists():
+        return ["npx", "--yes", "vitest", "run"]
+    if (project_dir / "node_modules" / ".bin" / "vitest").exists():
+        return ["npx", "--yes", "vitest", "run"]
+    return None
+
+
+def run_module_validation(
+    output_dir: Path,
+    module: RequirementModule,
+    *,
+    timeout_seconds: int | None = None,
+    run_fn=None,
+) -> ValidationResult:
+    """Harness-owned gate: Claude success alone must not mark_test_passed.
+
+    Semantics:
+    - Prefer frontend/ (or repo root) package.json tests.
+    - No test files => FAIL (cannot green).
+    - Non-zero test exit => FAIL.
+    - Validation failures are never API-retryable; callers use a separate repair loop.
+    """
+    if timeout_seconds is None:
+        timeout_seconds = env_int("ARC_VALIDATION_TIMEOUT_SECONDS", 300, minimum=30, maximum=3600)
+
+    project_dir = discover_test_project(output_dir)
+    if project_dir is None:
+        return ValidationResult(
+            ok=False,
+            exit_code=1,
+            cmd=[],
+            log_tail="",
+            reason="no package.json found under frontend/ or output root",
+            project_dir="",
+        )
+
+    test_files = find_test_files(project_dir)
+    if not test_files:
+        return ValidationResult(
+            ok=False,
+            exit_code=1,
+            cmd=[],
+            log_tail="",
+            reason=f"no test files found under {project_dir}",
+            project_dir=str(project_dir),
+        )
+
+    cmd = resolve_validation_command(project_dir)
+    if cmd is None:
+        return ValidationResult(
+            ok=False,
+            exit_code=1,
+            cmd=[],
+            log_tail="",
+            reason=f"no npm test / vitest command resolvable in {project_dir}",
+            project_dir=str(project_dir),
+        )
+
+    runner = run_fn or subprocess.run
+    try:
+        completed = runner(
+            cmd,
+            cwd=str(project_dir),
+            capture_output=True,
+            text=True,
+            timeout=timeout_seconds,
+            env=os.environ.copy(),
+        )
+        stdout = completed.stdout or ""
+        stderr = completed.stderr or ""
+        exit_code = int(completed.returncode)
+    except subprocess.TimeoutExpired as exc:
+        stdout = (exc.stdout or "") if isinstance(exc.stdout, str) else ""
+        stderr = (exc.stderr or "") if isinstance(exc.stderr, str) else ""
+        combined = (stdout + "\n" + stderr).strip()
+        return ValidationResult(
+            ok=False,
+            exit_code=124,
+            cmd=cmd,
+            log_tail=combined[-8000:],
+            reason=f"validation timed out after {timeout_seconds}s",
+            project_dir=str(project_dir),
+        )
+    except FileNotFoundError as exc:
+        return ValidationResult(
+            ok=False,
+            exit_code=127,
+            cmd=cmd,
+            log_tail=str(exc),
+            reason=f"validation command not found: {exc}",
+            project_dir=str(project_dir),
+        )
+    except Exception as exc:
+        return ValidationResult(
+            ok=False,
+            exit_code=1,
+            cmd=cmd,
+            log_tail=str(exc),
+            reason=f"validation runner error: {exc}",
+            project_dir=str(project_dir),
+        )
+
+    combined = (stdout + "\n" + stderr).strip()
+    log_tail = combined[-8000:]
+    if exit_code == 0:
+        return ValidationResult(
+            ok=True,
+            exit_code=0,
+            cmd=cmd,
+            log_tail=log_tail,
+            reason="harness local validation passed",
+            project_dir=str(project_dir),
+        )
+    return ValidationResult(
+        ok=False,
+        exit_code=exit_code,
+        cmd=cmd,
+        log_tail=log_tail,
+        reason=f"harness validation failed: exit={exit_code} cmd={' '.join(cmd)}",
+        project_dir=str(project_dir),
+    )
+
+
+@dataclass(frozen=True)
+class ValidationGateDecision:
+    """Policy for harness validation after Claude succeeds (never API-retryable)."""
+    action: str  # "pass" | "repair" | "fail"
+    reason: str
+
+
+def decide_validation_gate(
+    validation: ValidationResult,
+    *,
+    validation_repair: int,
+    max_validation_repairs: int,
+) -> ValidationGateDecision:
+    """Map validation result + repair budget to pass/repair/fail.
+
+    Claude success alone never yields "pass". Validation failures are
+    classified non-retryable:validation (separate from API self-heal).
+    """
+    if validation.ok:
+        return ValidationGateDecision("pass", validation.reason)
+    if validation_repair >= max_validation_repairs:
+        return ValidationGateDecision(
+            "fail",
+            f"non-retryable:validation exhausted after {validation_repair} repair(s): {validation.reason}",
+        )
+    return ValidationGateDecision(
+        "repair",
+        f"non-retryable:validation; schedule repair {validation_repair + 1}/{max_validation_repairs}: {validation.reason}",
+    )
 
 
 def parse_args() -> argparse.Namespace:
@@ -679,11 +980,29 @@ def ensure_gsc_spec(output_dir: Path, module: RequirementModule) -> Path:
     return html_path
 
 
-def module_prompt(module: RequirementModule, requirements_dir: Path, skills_dir: Path | None, completed: list[str], task_type: str, *, attempt: int = 1) -> str:
+def module_prompt(
+    module: RequirementModule,
+    requirements_dir: Path,
+    skills_dir: Path | None,
+    completed: list[str],
+    task_type: str,
+    *,
+    attempt: int = 1,
+    validation_failure: str | None = None,
+    validation_repair: int = 0,
+) -> str:
     completed_text = ", ".join(completed) if completed else "none"
     skills_text = f"ARC skills are installed at {skills_dir}." if skills_dir else "The adapter emits baseline ARC runtime states and checkpoints."
     recovery_text = ""
-    if attempt > 1:
+    if validation_failure:
+        recovery_text = (
+            f"VALIDATION REPAIR {validation_repair}: the harness local validation gate FAILED for this module. "
+            "Claude session success alone does NOT grant green. Fix the implementation and/or tests so the harness "
+            "command (prefer frontend `npx vitest run` / `npm test`) exits 0. Do not claim completion via a tiny "
+            "self-written smoke test or STOP early. MCP SPEC status helps planning but does NOT grant harness green.\n\n"
+            f"Harness validation failure log (tail):\n{validation_failure}"
+        )
+    elif attempt > 1:
         recovery_text = (
             f"RECOVERY ATTEMPT {attempt}: the previous Claude process ended because of a transient upstream/API failure. "
             "The workspace, GSC state, and all files were intentionally preserved. Inspect the current workspace first, "
@@ -704,14 +1023,17 @@ def module_prompt(module: RequirementModule, requirements_dir: Path, skills_dir:
 
         {skills_text}
         If ARC skills are present, read the runtime-signals, traceability, and checkpoint skill instructions and record detailed requirement-to-interface/file/test traceability.
-        Run focused validation/tests. Do not start a long-running server. Do not erase work from earlier modules.
+        Implement against the ROOT-child subtree below. Prefer adding/keeping real automated tests under frontend/ (or the project package.json) that the harness can run.
+        Do not start a long-running server. Do not erase work from earlier modules.
+
+        Harness bar (authoritative for mark_test_passed): after this Claude session returns, the harness itself runs local validation (prefer `frontend` `npx vitest run` / `npm test`). No test files => cannot green. Your session exit code alone never grants green. GSC MCP SPEC / planning tools help quality but do NOT grant harness green or platform score.
 
         Do not read the complete requirements.yaml. Work only from this complete ROOT-child subtree:
         ```json
         {json.dumps(module.subtree, ensure_ascii=False, indent=2)}
         ```
 
-        Finish only after implementation and validation are complete. Summarize changed files and validation performed.
+        Finish only after the subtree is implemented and ready for harness local validation. Summarize changed files and how tests cover the requirement.
     """).strip()
 
 
@@ -869,6 +1191,9 @@ def main() -> int:
     max_retries = env_int("ARC_MODULE_MAX_RETRIES", 5, minimum=0, maximum=10)
     retry_base_seconds = env_int("ARC_RETRY_BASE_SECONDS", 5, minimum=1, maximum=300)
     retry_max_seconds = env_int("ARC_RETRY_MAX_SECONDS", 60, minimum=1, maximum=600)
+    # Max repair Claude sessions AFTER the first harness validation failure.
+    # Total validation attempts = 1 + ARC_VALIDATION_MAX_REPAIRS (default 1+2=3).
+    max_validation_repairs = env_int("ARC_VALIDATION_MAX_REPAIRS", 2, minimum=0, maximum=10)
     max_budget_usd = os.environ.get("ARC_MAX_BUDGET_USD", "50").strip()
     base_urls = configured_base_urls(base_url)
     host = upstream_host(base_urls[0])
@@ -883,8 +1208,9 @@ def main() -> int:
                 "module_max_retries": max_retries,
                 "retry_base_seconds": retry_base_seconds,
                 "retry_max_seconds": retry_max_seconds,
+                "validation_max_repairs": max_validation_repairs,
                 "max_budget_usd": max_budget_usd,
-                "resume": "workspace+traceability",
+                "resume": "workspace+traceability+validation_receipt",
                 "mcp_enabled": enable_mcp,
                 "mcp_config": str(mcp_config_path) if mcp_config_path else None,
                 "mcp_timeout_ms": mcp_timeout_ms,
@@ -897,13 +1223,13 @@ def main() -> int:
     completed: list[str] = []
     try:
         for module in modules:
-            if module_already_passed(runtime, module.node_id):
+            if module_already_passed(runtime, module.node_id, output_dir):
                 print(
                     json.dumps(
                         {
                             "event": "module_skip",
                             "req_id": module.node_id,
-                            "reason": "traceability_state_PASSED",
+                            "reason": "PASSED_with_validation_receipt",
                         },
                         ensure_ascii=False,
                     ),
@@ -917,49 +1243,9 @@ def main() -> int:
             runtime.events.mark_design_started(module.node_id, f"Planning {module.name} from {spec_path.relative_to(output_dir)}")
             runtime.events.mark_design_done(module.node_id, f"Delegated {module.name} to Claude Code + GSC")
 
-            def run_attempt(attempt: int) -> ClaudeRunResult:
-                attempt_base_url = base_url_for_attempt(base_urls, attempt)
-                if attempt > 1:
-                    runtime.events.mark_run_resumed(
-                        f"Retry attempt {attempt}/{max_retries + 1} for {module.node_id}; workspace preserved"
-                    )
-                runtime.events.mark_implementation_started(
-                    module.node_id,
-                    f"Implementing {module.name} (attempt {attempt}/{max_retries + 1})",
-                )
-                command = [
-                    str(claude_bin),
-                    "-p",
-                    module_prompt(
-                        module,
-                        requirements_dir,
-                        skills_dir,
-                        completed,
-                        args.task_type,
-                        attempt=attempt,
-                    ),
-                    "--plugin-dir",
-                    str(gsc_dir),
-                    *claude_mcp_cli_args(enabled=enable_mcp, mcp_config=mcp_config_path),
-                    "--model",
-                    model,
-                    "--permission-mode",
-                    "bypassPermissions",
-                    "--no-session-persistence",
-                    "--output-format",
-                    "stream-json",
-                    "--verbose",
-                ]
-                if max_budget_usd:
-                    command.extend(["--max-budget-usd", max_budget_usd])
-                attempt_env = claude_env.copy()
-                attempt_env["ANTHROPIC_BASE_URL"] = attempt_base_url
-                return run_claude_streaming(
-                    command,
-                    cwd=output_dir,
-                    env=attempt_env,
-                    preexec_fn=privilege_dropper(identity),
-                )
+            validation_failure_log: str | None = None
+            validation_repair = 0
+            last_claude_attempts = 0
 
             def on_retry(
                 attempt: int,
@@ -989,44 +1275,165 @@ def main() -> int:
                     f"Transient upstream/API failure in {module.node_id}; retry {attempt}/{max_retries} after {delay}s"
                 )
 
-            result, attempts = execute_with_retry(
-                run_attempt,
-                max_retries=max_retries,
-                base_seconds=retry_base_seconds,
-                max_seconds=retry_max_seconds,
-                on_retry=on_retry,
-            )
-            classification = classify_claude_failure(result)
-            if result.returncode != 0 or result.is_error:
-                terminal = {
-                    "event": "module_terminal_failure",
-                    "req_id": module.node_id,
-                    "attempts": attempts,
-                    "max_retries": max_retries,
-                    "classification": classification.reason,
-                    "terminal_reason": result.terminal_reason or "unknown",
-                    "returncode": result.returncode,
-                    "api_error_status": result.api_error_status,
-                    "upstream_host": host,
-                }
-                print(json.dumps(terminal, ensure_ascii=False), file=sys.stderr, flush=True)
-                runtime.events.mark_implementation_failed(
+            def run_attempt(attempt: int) -> ClaudeRunResult:
+                attempt_base_url = base_url_for_attempt(base_urls, attempt)
+                if attempt > 1 and validation_failure_log is None:
+                    runtime.events.mark_run_resumed(
+                        f"Retry attempt {attempt}/{max_retries + 1} for {module.node_id}; workspace preserved"
+                    )
+                runtime.events.mark_implementation_started(
                     module.node_id,
-                    f"Claude Code failed after {attempts} attempt(s): {classification.reason}",
+                    f"Implementing {module.name} (attempt {attempt}/{max_retries + 1}"
+                    + (f"; validation_repair {validation_repair}" if validation_repair else "")
+                    + ")",
                 )
-                runtime.events.mark_test_failed(module.node_id, "Module did not complete")
-                runtime.events.mark_run_failed(
-                    f"Module {module.node_id} failed after {attempts} attempt(s): {classification.reason}"
+                command = [
+                    str(claude_bin),
+                    "-p",
+                    module_prompt(
+                        module,
+                        requirements_dir,
+                        skills_dir,
+                        completed,
+                        args.task_type,
+                        attempt=attempt,
+                        validation_failure=validation_failure_log,
+                        validation_repair=validation_repair,
+                    ),
+                    "--plugin-dir",
+                    str(gsc_dir),
+                    *claude_mcp_cli_args(enabled=enable_mcp, mcp_config=mcp_config_path),
+                    "--model",
+                    model,
+                    "--permission-mode",
+                    "bypassPermissions",
+                    "--no-session-persistence",
+                    "--output-format",
+                    "stream-json",
+                    "--verbose",
+                ]
+                if max_budget_usd:
+                    command.extend(["--max-budget-usd", max_budget_usd])
+                attempt_env = claude_env.copy()
+                attempt_env["ANTHROPIC_BASE_URL"] = attempt_base_url
+                return run_claude_streaming(
+                    command,
+                    cwd=output_dir,
+                    env=attempt_env,
+                    preexec_fn=privilege_dropper(identity),
                 )
-                return result.returncode or 1
 
-            runtime.events.mark_implementation_done(
-                module.node_id,
-                f"Implemented {module.name} after {attempts} attempt(s)",
-            )
-            runtime.events.mark_test_passed(module.node_id, "Agent completed module validation")
-            runtime.git.commit(f"{module.node_id}: {module.name}")
-            completed.append(module.node_id)
+            # Outer loop: Claude (with API self-heal) then harness validation;
+            # validation failures drive a separate repair Claude session (not API retry).
+            while True:
+                result, attempts = execute_with_retry(
+                    run_attempt,
+                    max_retries=max_retries,
+                    base_seconds=retry_base_seconds,
+                    max_seconds=retry_max_seconds,
+                    on_retry=on_retry,
+                )
+                last_claude_attempts = attempts
+                classification = classify_claude_failure(result)
+                if result.returncode != 0 or result.is_error:
+                    terminal = {
+                        "event": "module_terminal_failure",
+                        "req_id": module.node_id,
+                        "attempts": attempts,
+                        "max_retries": max_retries,
+                        "classification": classification.reason,
+                        "terminal_reason": result.terminal_reason or "unknown",
+                        "returncode": result.returncode,
+                        "api_error_status": result.api_error_status,
+                        "upstream_host": host,
+                        "validation_repair": validation_repair,
+                    }
+                    print(json.dumps(terminal, ensure_ascii=False), file=sys.stderr, flush=True)
+                    runtime.events.mark_implementation_failed(
+                        module.node_id,
+                        f"Claude Code failed after {attempts} attempt(s): {classification.reason}",
+                    )
+                    runtime.events.mark_test_failed(module.node_id, "Module did not complete")
+                    runtime.events.mark_run_failed(
+                        f"Module {module.node_id} failed after {attempts} attempt(s): {classification.reason}"
+                    )
+                    return result.returncode or 1
+
+                validation = run_module_validation(output_dir, module)
+                validation_event = {
+                    "event": "module_validation",
+                    "req_id": module.node_id,
+                    "ok": validation.ok,
+                    "exit_code": validation.exit_code,
+                    "cmd": validation.cmd,
+                    "reason": validation.reason,
+                    "project_dir": validation.project_dir,
+                    "validation_repair": validation_repair,
+                    "max_validation_repairs": max_validation_repairs,
+                }
+                print(json.dumps(validation_event, ensure_ascii=False), flush=True)
+
+                gate = decide_validation_gate(
+                    validation,
+                    validation_repair=validation_repair,
+                    max_validation_repairs=max_validation_repairs,
+                )
+                if gate.action == "pass":
+                    write_validation_receipt(output_dir, module.node_id, validation)
+                    runtime.events.mark_implementation_done(
+                        module.node_id,
+                        f"Implemented {module.name} after {last_claude_attempts} Claude attempt(s)"
+                        + (f"; validation_repair {validation_repair}" if validation_repair else ""),
+                    )
+                    runtime.events.mark_test_passed(
+                        module.node_id,
+                        "Harness local validation passed",
+                    )
+                    runtime.git.commit(f"{module.node_id}: {module.name}")
+                    completed.append(module.node_id)
+                    break
+
+                # Validation failed: never treat as API-retryable; mark failed and maybe repair.
+                clear_validation_receipt(output_dir, module.node_id)
+                fail_msg = validation.reason
+                if validation.log_tail:
+                    fail_msg = f"{validation.reason}\n{validation.log_tail[-2000:]}"
+                runtime.events.mark_test_failed(
+                    module.node_id,
+                    f"Harness validation failed: {validation.reason}",
+                )
+                if gate.action == "fail":
+                    runtime.events.mark_implementation_failed(
+                        module.node_id,
+                        f"Harness validation exhausted after {validation_repair} repair(s): {validation.reason}",
+                    )
+                    runtime.events.mark_run_failed(
+                        f"Module {module.node_id} harness validation failed after "
+                        f"{validation_repair} repair(s): {validation.reason}"
+                    )
+                    print(
+                        json.dumps(
+                            {
+                                "event": "module_validation_exhausted",
+                                "req_id": module.node_id,
+                                "validation_repair": validation_repair,
+                                "max_validation_repairs": max_validation_repairs,
+                                "reason": validation.reason,
+                                "classification": "non-retryable:validation",
+                                "gate": gate.reason,
+                            },
+                            ensure_ascii=False,
+                        ),
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    return validation.exit_code or 1
+
+                validation_repair += 1
+                validation_failure_log = fail_msg[-6000:]
+                runtime.events.mark_run_resumed(
+                    f"Validation repair {validation_repair}/{max_validation_repairs} for {module.node_id}; injecting harness failure log"
+                )
         runtime.events.mark_run_completed("All ROOT modules completed")
         return 0
     except Exception as exc:

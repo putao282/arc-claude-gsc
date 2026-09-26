@@ -5,6 +5,35 @@ import tempfile
 import unittest
 from pathlib import Path
 
+
+
+def _install_test_stubs():
+    """Allow loading main.py when ARC/Claude runtime wheels are absent."""
+    import sys
+    import types
+    try:
+        import claude_agent_sdk  # noqa: F401
+    except ImportError:
+        sys.modules["claude_agent_sdk"] = types.ModuleType("claude_agent_sdk")
+    try:
+        import arcbench_agent_runtime  # noqa: F401
+    except ImportError:
+        runtime = types.ModuleType("arcbench_agent_runtime")
+        class AgentRuntime:  # noqa: D401
+            """Test stub."""
+        runtime.AgentRuntime = AgentRuntime
+        sys.modules["arcbench_agent_runtime"] = runtime
+    try:
+        import yaml  # noqa: F401
+    except ImportError:
+        yaml_mod = types.ModuleType("yaml")
+        def safe_load(text):
+            raise RuntimeError("PyYAML not installed in this test environment")
+        yaml_mod.safe_load = safe_load
+        sys.modules["yaml"] = yaml_mod
+
+_install_test_stubs()
+
 ROOT = Path(__file__).resolve().parents[2]
 if not (ROOT / "main.py").is_file() and Path("/workspace/submission/main.py").is_file():
     ROOT = Path("/workspace/submission")
