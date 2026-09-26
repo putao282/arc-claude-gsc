@@ -75,7 +75,11 @@ ARC_MODULE_MAX_RETRIES=5
 ARC_RETRY_BASE_SECONDS=5
 ARC_RETRY_MAX_SECONDS=60
 ARC_MAX_BUDGET_USD=50
+ARC_ENABLE_MCP=1
+MCP_TIMEOUT=60000
 ```
+
+GSC MCP is **enabled by default**. `main.py` writes an explicit Claude `--mcp-config` pointing at the packaged GSC `mcp/src/bootstrap.mjs`, and pairs it with `--strict-mcp-config` so only that GSC server is loaded (hooks still come from `--plugin-dir`). Claude `-p` waits for MCP connect up to `MCP_TIMEOUT` ms before the first turn — a softer thrash mitigation than banning `WaitForMcpServers` / MCP tools. Set `ARC_ENABLE_MCP=0` only as an explicit escape hatch (still does not inject "do not use MCP" prompt bans). SPEC scaffolds are HTML 2.0 so GSC MCP can use `spec_read`/`spec_write` without the Markdown migrate dead-end.
 
 The primary model endpoint always comes from ARC's injected `OPENAI_BASE_URL`. Optional fallback endpoints are only used when explicitly configured:
 

@@ -72,6 +72,7 @@ cp "$ROOT/tests/arc_like/mock_openai.py" \
    "$ROOT/tests/arc_like/verify_arcbench_runtime.py" \
    "$ROOT/tests/arc_like/arcbench_runtime_sha256.json" \
    "$ROOT/tests/arc_like/test_self_heal.py" \
+   "$ROOT/tests/arc_like/test_mcp_restore.py" \
    "$WORK/tests/"
 
 # The production slim agent talks directly to ARC-Bench's Anthropic-compatible
@@ -123,6 +124,7 @@ python3 -m pip install -q -r requirements.txt
 cd /workspace/output
 python3 /workspace/tests/verify_arcbench_runtime.py
 python3 /workspace/tests/test_self_heal.py
+python3 /workspace/tests/test_mcp_restore.py
 
 ARC_MOCK_REQUIRE_RECOVERY=1 python3 /workspace/tests/mock_openai.py >/workspace/artifacts/mock.log 2>&1 &
 mockpid=$!

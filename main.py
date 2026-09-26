@@ -116,6 +116,63 @@ def env_int(name: str, default: int, *, minimum: int = 0, maximum: int = 10_000)
     return value
 
 
+def env_bool(name: str, default: bool = True) -> bool:
+    """Parse a boolean env flag. Empty/unset returns default. Default is MCP-enabled."""
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    value = raw.strip().lower()
+    if not value:
+        return default
+    if value in {"1", "true", "yes", "on", "y"}:
+        return True
+    if value in {"0", "false", "no", "off", "n"}:
+        return False
+    die(f"{name} must be a boolean (1/0 true/false), got {raw!r}")
+
+
+def mcp_enabled() -> bool:
+    """GSC MCP is ON by default. Set ARC_ENABLE_MCP=0 only as an explicit escape hatch."""
+    return env_bool("ARC_ENABLE_MCP", True)
+
+
+def write_gsc_mcp_config(gsc_dir: Path, dest_dir: Path) -> Path:
+    """Write a Claude --mcp-config that points at the packaged GSC bootstrap."""
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    bootstrap = gsc_dir / "mcp" / "src" / "bootstrap.mjs"
+    require_file(bootstrap, "GSC MCP bootstrap")
+    config_path = dest_dir / "gsc-mcp.json"
+    payload = {
+        "mcpServers": {
+            "arch": {
+                "command": "node",
+                "args": [str(bootstrap)],
+                "env": {
+                    "CLAUDE_PLUGIN_ROOT": str(gsc_dir),
+                    "GSC_ARC_PACKAGED_RUNTIME": "1",
+                    "GSC_RUNTIME_SERVER_BIN": str(gsc_dir / "bin" / "gsc-spec-server"),
+                },
+            }
+        }
+    }
+    config_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    return config_path
+
+
+def claude_mcp_cli_args(*, enabled: bool, mcp_config: Path | None) -> list[str]:
+    """Less-destructive MCP thrash mitigation vs v4's total ban.
+
+    When enabled (default): --mcp-config + --strict-mcp-config loads ONLY GSC.
+    Claude -p waits for MCP connect up to MCP_TIMEOUT before the first turn.
+    When disabled: --strict-mcp-config alone ignores plugin MCP (escape hatch).
+    Never writes CLAUDE.md / prompt bans that forbid MCP.
+    """
+    if enabled:
+        if mcp_config is None:
+            raise ValueError("mcp_config is required when MCP is enabled")
+        return ["--mcp-config", str(mcp_config), "--strict-mcp-config"]
+    return ["--strict-mcp-config"]
+
 
 def configured_base_urls(primary: str) -> list[str]:
     urls = [primary.strip()]
@@ -565,19 +622,61 @@ def load_root_modules(payload: dict[str, Any]) -> list[RequirementModule]:
     return result
 
 
+def _html_escape(value: str) -> str:
+    return (
+        value.replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace('"', "&quot;")
+    )
+
+
 def ensure_gsc_spec(output_dir: Path, module: RequirementModule) -> Path:
-    """Materialize the current ARC requirement subtree into GSC's SPEC-first workspace."""
+    """Materialize the ARC requirement as GSC HTML 2.0 SPEC (never Markdown).
+
+    Writing SPEC/*.md forces GSC's migrate path; ARC runners lack a migrate provider,
+    which previously caused thrash. HTML 2.0 lets GSC MCP use spec_read/spec_write
+    without banning MCP.
+    """
     spec_dir = output_dir / "SPEC" / "arcbench"
     spec_dir.mkdir(parents=True, exist_ok=True)
     safe_id = "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in module.node_id)
-    path = spec_dir / f"{safe_id}.md"
-    path.write_text(
-        f"# {module.node_id}: {module.name}\n\n"
-        "Source: ARC-Bench requirements.yaml ROOT child subtree.\n\n"
-        "```json\n" + json.dumps(module.subtree, ensure_ascii=False, indent=2) + "\n```\n",
+    md_path = spec_dir / f"{safe_id}.md"
+    if md_path.exists():
+        md_path.unlink()
+    html_path = spec_dir / f"{safe_id}.html"
+    title = _html_escape(f"{module.node_id}: {module.name}")
+    brief = _html_escape(str(module.subtree.get("description") or module.name)[:500])
+    html_path.write_text(
+        "<!DOCTYPE html>\n"
+        '<html lang="zh-CN" data-spec-root>\n'
+        "<head>\n"
+        '  <meta charset="utf-8">\n'
+        f'  <meta name="spec-file" content="{safe_id}">\n'
+        '  <meta name="spec-category" content="arcbench">\n'
+        f'  <meta name="spec-title" content="{title}">\n'
+        '  <script type="application/ld+json">\n'
+        f'  {{ "@context":"https://spec.gsc.local/v1", "@type":"SpecDocument", "id":"{safe_id}", "dependencies":[], "children":[] }}\n'
+        "  </script>\n"
+        f"  <title>{title}</title>\n"
+        "</head>\n"
+        "<body>\n"
+        "  <header data-spec-header>\n"
+        f"    <h1>{title}</h1>\n"
+        "  </header>\n"
+        '  <main data-spec-content>\n'
+        f'    <section id="s-req" data-section="requirements" data-req="{_html_escape(module.node_id)}" '
+        'data-req-status="unknown" data-req-domain="arcbench">\n'
+        f"      <h2>{title}</h2>\n"
+        "      <p>Implement from the task JSON in the agent prompt. Prefer GSC MCP SPEC tools when available.</p>\n"
+        f"      <p data-arc-brief>{brief}</p>\n"
+        "    </section>\n"
+        "  </main>\n"
+        "</body>\n"
+        "</html>\n",
         encoding="utf-8",
     )
-    return path
+    return html_path
 
 
 def module_prompt(module: RequirementModule, requirements_dir: Path, skills_dir: Path | None, completed: list[str], task_type: str, *, attempt: int = 1) -> str:
@@ -591,7 +690,7 @@ def module_prompt(module: RequirementModule, requirements_dir: Path, skills_dir:
             "continue this same requirement from the existing partial implementation, and do not redo previously passed ROOT modules."
         )
     return textwrap.dedent(f"""
-        You are implementing an ARC-Bench Agentic Software Factory task using original Claude Code with the GSC plugin loaded.
+        You are implementing an ARC-Bench Agentic Software Factory task using original Claude Code with the GSC plugin and GSC MCP loaded.
 
         Target task type: {task_type}
         Implement ROOT module {module.index}/{module.total}: {module.node_id} - {module.name}
@@ -600,7 +699,8 @@ def module_prompt(module: RequirementModule, requirements_dir: Path, skills_dir:
         {recovery_text}
 
         The current working directory is the persistent generated project. Preserve working features from earlier modules.
-        Use GSC actively for requirements/specification, implementation planning, coding, validation, and state tracking rather than bypassing it.
+        Use GSC actively (including GSC MCP SPEC / planning / validation tools) for requirements, implementation planning, coding, validation, and state tracking rather than bypassing it.
+        If WaitForMcpServers appears, wait once for GSC MCP readiness then continue implementation; do not loop reconnecting or dump huge unrelated context.
 
         {skills_text}
         If ARC skills are present, read the runtime-signals, traceability, and checkpoint skill instructions and record detailed requirement-to-interface/file/test traceability.
@@ -728,6 +828,12 @@ def main() -> int:
     require_file(gsc_dir / "bin" / "gsc-spec-server", "compiled GSC server")
     require_file(gsc_dir / "mcp" / "src" / "bootstrap.mjs", "GSC MCP bootstrap")
 
+    enable_mcp = mcp_enabled()
+    mcp_config_path: Path | None = None
+    if enable_mcp:
+        mcp_config_path = write_gsc_mcp_config(gsc_dir, artifacts_dir / "mcp")
+    mcp_timeout_ms = env_int("MCP_TIMEOUT", 60_000, minimum=1_000, maximum=600_000)
+
     home_dir = artifacts_dir / "home"
     plugin_data = artifacts_dir / "gsc-plugin-data"
     home_dir.mkdir(parents=True, exist_ok=True)
@@ -738,8 +844,12 @@ def main() -> int:
     env["HOME"] = str(home_dir)
     env["GSC_ARC_PACKAGED_RUNTIME"] = "1"
     env["GSC_RUNTIME_SERVER_BIN"] = str(gsc_dir / "bin" / "gsc-spec-server")
+    env["CLAUDE_PLUGIN_ROOT"] = str(gsc_dir)
     env["CLAUDE_PLUGIN_DATA"] = str(plugin_data)
     env["CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS"] = "1"
+    # Claude -p waits for --mcp-config servers up to MCP_TIMEOUT before the first turn.
+    # Prefer this over permanently banning WaitForMcpServers / MCP tools.
+    env["MCP_TIMEOUT"] = str(mcp_timeout_ms)
     env["PATH"] = os.pathsep.join([str(gsc_dir / "bin"), str(gsc_dir / "lsp" / "web" / "node_modules" / ".bin"), env.get("PATH", "")])
 
     # ARC-Bench's official Claude starter maps the injected OpenAI-compatible
@@ -775,6 +885,9 @@ def main() -> int:
                 "retry_max_seconds": retry_max_seconds,
                 "max_budget_usd": max_budget_usd,
                 "resume": "workspace+traceability",
+                "mcp_enabled": enable_mcp,
+                "mcp_config": str(mcp_config_path) if mcp_config_path else None,
+                "mcp_timeout_ms": mcp_timeout_ms,
             },
             ensure_ascii=False,
         ),
@@ -827,6 +940,7 @@ def main() -> int:
                     ),
                     "--plugin-dir",
                     str(gsc_dir),
+                    *claude_mcp_cli_args(enabled=enable_mcp, mcp_config=mcp_config_path),
                     "--model",
                     model,
                     "--permission-mode",
