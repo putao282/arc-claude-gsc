@@ -47,6 +47,22 @@ class RequirementModule:
 
 
 @dataclass(frozen=True)
+class DomainGroup:
+    """One DOMAIN bucket: modules that share a worktree and implement batch."""
+    domain_id: str
+    modules: tuple[RequirementModule, ...]
+    depends_on: tuple[str, ...] = ()
+    conflicts_with: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class WavePlan:
+    """One WAVE: non-conflicting DOMAINs developed (prompt-parallel), then merge+BATCH_TEST."""
+    wave_index: int
+    domains: tuple[DomainGroup, ...]
+
+
+@dataclass(frozen=True)
 class ClaudeRunResult:
     returncode: int
     is_error: bool
@@ -168,10 +184,14 @@ OFFICIAL_STEPS: tuple[StepDef, ...] = (
     ),
     StepDef(
         step_id="batch_test",
-        title="BATCH test (after code done)",
+        title="WAVE BATCH test (after DOMAIN merge)",
         required_skills=("arcbench-runtime-signals",),
-        goal="After code is done, run batch/centralized tests once (vitest/npm test).",
-        exit_criteria="Harness local validation passes (batch tests).",
+        goal=(
+            "AFTER all DOMAIN worktrees in the current WAVE are accepted and merged "
+            "to mainline, run centralized batch/harness tests once (vitest/npm test). "
+            "Never run this after a single REQ while sibling DOMAIN/WAVE work remains."
+        ),
+        exit_criteria="Harness local validation passes on mainline after WAVE merge.",
         require_batch_test_run=True,
     ),
 )
@@ -211,7 +231,7 @@ AUDIT_REFACTOR_STEP = StepDef(
 
 
 def official_steps() -> list[StepDef]:
-    """6 core STEPs + optional govern (after spec) + audit_refactor (after implement)."""
+    """Full STEP catalog (includes batch_test). Prefer domain_dev_steps + wave batch."""
     steps = list(OFFICIAL_STEPS)
     if not mcp_audit_steps_enabled():
         return steps
@@ -223,6 +243,16 @@ def official_steps() -> list[StepDef]:
         elif step.step_id == "implement":
             out.append(AUDIT_REFACTOR_STEP)
     return out
+
+
+def domain_dev_steps() -> list[StepDef]:
+    """DEV STEPs inside a DOMAIN worktree — NO batch_test (centralized after WAVE merge)."""
+    return [s for s in official_steps() if s.step_id != "batch_test"]
+
+
+def wave_batch_steps() -> list[StepDef]:
+    """Post-merge centralized BATCH_TEST STEPs only."""
+    return [s for s in official_steps() if s.step_id == "batch_test"]
 
 
 RETRYABLE_MARKERS = (
@@ -1875,6 +1905,348 @@ def load_root_modules(payload: dict[str, Any]) -> list[RequirementModule]:
     return result
 
 
+def _node_domain_id(node: dict[str, Any], fallback: str) -> str:
+    """Extract DOMAIN id from a requirement node (domain / Domain / data-req-domain / req domain)."""
+    for key in ("domain", "Domain", "DOMAIN", "req_domain", "domain_id"):
+        raw = node.get(key)
+        if raw is not None and str(raw).strip():
+            return str(raw).strip()
+    return fallback
+
+
+def module_domain_id(module: RequirementModule) -> str:
+    """DOMAIN for a ROOT-child module; default = module.node_id (one DOMAIN per REQ)."""
+    return _node_domain_id(module.subtree, module.node_id)
+
+
+def _as_id_tuple(value: Any) -> tuple[str, ...]:
+    if value is None:
+        return ()
+    if isinstance(value, str):
+        item = value.strip()
+        return (item,) if item else ()
+    if isinstance(value, (list, tuple)):
+        out: list[str] = []
+        for x in value:
+            s = str(x).strip()
+            if s and s not in out:
+                out.append(s)
+        return tuple(out)
+    s = str(value).strip()
+    return (s,) if s else ()
+
+
+def module_depends_on(module: RequirementModule) -> tuple[str, ...]:
+    """Dependency edges: domain or module ids this module/domain waits on."""
+    node = module.subtree
+    for key in ("depends_on", "dependencies", "depends", "requires", "blocked_by"):
+        if key in node:
+            return _as_id_tuple(node.get(key))
+    return ()
+
+
+def module_conflicts_with(module: RequirementModule) -> tuple[str, ...]:
+    node = module.subtree
+    for key in ("conflicts_with", "conflicts", "exclusive_with"):
+        if key in node:
+            return _as_id_tuple(node.get(key))
+    return ()
+
+
+def build_domain_groups(modules: list[RequirementModule]) -> list[DomainGroup]:
+    """Group ROOT modules by DOMAIN; union depends_on / conflicts_with."""
+    order: list[str] = []
+    buckets: dict[str, list[RequirementModule]] = {}
+    deps: dict[str, list[str]] = {}
+    conf: dict[str, list[str]] = {}
+    for mod in modules:
+        did = module_domain_id(mod)
+        if did not in buckets:
+            buckets[did] = []
+            order.append(did)
+            deps[did] = []
+            conf[did] = []
+        buckets[did].append(mod)
+        for d in module_depends_on(mod):
+            # Map module-id deps to that module's domain when possible.
+            target = d
+            for m2 in modules:
+                if m2.node_id == d:
+                    target = module_domain_id(m2)
+                    break
+            if target != did and target not in deps[did]:
+                deps[did].append(target)
+        for c in module_conflicts_with(mod):
+            target = c
+            for m2 in modules:
+                if m2.node_id == c:
+                    target = module_domain_id(m2)
+                    break
+            if target != did and target not in conf[did]:
+                conf[did].append(target)
+    return [
+        DomainGroup(
+            domain_id=did,
+            modules=tuple(buckets[did]),
+            depends_on=tuple(deps[did]),
+            conflicts_with=tuple(conf[did]),
+        )
+        for did in order
+    ]
+
+
+def plan_domain_waves(groups: list[DomainGroup]) -> list[WavePlan]:
+    """Build WAVEs: Kahn-style topo on depends_on; conflict edges keep domains apart.
+
+    Non-conflicting, dep-ready domains share a WAVE (prompt-level concurrent tracks).
+    Runtime may still execute DOMAIN worktrees sequentially when single-threaded.
+    """
+    by_id = {g.domain_id: g for g in groups}
+    remaining = set(by_id)
+    # Symmetric conflict closure
+    conflict: dict[str, set[str]] = {d: set() for d in by_id}
+    for g in groups:
+        for c in g.conflicts_with:
+            if c in by_id:
+                conflict[g.domain_id].add(c)
+                conflict[c].add(g.domain_id)
+    waves: list[WavePlan] = []
+    safety = 0
+    while remaining:
+        safety += 1
+        if safety > len(by_id) + 5:
+            # Cycle / unsatisfiable deps — dump rest as one wave
+            rest = tuple(by_id[d] for d in sorted(remaining))
+            waves.append(WavePlan(wave_index=len(waves) + 1, domains=rest))
+            break
+        ready = []
+        for d in sorted(remaining):
+            g = by_id[d]
+            if any(dep in remaining for dep in g.depends_on if dep in by_id):
+                continue
+            ready.append(d)
+        if not ready:
+            # dependency cycle among remaining
+            rest = tuple(by_id[d] for d in sorted(remaining))
+            waves.append(WavePlan(wave_index=len(waves) + 1, domains=rest))
+            break
+        # Pack ready domains into this wave without mutual conflicts
+        wave_domains: list[str] = []
+        for d in ready:
+            if any(d in conflict[x] or x in conflict[d] for x in wave_domains):
+                continue
+            wave_domains.append(d)
+        if not wave_domains:
+            wave_domains = [ready[0]]
+        waves.append(
+            WavePlan(
+                wave_index=len(waves) + 1,
+                domains=tuple(by_id[d] for d in wave_domains),
+            )
+        )
+        for d in wave_domains:
+            remaining.discard(d)
+    return waves
+
+
+def write_wave_plan(output_dir: Path, waves: list[WavePlan]) -> Path:
+    dest = output_dir / ".arc" / "waves" / "plan.json"
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "version": "v5z",
+        "policy": "domain_worktree_parallel_then_merge_then_batch_test",
+        "waves": [
+            {
+                "wave_index": w.wave_index,
+                "domains": [
+                    {
+                        "domain_id": g.domain_id,
+                        "req_ids": [m.node_id for m in g.modules],
+                        "depends_on": list(g.depends_on),
+                        "conflicts_with": list(g.conflicts_with),
+                    }
+                    for g in w.domains
+                ],
+            }
+            for w in waves
+        ],
+    }
+    dest.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    return dest
+
+
+def domain_worktree_path(output_dir: Path, domain_id: str) -> Path:
+    return output_dir.parent / f".arc-wt-{safe_node_id(domain_id)}"
+
+
+def ensure_domain_worktree(output_dir: Path, domain_id: str) -> Path:
+    """Create (or reuse) a git worktree for this DOMAIN branched from mainline HEAD."""
+    wt = domain_worktree_path(output_dir, domain_id)
+    branch = f"arc-domain-{safe_node_id(domain_id)}"
+    if wt.is_dir() and (
+        (wt / ".git").exists()
+        or ((output_dir / ".git").exists() and _worktree_registered(output_dir, wt))
+    ):
+        return wt
+    # Remove stale empty path
+    if wt.is_dir() and not any(wt.iterdir()):
+        wt.rmdir()
+    elif wt.exists() and not _worktree_registered(output_dir, wt):
+        # leftover dir without worktree — clear
+        shutil.rmtree(wt, ignore_errors=True)
+    # Ensure branch exists from HEAD
+    list_br = subprocess.run(
+        ["git", "branch", "--list", branch],
+        cwd=str(output_dir),
+        capture_output=True,
+        text=True,
+    )
+    if not (list_br.stdout or "").strip():
+        subprocess.run(
+            ["git", "branch", branch],
+            cwd=str(output_dir),
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    proc = subprocess.run(
+        ["git", "worktree", "add", str(wt), branch],
+        cwd=str(output_dir),
+        capture_output=True,
+        text=True,
+    )
+    if proc.returncode != 0:
+        # Retry: worktree may already exist
+        if wt.is_dir() and _worktree_registered(output_dir, wt):
+            return wt
+        # Fallback: soft copy via worktree add --force detached then checkout
+        proc2 = subprocess.run(
+            ["git", "worktree", "add", "-f", "-B", branch, str(wt), "HEAD"],
+            cwd=str(output_dir),
+            capture_output=True,
+            text=True,
+        )
+        if proc2.returncode != 0:
+            raise RuntimeError(
+                f"git worktree add failed for domain {domain_id}: "
+                f"{(proc.stderr or proc.stdout or '')[:500]} | "
+                f"{(proc2.stderr or proc2.stdout or '')[:500]}"
+            )
+    return wt
+
+
+def _worktree_registered(output_dir: Path, wt: Path) -> bool:
+    proc = subprocess.run(
+        ["git", "worktree", "list", "--porcelain"],
+        cwd=str(output_dir),
+        capture_output=True,
+        text=True,
+    )
+    if proc.returncode != 0:
+        return False
+    target = str(wt.resolve())
+    for line in (proc.stdout or "").splitlines():
+        if line.startswith("worktree "):
+            if Path(line[len("worktree "):]).resolve() == Path(target):
+                return True
+    return False
+
+
+def commit_domain_worktree(wt: Path, domain_id: str, message: str) -> None:
+    subprocess.run(["git", "add", "-A"], cwd=str(wt), check=False, capture_output=True)
+    subprocess.run(
+        ["git", "commit", "-m", message, "--allow-empty"],
+        cwd=str(wt),
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+
+def merge_domain_worktree(output_dir: Path, domain_id: str, wt: Path) -> None:
+    """Merge DOMAIN branch into mainline; remove worktree after successful merge."""
+    branch = f"arc-domain-{safe_node_id(domain_id)}"
+    # Commit any leftover WIP in worktree
+    commit_domain_worktree(wt, domain_id, f"{domain_id}: domain accept pre-merge")
+    merge = subprocess.run(
+        ["git", "merge", "--no-ff", "-m", f"wave-merge domain {domain_id}", branch],
+        cwd=str(output_dir),
+        capture_output=True,
+        text=True,
+    )
+    if merge.returncode != 0:
+        # Try merge by worktree path ref
+        merge2 = subprocess.run(
+            ["git", "merge", "--no-ff", "-m", f"wave-merge domain {domain_id}", "HEAD"],
+            cwd=str(wt),
+            capture_output=True,
+            text=True,
+        )
+        # Cherry approach: fetch commit from worktree and merge into mainline
+        rev = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=str(wt),
+            capture_output=True,
+            text=True,
+        )
+        sha = (rev.stdout or "").strip()
+        if sha:
+            merge3 = subprocess.run(
+                ["git", "merge", "--no-ff", "-m", f"wave-merge domain {domain_id}", sha],
+                cwd=str(output_dir),
+                capture_output=True,
+                text=True,
+            )
+            if merge3.returncode != 0:
+                raise RuntimeError(
+                    f"merge domain {domain_id} failed: "
+                    f"{(merge.stderr or '')[:400]} | {(merge3.stderr or '')[:400]}"
+                )
+        elif merge.returncode != 0:
+            raise RuntimeError(f"merge domain {domain_id} failed: {(merge.stderr or merge.stdout or '')[:600]}")
+    # Best-effort cleanup
+    subprocess.run(
+        ["git", "worktree", "remove", "--force", str(wt)],
+        cwd=str(output_dir),
+        check=False,
+        capture_output=True,
+    )
+
+
+def domain_dev_complete(
+    output_dir: Path,
+    group: DomainGroup,
+    *,
+    skip_req_ids: set[str] | None = None,
+) -> tuple[bool, str]:
+    """Per-DOMAIN accept: all DEV step receipts present (no batch_test yet)."""
+    skip = skip_req_ids or set()
+    missing: list[str] = []
+    checked = 0
+    for mod in group.modules:
+        if mod.node_id in skip:
+            continue
+        checked += 1
+        for step in domain_dev_steps():
+            if not has_step_receipt(output_dir, mod.node_id, step.step_id):
+                missing.append(f"{mod.node_id}/{step.step_id}")
+    if missing:
+        return False, "missing_dev_receipts:" + ",".join(missing[:20])
+    if checked == 0:
+        return True, "domain_dev_accept_ok_all_skipped"
+    return True, "domain_dev_accept_ok"
+
+
+def wave_plan_summary(waves: list[WavePlan]) -> str:
+    parts = []
+    for w in waves:
+        doms = ", ".join(
+            f"{g.domain_id}[{','.join(m.node_id for m in g.modules)}]" for g in w.domains
+        )
+        parts.append(f"WAVE{w.wave_index}: {doms}")
+    return " | ".join(parts)
+
+
 def _html_escape(value: str) -> str:
     return (
         value.replace("&", "&amp;")
@@ -2062,14 +2434,25 @@ def ensure_arc_spawn_gate_softener(output_dir: Path) -> None:
     """Soften GSC SPAWN-GATE without disabling MCP; encode Official STEP loop."""
     claude_md = output_dir / "CLAUDE.md"
     claude_md.write_text(
-        "# ARC-Bench project — MCP-first Official STEP loop (v5y govern STOP + thrash deny)\n\n"
+        "# ARC-Bench project — MCP-first WAVE/DOMAIN DAG (v5z worktree + central BATCH_TEST)\n\n"
         "HARD: GSC MCP stays ON. Never disable WaitForMcpServers / never set "
         "ARC_ENABLE_MCP=0 / never ban MCP tools.\n\n"
+        "## WAVE / DOMAIN orchestration (default path)\n"
+        "1. Build a WAVE/DAG plan: group REQs by DOMAIN, note depends_on + conflicts.\n"
+        "2. Each DOMAIN gets its own git worktree; non-conflicting DOMAINs in a WAVE "
+        "are concurrent tracks (runtime may run them sequentially if single-threaded).\n"
+        "3. Inside a DOMAIN worktree: run DEV STEPs (prd→…→implement→audit). "
+        "Same-DOMAIN REQs share the worktree and one IMPLEMENT batch mindset.\n"
+        "4. Per-DOMAIN accept (DEV receipts) → merge DOMAIN worktrees to mainline.\n"
+        "5. ONLY AFTER WAVE merge: centralized **batch_test** / wave acceptance.\n"
+        "FORBIDDEN: per-REQ serial PRD→…→BATCH_TEST loops; FORBIDDEN testing one REQ "
+        "while sibling same-DOMAIN / same-WAVE DOMAIN work remains unmerged.\n"
+        "Next WAVE starts only after current WAVE acceptance.\n\n"
         "## Harness STEP loop (fail-closed)\n"
         "The harness runs discrete STEPs. Each STEP is its own Claude round.\n"
         "Do not advance yourself — the harness advances only after acceptance passes.\n"
         "Receipts live under `.arc/steps/<module-id>/`.\n\n"
-        "STEPs in order:\n"
+        "DEV STEPs (inside DOMAIN worktree) then WAVE batch_test:\n"
         "1. **prd** — `mcp__arch__state_read` then `mcp__arch__prd`. Soft: architect|discoverer.\n"
         "2. **spec** — Read PRD/ + subtree atomics; `mcp__arch__spec_read` ≤1 then "
         "`mcp__arch__spec_write` once (HTML 2.0 under SPEC/arcbench, data-req per leaf). "
@@ -2086,7 +2469,7 @@ def ensure_arc_spawn_gate_softener(output_dir: Path) -> None:
         "Leftover pages files + search_code alone do NOT pass. Soft: kb_query. No mid-dev tests.\n"
         "7. **audit_refactor** (when enabled) — soft `mcp__arch__arch_insight` / "
         "`mcp__arch__commit_gate`.\n"
-        "8. **batch_test** — harness validation. "
+        "8. **batch_test** — WAVE-central harness validation AFTER DOMAIN merge only. "
         "Soft: `mcp__arch__commit_gate` → commit_gate.json (failure does not alone kill STEP).\n\n"
         "## Per-STEP rules\n"
         "- Skills are model-invoked via the runtime Skill tool when relevant "
@@ -2664,6 +3047,7 @@ def step_prompt(
     prior_failure: str | None = None,
     validation_failure: str | None = None,
     validation_repair: int = 0,
+    wave_ctx: dict[str, Any] | None = None,
 ) -> str:
     completed_text = ", ".join(completed) if completed else "none"
     skills_text = (
@@ -2695,13 +3079,15 @@ def step_prompt(
     if step.forbid_mid_dev_tests:
         mid_dev = (
             "FORBIDDEN this STEP: do not run vitest/npm test / playwright continuously. "
-            "Write/adjust code only; batch testing is the next STEP.\n"
+            "Write/adjust code only; centralized BATCH_TEST runs only after WAVE DOMAIN merge.\n"
         )
     batch = ""
     if step.require_batch_test_run:
         batch = (
-            "REQUIRED this STEP: after confirming code is done, run batch tests once "
-            "(prefer frontend `npx vitest run` / `npm test`). Fix failures if needed within this STEP.\n"
+            "REQUIRED this STEP (WAVE-central, post-merge ONLY): all DOMAIN worktrees "
+            "for this WAVE are already accepted+merged. Run centralized batch tests once "
+            "on mainline (prefer frontend `npx vitest run` / `npm test`). "
+            "Do NOT treat this as a per-REQ loop — fix wave-level failures here.\n"
         )
 
     skill_lines = ", ".join(f"`{s}`" for s in step.required_skills)
@@ -2817,6 +3203,20 @@ def step_prompt(
             "- Harness local validation is the hard green gate.\n"
         )
 
+    wave_ctx = wave_ctx or {}
+    wave_lines = ""
+    if wave_ctx:
+        wave_lines = (
+            f"WAVE {wave_ctx.get('wave_index', '?')}/{wave_ctx.get('wave_total', '?')}: "
+            f"domains={wave_ctx.get('wave_domains', [])}\n"
+            f"DOMAIN worktree: {wave_ctx.get('domain_id', '')} cwd={wave_ctx.get('worktree', '')}\n"
+            f"Sibling REQs in this DOMAIN (share implement batch / worktree): "
+            f"{wave_ctx.get('sibling_reqs', [])}\n"
+            f"WAVE plan: {wave_ctx.get('plan_summary', '')}\n"
+            "ORCHESTRATION: DOMAIN worktree DEV first → per-DOMAIN accept → merge all "
+            "DOMAIN worktrees → centralized BATCH_TEST. Never per-REQ BATCH_TEST.\n"
+        )
+
     return textwrap.dedent(f"""
         You are in an ARC-Bench Official harness STEP round (not a mega-prompt).
         GSC plugin + GSC MCP are loaded. MCP stays ON.
@@ -2828,10 +3228,13 @@ def step_prompt(
         Current STEP: {step.step_id} — {step.title}
         {recovery}
 
+        {wave_lines}
         HARD RULES:
         - GSC MCP stays ON. Never disable WaitForMcpServers / never ARC_ENABLE_MCP=0 / never ban MCP.
         - This round is ONLY for STEP `{step.step_id}`. Do not perform later STEPs.
-        - Prefer main session; do NOT spawn Agent/Task.
+        - WAVE/DOMAIN DAG: work inside the DOMAIN worktree; same-DOMAIN REQs share implement.
+        - FORBIDDEN: per-REQ serial BATCH_TEST. BATCH_TEST only after WAVE DOMAIN merge.
+        - Prefer main session; do NOT spawn Agent/Task for DOMAIN parallelism (harness owns worktrees).
         - Keep tool outputs small (no huge lockfiles/schemas).
         - Do NOT Read/Bash/cat SKILL.md. Skills (if any) are model-invoked via the Skill tool.
         - Harness acceptance is artifact/MCP gates — not skill force-load.
@@ -3108,6 +3511,9 @@ def main() -> int:
                 "permission_mode": "acceptEdits",
                 "mcp_allowed_tools": gsc_mcp_allowed_tools() if enable_mcp else [],
                 "step_loop": [s.step_id for s in official_steps()],
+                "domain_dev_steps": [s.step_id for s in domain_dev_steps()],
+                "wave_batch_steps": [s.step_id for s in wave_batch_steps()],
+                "orchestration": "wave_domain_worktree_dag",
                 "step_required_skills": {s.step_id: list(s.required_skills) for s in official_steps()},
                 "mcp_audit_steps": mcp_audit_steps_enabled(),
                 "mcp_n_allowed": len(gsc_mcp_allowed_tools()),
@@ -3138,6 +3544,7 @@ def main() -> int:
                     "v5w_hard_audit_agent_plus_tool_chain",
                     "v5x_phaseA_write_gate_thrash_deny_refill_degrade",
                     "v5y_govern_stop_thrash_accept_green_deny",
+                    "v5z_wave_domain_worktree_dag_central_batch_test",
                 ],
             },
             ensure_ascii=False,
@@ -3146,459 +3553,740 @@ def main() -> int:
     )
 
     completed: list[str] = []
-    try:
-        for module in modules:
-            if module_already_passed(runtime, module.node_id, output_dir):
-                print(
-                    json.dumps(
-                        {
-                            "event": "module_skip",
-                            "req_id": module.node_id,
-                            "reason": "PASSED_with_validation_receipt",
-                        },
-                        ensure_ascii=False,
-                    ),
-                    flush=True,
-                )
-                completed.append(module.node_id)
-                continue
+    domain_groups = build_domain_groups(modules)
+    waves = plan_domain_waves(domain_groups)
+    plan_path = write_wave_plan(output_dir, waves)
+    print(
+        json.dumps(
+            {
+                "event": "wave_plan",
+                "path": str(plan_path),
+                "summary": wave_plan_summary(waves),
+                "n_waves": len(waves),
+                "n_domains": len(domain_groups),
+                "n_modules": len(modules),
+                "note": (
+                    "DOMAIN worktrees develop in parallel tracks (sequential if "
+                    "single-threaded agent); BATCH_TEST only after WAVE merge"
+                ),
+            },
+            ensure_ascii=False,
+        ),
+        flush=True,
+    )
 
-            print(f"[arc-claude-gsc] module {module.index}/{module.total}: {module.node_id} - {module.name}", flush=True)
-            spec_path = ensure_gsc_spec(output_dir, module)
-            ensure_arc_spawn_gate_softener(output_dir)
-            runtime.events.mark_design_started(module.node_id, f"Planning {module.name} from {spec_path.relative_to(output_dir)}")
-            runtime.events.mark_design_done(module.node_id, f"Delegated {module.name} to Claude Code + GSC")
+    def execute_steps_for_module(
+        *,
+        module: RequirementModule,
+        steps_to_run: list[StepDef],
+        work_dir: Path,
+        wave_ctx: dict[str, Any],
+        validation_repair: int = 0,
+        do_post_validation: bool = False,
+    ) -> int:
+        """Run fail-closed STEPs for one module in work_dir. Returns 0 or error code.
 
-            max_step_retries = env_int("ARC_STEP_MAX_RETRIES", 2, minimum=0, maximum=8)
-            validation_repair = 0
+        do_post_validation=False for DOMAIN DEV (no per-REQ BATCH_TEST).
+        do_post_validation=True only for WAVE-central batch_test path.
+        """
+        max_step_retries = env_int("ARC_STEP_MAX_RETRIES", 2, minimum=0, maximum=8)
+        local_repair = validation_repair
 
-            def on_retry(
-                attempt: int,
-                result: ClaudeRunResult,
-                classification: FailureClassification,
-                delay: int,
-            ) -> None:
-                current_url = base_url_for_attempt(base_urls, attempt)
-                next_url = base_url_for_attempt(base_urls, attempt + 1)
-                payload = {
-                    "event": "module_retry",
-                    "req_id": module.node_id,
-                    "attempt": attempt,
-                    "next_attempt": attempt + 1,
-                    "max_retries": max_retries,
-                    "classification": classification.reason,
-                    "terminal_reason": result.terminal_reason or "unknown",
-                    "returncode": result.returncode,
-                    "api_error_status": result.api_error_status,
-                    "sleep_seconds": delay,
-                    "upstream_host": upstream_host(current_url),
-                    "next_upstream_host": upstream_host(next_url),
-                    "switch_base_url": current_url != next_url,
-                }
-                print(json.dumps(payload, ensure_ascii=False), flush=True)
-                runtime.events.mark_run_paused(
-                    f"Transient upstream/API failure in {module.node_id}; retry {attempt}/{max_retries} after {delay}s"
-                )
+        def on_retry(
+            attempt: int,
+            result: ClaudeRunResult,
+            classification: FailureClassification,
+            delay: int,
+        ) -> None:
+            current_url = base_url_for_attempt(base_urls, attempt)
+            next_url = base_url_for_attempt(base_urls, attempt + 1)
+            payload = {
+                "event": "module_retry",
+                "req_id": module.node_id,
+                "attempt": attempt,
+                "next_attempt": attempt + 1,
+                "max_retries": max_retries,
+                "classification": classification.reason,
+                "terminal_reason": result.terminal_reason or "unknown",
+                "returncode": result.returncode,
+                "api_error_status": result.api_error_status,
+                "sleep_seconds": delay,
+                "upstream_host": upstream_host(current_url),
+                "next_upstream_host": upstream_host(next_url),
+                "switch_base_url": current_url != next_url,
+                "wave": wave_ctx.get("wave_index"),
+                "domain": wave_ctx.get("domain_id"),
+            }
+            print(json.dumps(payload, ensure_ascii=False), flush=True)
+            runtime.events.mark_run_paused(
+                f"Transient failure on {module.node_id}: {classification.reason}; retry in {delay}s"
+            )
 
-            def build_claude_command(prompt: str, attempt: int) -> tuple[list[str], dict[str, str]]:
-                attempt_base_url = base_url_for_attempt(base_urls, attempt)
-                command = [
-                    str(claude_bin),
-                    "-p",
-                    prompt,
-                    "--plugin-dir",
-                    str(gsc_dir),
-                    *claude_mcp_cli_args(enabled=enable_mcp, mcp_config=mcp_config_path),
-                    "--model",
-                    claude_cli_model(model=model, using_proxy=gateway_proc is not None),
-                    # Keep MCP ON; WaitForMcpServers NOT banned.
-                    # Skill remains allowed (official skills wiring); not force-loaded by harness.
-                    "--disallowedTools",
-                    claude_disallowed_tools_csv(),
-                    "--disable-slash-commands",
-                    "--autocompact",
-                    "200000",
-                    "--permission-mode",
-                    "bypassPermissions",
-                    "--no-session-persistence",
-                    "--output-format",
-                    "stream-json",
-                    "--verbose",
-                ]
-                if max_budget_usd:
-                    command.extend(["--max-budget-usd", max_budget_usd])
-                attempt_env = claude_env.copy()
-                if gateway_proc is None:
-                    attempt_env = apply_official_claude_env(
-                        attempt_env, base_url=attempt_base_url, api_key=api_key, model=model
-                    )
-                return command, attempt_env
-
-            # Fail-closed Official STEP loop: artifact/MCP gates before advance (skills soft).
-            steps_to_run: list[StepDef] = list(official_steps())
-            while True:
-                step_failed = False
-                for step in steps_to_run:
-                    if has_step_receipt(output_dir, module.node_id, step.step_id):
-                        print(
-                            json.dumps(
-                                {
-                                    "event": "step_skip",
-                                    "req_id": module.node_id,
-                                    "step_id": step.step_id,
-                                    "reason": "receipt_ok_present",
-                                },
-                                ensure_ascii=False,
-                            ),
-                            flush=True,
-                        )
-                        continue
-
-                    prior_failure: str | None = None
-                    accepted = False
-                    last_result: ClaudeRunResult | None = None
-                    # v5x G3: arm degrade on rapid_refill retry (breaker/cap unchanged; MCP ON).
-                    degrade_state = {"active": False}
-                    # If repairing, inject harness failure log into implement/batch_test prompts.
-                    repair_log = None
-                    repair_note = step_dir(output_dir, module.node_id) / "repair_note.txt"
-                    if validation_repair > 0 and step.step_id in ("implement", "batch_test") and repair_note.is_file():
-                        repair_log = repair_note.read_text(encoding="utf-8", errors="replace")[-6000:]
-
-                    def on_step_retry(
-                        attempt: int,
-                        result: ClaudeRunResult,
-                        classification: FailureClassification,
-                        delay: int,
-                        _degrade=degrade_state,
-                    ) -> None:
-                        if "rapid_refill" in classification.reason:
-                            _degrade["active"] = True
-                            print(
-                                json.dumps(
-                                    {
-                                        "event": "rapid_refill_needs_degrade",
-                                        "req_id": module.node_id,
-                                        "step_id": step.step_id,
-                                        "attempt": attempt,
-                                        "next_attempt": attempt + 1,
-                                        "classification": classification.reason,
-                                        "note": "next attempt uses degraded system + narrower MCP allow",
-                                    },
-                                    ensure_ascii=False,
-                                ),
-                                flush=True,
-                            )
-                        on_retry(attempt, result, classification, delay)
-
-                    for step_attempt in range(1, max_step_retries + 2):
-                        def run_attempt(attempt: int, _step=step, _prior_ref=lambda: prior_failure, _repair=repair_log, _vrep=validation_repair, _degrade=degrade_state) -> ClaudeRunResult:
-                            runtime.events.mark_implementation_started(
-                                module.node_id,
-                                f"STEP {_step.step_id} ({_step.title}) attempt {attempt} for {module.name}",
-                            )
-                            prompt = step_prompt(
-                                module,
-                                requirements_dir,
-                                skills_dir,
-                                completed,
-                                args.task_type,
-                                _step,
-                                attempt=attempt,
-                                prior_failure=_prior_ref(),
-                                validation_failure=_repair,
-                                validation_repair=_vrep,
-                            )
-                            attempt_base_url = base_url_for_attempt(base_urls, attempt)
-                            attempt_env = claude_env.copy()
-                            attempt_env["MODEL"] = model
-                            if gateway_proc is not None:
-                                # Keep bridge auth; upstream key stays inside the proxy process.
-                                attempt_env["ANTHROPIC_BASE_URL"] = "http://127.0.0.1:8787"
-                                attempt_env["ANTHROPIC_API_KEY"] = "arc-local"
-                                for _k in ("ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY_OLD", "CLAUDE_CODE_API_KEY"):
-                                    attempt_env.pop(_k, None)
-                                attempt_env["OPENAI_API_KEY"] = "arc-local"
-                                attempt_env["OPENAI_BASE_URL"] = "http://127.0.0.1:8787"
-                                attempt_env = sdk_driver.apply_contest_model_env(attempt_env, "sonnet")
-                            else:
-                                attempt_env["OPENAI_API_KEY"] = api_key
-                                attempt_env["OPENAI_BASE_URL"] = attempt_base_url
-                                attempt_env = apply_official_claude_env(
-                                    attempt_env, base_url=attempt_base_url, api_key=api_key, model=model
-                                )
-                                attempt_env["ANTHROPIC_API_KEY"] = ""
-                                if api_key:
-                                    attempt_env["ANTHROPIC_AUTH_TOKEN"] = api_key
-                                attempt_env = sdk_driver.apply_contest_model_env(attempt_env, model)
-                            print(
-                                json.dumps(
-                                    {
-                                        "event": "step_started",
-                                        "req_id": module.node_id,
-                                        "step_id": _step.step_id,
-                                        "title": _step.title,
-                                        "required_skills": list(_step.required_skills),
-                                        "attempt": attempt,
-                                        "prior_failure": _prior_ref(),
-                                        "validation_repair": _vrep,
-                                        "driver": "ClaudeSDKClient",
-                                    },
-                                    ensure_ascii=False,
-                                ),
-                                flush=True,
-                            )
-                            return run_claude_via_sdk(
-                                prompt=prompt,
-                                output_dir=output_dir,
-                                model=model,
-                                claude_bin=claude_bin,
-                                gsc_dir=gsc_dir,
-                                mcp_config=mcp_config_path,
-                                enable_mcp=enable_mcp,
-                                attempt_env=attempt_env,
-                                skills_dir=skills_dir,
-                                max_budget_usd=max_budget_usd,
-                                max_turns=sdk_driver.max_turns_for_step(_step.step_id),
-                                step_id=_step.step_id,
-                                degrade_mode=bool(_degrade.get("active")),
-                            )
-
-                        result, api_attempts = execute_with_retry(
-                            run_attempt,
-                            max_retries=max_retries,
-                            base_seconds=retry_base_seconds,
-                            max_seconds=retry_max_seconds,
-                            on_retry=on_step_retry,
-                        )
-                        last_result = result
-                        classification = classify_claude_failure(result)
-                        if result.returncode != 0 or result.is_error:
-                            term_reason = (result.terminal_reason or "").lower()
-                            max_turns_hit = "max_turns" in term_reason or term_reason.endswith("max_turns")
-                            # v5r: if SPEC/others hit max_turns but artifacts already satisfy
-                            # acceptance (e.g. wrote once then thrashed on identical reads), soft-accept.
-                            if max_turns_hit:
-                                soft_acc = evaluate_step_acceptance(output_dir, module, step, result)
-                                if soft_acc.ok:
-                                    soft_acc = StepAcceptance(
-                                        ok=True,
-                                        reason=f"{soft_acc.reason} (soft-accept after max_turns)",
-                                        skills_seen=soft_acc.skills_seen,
-                                        missing_skills=soft_acc.missing_skills,
-                                        artifacts=soft_acc.artifacts,
-                                        mcp_required=soft_acc.mcp_required,
-                                        mcp_optional_seen=soft_acc.mcp_optional_seen,
-                                        commit_gate_status=soft_acc.commit_gate_status,
-                                        soft_notes=tuple(list(soft_acc.soft_notes) + ["soft_accept:max_turns"]),
-                                    )
-                                    write_step_receipt(output_dir, module.node_id, step, soft_acc, claude=result)
-                                    print(
-                                        json.dumps(
-                                            {
-                                                "event": "step_acceptance",
-                                                "req_id": module.node_id,
-                                                "step_id": step.step_id,
-                                                "ok": True,
-                                                "reason": soft_acc.reason,
-                                                "skills_seen": list(soft_acc.skills_seen),
-                                                "missing_skills": list(soft_acc.missing_skills),
-                                                "artifacts": list(soft_acc.artifacts),
-                                                "step_attempt": step_attempt,
-                                                "mcp_tools_used": list(result.mcp_tools_used),
-                                                "soft_accept_max_turns": True,
-                                                "terminal_reason": result.terminal_reason,
-                                            },
-                                            ensure_ascii=False,
-                                        ),
-                                        flush=True,
-                                    )
-                                    accepted = True
-                                    break
-                            terminal = {
-                                "event": "step_terminal_failure",
+        while True:
+            for step in steps_to_run:
+                if has_step_receipt(work_dir, module.node_id, step.step_id):
+                    print(
+                        json.dumps(
+                            {
+                                "event": "step_skip",
                                 "req_id": module.node_id,
                                 "step_id": step.step_id,
-                                "step_attempt": step_attempt,
-                                "api_attempts": api_attempts,
-                                "classification": classification.reason,
-                                "terminal_reason": result.terminal_reason or "unknown",
-                                "returncode": result.returncode,
-                                "skills_loaded": list(result.skills_loaded),
-                                "max_turns_soft_accept_attempted": max_turns_hit,
-                            }
-                            print(json.dumps(terminal, ensure_ascii=False), file=sys.stderr, flush=True)
-                            prior_failure = classification.reason
-                            if step_attempt >= max_step_retries + 1:
-                                runtime.events.mark_implementation_failed(
-                                    module.node_id,
-                                    f"STEP {step.step_id} Claude failed: {classification.reason}",
-                                )
-                                runtime.events.mark_test_failed(module.node_id, f"STEP {step.step_id} did not complete")
-                                runtime.events.mark_run_failed(
-                                    f"Module {module.node_id} STEP {step.step_id} failed: {classification.reason}"
-                                )
-                                return result.returncode or 1
-                            continue
+                                "reason": "receipt_ok_present",
+                                "work_dir": str(work_dir),
+                                "wave": wave_ctx.get("wave_index"),
+                                "domain": wave_ctx.get("domain_id"),
+                            },
+                            ensure_ascii=False,
+                        ),
+                        flush=True,
+                    )
+                    continue
 
-                        acceptance = evaluate_step_acceptance(output_dir, module, step, result)
-                        write_step_receipt(output_dir, module.node_id, step, acceptance, claude=result)
+                prior_failure: str | None = None
+                accepted = False
+                degrade_state = {"active": False}
+                repair_log = None
+                repair_note = step_dir(work_dir, module.node_id) / "repair_note.txt"
+                if local_repair > 0 and step.step_id in ("implement", "batch_test") and repair_note.is_file():
+                    repair_log = repair_note.read_text(encoding="utf-8", errors="replace")[-6000:]
+
+                def on_step_retry(
+                    attempt: int,
+                    result: ClaudeRunResult,
+                    classification: FailureClassification,
+                    delay: int,
+                    _degrade=degrade_state,
+                ) -> None:
+                    if "rapid_refill" in classification.reason:
+                        _degrade["active"] = True
                         print(
                             json.dumps(
                                 {
-                                    "event": "step_acceptance",
+                                    "event": "rapid_refill_needs_degrade",
                                     "req_id": module.node_id,
                                     "step_id": step.step_id,
-                                    "ok": acceptance.ok,
-                                    "reason": acceptance.reason,
-                                    "skills_seen": list(acceptance.skills_seen),
-                                    "missing_skills": list(acceptance.missing_skills),
-                                    "artifacts": list(acceptance.artifacts),
-                                    "step_attempt": step_attempt,
-                                    "mcp_tools_used": list(result.mcp_tools_used),
+                                    "attempt": attempt,
+                                    "next_attempt": attempt + 1,
+                                    "classification": classification.reason,
+                                    "note": "next attempt uses degraded system + narrower MCP allow",
                                 },
                                 ensure_ascii=False,
                             ),
                             flush=True,
                         )
-                        if acceptance.ok:
-                            accepted = True
-                            break
-                        prior_failure = acceptance.reason
-                        clear_step_receipt(output_dir, module.node_id, step.step_id)
-                        # keep json for debug: rewrite failed receipt without .ok
-                        write_step_receipt(output_dir, module.node_id, step, acceptance, claude=result)
+                    on_retry(attempt, result, classification, delay)
 
-                    if not accepted:
-                        runtime.events.mark_implementation_failed(
+                for step_attempt in range(1, max_step_retries + 2):
+                    def run_attempt(
+                        attempt: int,
+                        _step=step,
+                        _prior_ref=lambda: prior_failure,
+                        _repair=repair_log,
+                        _vrep=local_repair,
+                        _degrade=degrade_state,
+                    ) -> ClaudeRunResult:
+                        runtime.events.mark_implementation_started(
                             module.node_id,
-                            f"STEP {step.step_id} acceptance failed (fail-closed): {prior_failure}",
+                            f"STEP {_step.step_id} ({_step.title}) attempt {attempt} for {module.name}",
                         )
-                        runtime.events.mark_test_failed(
-                            module.node_id,
-                            f"STEP {step.step_id} acceptance failed",
+                        prompt = step_prompt(
+                            module,
+                            requirements_dir,
+                            skills_dir,
+                            completed,
+                            args.task_type,
+                            _step,
+                            attempt=attempt,
+                            prior_failure=_prior_ref(),
+                            validation_failure=_repair,
+                            validation_repair=_vrep,
+                            wave_ctx=wave_ctx,
                         )
-                        runtime.events.mark_run_failed(
-                            f"Module {module.node_id} stopped at STEP {step.step_id}: {prior_failure}"
-                        )
+                        attempt_base_url = base_url_for_attempt(base_urls, attempt)
+                        attempt_env = claude_env.copy()
+                        attempt_env["MODEL"] = model
+                        if gateway_proc is not None:
+                            attempt_env["ANTHROPIC_BASE_URL"] = "http://127.0.0.1:8787"
+                            attempt_env["ANTHROPIC_API_KEY"] = "arc-local"
+                            for _k in ("ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY_OLD", "CLAUDE_CODE_API_KEY"):
+                                attempt_env.pop(_k, None)
+                            attempt_env["OPENAI_API_KEY"] = "arc-local"
+                            attempt_env["OPENAI_BASE_URL"] = "http://127.0.0.1:8787"
+                            attempt_env = sdk_driver.apply_contest_model_env(attempt_env, "sonnet")
+                        else:
+                            attempt_env["OPENAI_API_KEY"] = api_key
+                            attempt_env["OPENAI_BASE_URL"] = attempt_base_url
+                            attempt_env = apply_official_claude_env(
+                                attempt_env, base_url=attempt_base_url, api_key=api_key, model=model
+                            )
+                            attempt_env["ANTHROPIC_API_KEY"] = ""
+                            if api_key:
+                                attempt_env["ANTHROPIC_AUTH_TOKEN"] = api_key
+                            attempt_env = sdk_driver.apply_contest_model_env(attempt_env, model)
                         print(
                             json.dumps(
                                 {
-                                    "event": "step_acceptance_exhausted",
+                                    "event": "step_started",
                                     "req_id": module.node_id,
-                                    "step_id": step.step_id,
-                                    "reason": prior_failure,
-                                    "required_skills": list(step.required_skills),
+                                    "step_id": _step.step_id,
+                                    "title": _step.title,
+                                    "required_skills": list(_step.required_skills),
+                                    "attempt": attempt,
+                                    "prior_failure": _prior_ref(),
+                                    "validation_repair": _vrep,
+                                    "driver": "ClaudeSDKClient",
+                                    "work_dir": str(work_dir),
+                                    "wave": wave_ctx.get("wave_index"),
+                                    "domain": wave_ctx.get("domain_id"),
                                 },
                                 ensure_ascii=False,
                             ),
-                            file=sys.stderr,
                             flush=True,
                         )
-                        return 1
+                        return run_claude_via_sdk(
+                            prompt=prompt,
+                            output_dir=work_dir,
+                            model=model,
+                            claude_bin=claude_bin,
+                            gsc_dir=gsc_dir,
+                            mcp_config=mcp_config_path,
+                            enable_mcp=enable_mcp,
+                            attempt_env=attempt_env,
+                            skills_dir=skills_dir,
+                            max_budget_usd=max_budget_usd,
+                            max_turns=sdk_driver.max_turns_for_step(_step.step_id),
+                            step_id=_step.step_id,
+                            degrade_mode=bool(_degrade.get("active")),
+                        )
 
-                # All STEPs accepted. batch_test already ran harness validation; persist module receipt.
-                validation = run_module_validation(output_dir, module)
-                print(
-                    json.dumps(
-                        {
-                            "event": "module_validation",
+                    result, api_attempts = execute_with_retry(
+                        run_attempt,
+                        max_retries=max_retries,
+                        base_seconds=retry_base_seconds,
+                        max_seconds=retry_max_seconds,
+                        on_retry=on_step_retry,
+                    )
+                    classification = classify_claude_failure(result)
+                    if result.returncode != 0 or result.is_error:
+                        term_reason = (result.terminal_reason or "").lower()
+                        max_turns_hit = "max_turns" in term_reason or term_reason.endswith("max_turns")
+                        if max_turns_hit:
+                            soft_acc = evaluate_step_acceptance(work_dir, module, step, result)
+                            if soft_acc.ok:
+                                soft_acc = StepAcceptance(
+                                    ok=True,
+                                    reason=f"{soft_acc.reason} (soft-accept after max_turns)",
+                                    skills_seen=soft_acc.skills_seen,
+                                    missing_skills=soft_acc.missing_skills,
+                                    artifacts=soft_acc.artifacts,
+                                    mcp_required=soft_acc.mcp_required,
+                                    mcp_optional_seen=soft_acc.mcp_optional_seen,
+                                    commit_gate_status=soft_acc.commit_gate_status,
+                                    soft_notes=tuple(list(soft_acc.soft_notes) + ["soft_accept:max_turns"]),
+                                )
+                                write_step_receipt(work_dir, module.node_id, step, soft_acc, claude=result)
+                                print(
+                                    json.dumps(
+                                        {
+                                            "event": "step_acceptance",
+                                            "req_id": module.node_id,
+                                            "step_id": step.step_id,
+                                            "ok": True,
+                                            "reason": soft_acc.reason,
+                                            "soft_accept_max_turns": True,
+                                            "wave": wave_ctx.get("wave_index"),
+                                            "domain": wave_ctx.get("domain_id"),
+                                        },
+                                        ensure_ascii=False,
+                                    ),
+                                    flush=True,
+                                )
+                                accepted = True
+                                break
+                        terminal = {
+                            "event": "step_terminal_failure",
                             "req_id": module.node_id,
-                            "ok": validation.ok,
-                            "exit_code": validation.exit_code,
-                            "cmd": validation.cmd,
-                            "reason": validation.reason,
-                            "project_dir": validation.project_dir,
-                            "validation_repair": validation_repair,
-                            "max_validation_repairs": max_validation_repairs,
-                            "note": "post-STEP-loop confirmation",
-                        },
-                        ensure_ascii=False,
-                    ),
-                    flush=True,
-                )
-                gate = decide_validation_gate(
-                    validation,
-                    validation_repair=validation_repair,
-                    max_validation_repairs=max_validation_repairs,
-                )
-                if gate.action == "pass":
-                    write_validation_receipt(output_dir, module.node_id, validation)
-                    runtime.events.mark_implementation_done(
-                        module.node_id,
-                        f"Implemented {module.name} via Official STEP loop"
-                        + (f"; validation_repair {validation_repair}" if validation_repair else ""),
-                    )
-                    runtime.events.mark_test_passed(
-                        module.node_id,
-                        "Harness local validation passed after STEP loop",
-                    )
-                    runtime.git.commit(f"{module.node_id}: {module.name}")
-                    completed.append(module.node_id)
-                    break
+                            "step_id": step.step_id,
+                            "step_attempt": step_attempt,
+                            "api_attempts": api_attempts,
+                            "classification": classification.reason,
+                            "terminal_reason": result.terminal_reason or "unknown",
+                            "returncode": result.returncode,
+                            "skills_loaded": list(result.skills_loaded),
+                            "max_turns_soft_accept_attempted": max_turns_hit,
+                        }
+                        print(json.dumps(terminal, ensure_ascii=False), file=sys.stderr, flush=True)
+                        prior_failure = classification.reason
+                        if step_attempt >= max_step_retries + 1:
+                            runtime.events.mark_implementation_failed(
+                                module.node_id,
+                                f"STEP {step.step_id} Claude failed: {classification.reason}",
+                            )
+                            runtime.events.mark_test_failed(module.node_id, f"STEP {step.step_id} did not complete")
+                            runtime.events.mark_run_failed(
+                                f"Module {module.node_id} STEP {step.step_id} failed: {classification.reason}"
+                            )
+                            return result.returncode or 1
+                        continue
 
-                clear_validation_receipt(output_dir, module.node_id)
-                fail_msg = validation.reason
-                if validation.log_tail:
-                    fail_msg = f"{validation.reason}\n{validation.log_tail[-2000:]}"
-                runtime.events.mark_test_failed(
-                    module.node_id,
-                    f"Harness validation failed: {validation.reason}",
-                )
-                if gate.action == "fail":
+                    acceptance = evaluate_step_acceptance(work_dir, module, step, result)
+                    write_step_receipt(work_dir, module.node_id, step, acceptance, claude=result)
+                    print(
+                        json.dumps(
+                            {
+                                "event": "step_acceptance",
+                                "req_id": module.node_id,
+                                "step_id": step.step_id,
+                                "ok": acceptance.ok,
+                                "reason": acceptance.reason,
+                                "skills_seen": list(acceptance.skills_seen),
+                                "missing_skills": list(acceptance.missing_skills),
+                                "artifacts": list(acceptance.artifacts),
+                                "step_attempt": step_attempt,
+                                "mcp_tools_used": list(result.mcp_tools_used),
+                                "wave": wave_ctx.get("wave_index"),
+                                "domain": wave_ctx.get("domain_id"),
+                            },
+                            ensure_ascii=False,
+                        ),
+                        flush=True,
+                    )
+                    if acceptance.ok:
+                        accepted = True
+                        break
+                    prior_failure = acceptance.reason
+                    clear_step_receipt(work_dir, module.node_id, step.step_id)
+                    write_step_receipt(work_dir, module.node_id, step, acceptance, claude=result)
+
+                if not accepted:
                     runtime.events.mark_implementation_failed(
                         module.node_id,
-                        f"Harness validation exhausted after {validation_repair} repair(s): {validation.reason}",
+                        f"STEP {step.step_id} acceptance failed (fail-closed): {prior_failure}",
+                    )
+                    runtime.events.mark_test_failed(
+                        module.node_id,
+                        f"STEP {step.step_id} acceptance failed",
                     )
                     runtime.events.mark_run_failed(
-                        f"Module {module.node_id} harness validation failed after "
-                        f"{validation_repair} repair(s): {validation.reason}"
+                        f"Module {module.node_id} stopped at STEP {step.step_id}: {prior_failure}"
                     )
                     print(
                         json.dumps(
                             {
-                                "event": "module_validation_exhausted",
+                                "event": "step_acceptance_exhausted",
                                 "req_id": module.node_id,
-                                "validation_repair": validation_repair,
-                                "max_validation_repairs": max_validation_repairs,
-                                "reason": validation.reason,
-                                "classification": "non-retryable:validation",
-                                "gate": gate.reason,
+                                "step_id": step.step_id,
+                                "reason": prior_failure,
+                                "required_skills": list(step.required_skills),
                             },
                             ensure_ascii=False,
                         ),
                         file=sys.stderr,
                         flush=True,
                     )
-                    return validation.exit_code or 1
+                    return 1
 
-                validation_repair += 1
-                # Repair: clear implement + batch_test receipts and re-run those STEPs only.
-                for sid in ("implement", "batch_test"):
-                    clear_step_receipt(output_dir, module.node_id, sid)
-                steps_to_run = [s for s in official_steps() if s.step_id in ("implement", "audit_refactor", "batch_test")]
-                # Seed prior failure into batch_test via a repair note file
-                repair_note = step_dir(output_dir, module.node_id) / "repair_note.txt"
-                repair_note.parent.mkdir(parents=True, exist_ok=True)
-                repair_note.write_text(fail_msg[-6000:], encoding="utf-8")
-                runtime.events.mark_run_resumed(
-                    f"Validation repair {validation_repair}/{max_validation_repairs} for {module.node_id}; "
-                    "re-running implement+batch_test STEPs"
+            if not do_post_validation:
+                # DOMAIN DEV path: STEPs accepted; NO per-REQ BATCH_TEST / mark_test_passed.
+                runtime.events.mark_implementation_done(
+                    module.node_id,
+                    f"DOMAIN DEV STEPs done for {module.name} (await WAVE merge + BATCH_TEST)",
+                )
+                return 0
+
+            # WAVE-central batch_test confirmation
+            validation = run_module_validation(work_dir, module)
+            print(
+                json.dumps(
+                    {
+                        "event": "module_validation",
+                        "req_id": module.node_id,
+                        "ok": validation.ok,
+                        "exit_code": validation.exit_code,
+                        "cmd": validation.cmd,
+                        "reason": validation.reason,
+                        "project_dir": validation.project_dir,
+                        "validation_repair": local_repair,
+                        "max_validation_repairs": max_validation_repairs,
+                        "note": "WAVE-central post-merge BATCH_TEST confirmation",
+                        "wave": wave_ctx.get("wave_index"),
+                    },
+                    ensure_ascii=False,
+                ),
+                flush=True,
+            )
+            gate = decide_validation_gate(
+                validation,
+                validation_repair=local_repair,
+                max_validation_repairs=max_validation_repairs,
+            )
+            if gate.action == "pass":
+                write_validation_receipt(work_dir, module.node_id, validation)
+                runtime.events.mark_implementation_done(
+                    module.node_id,
+                    f"WAVE BATCH_TEST passed for {module.name}"
+                    + (f"; validation_repair {local_repair}" if local_repair else ""),
+                )
+                runtime.events.mark_test_passed(
+                    module.node_id,
+                    "Harness local validation passed after WAVE merge BATCH_TEST",
+                )
+                runtime.git.commit(f"{module.node_id}: {module.name}")
+                if module.node_id not in completed:
+                    completed.append(module.node_id)
+                return 0
+
+            clear_validation_receipt(work_dir, module.node_id)
+            fail_msg = validation.reason
+            if validation.log_tail:
+                fail_msg = f"{validation.reason}\n{validation.log_tail[-2000:]}"
+            runtime.events.mark_test_failed(
+                module.node_id,
+                f"Harness validation failed: {validation.reason}",
+            )
+            if gate.action == "fail":
+                runtime.events.mark_implementation_failed(
+                    module.node_id,
+                    f"Harness validation exhausted after {local_repair} repair(s): {validation.reason}",
+                )
+                runtime.events.mark_run_failed(
+                    f"Module {module.node_id} harness validation failed after "
+                    f"{local_repair} repair(s): {validation.reason}"
                 )
                 print(
                     json.dumps(
                         {
-                            "event": "step_repair_rewind",
+                            "event": "module_validation_exhausted",
                             "req_id": module.node_id,
-                            "validation_repair": validation_repair,
-                            "replay_steps": [s.step_id for s in steps_to_run],
+                            "validation_repair": local_repair,
+                            "max_validation_repairs": max_validation_repairs,
+                            "reason": validation.reason,
+                            "classification": "non-retryable:validation",
+                            "gate": gate.reason,
+                        },
+                        ensure_ascii=False,
+                    ),
+                    file=sys.stderr,
+                    flush=True,
+                )
+                return validation.exit_code or 1
+
+            local_repair += 1
+            for sid in ("implement", "batch_test"):
+                clear_step_receipt(work_dir, module.node_id, sid)
+            steps_to_run = [
+                s for s in official_steps() if s.step_id in ("implement", "audit_refactor", "batch_test")
+            ]
+            repair_note = step_dir(work_dir, module.node_id) / "repair_note.txt"
+            repair_note.parent.mkdir(parents=True, exist_ok=True)
+            repair_note.write_text(fail_msg[-6000:], encoding="utf-8")
+            runtime.events.mark_run_resumed(
+                f"WAVE validation repair {local_repair}/{max_validation_repairs} for {module.node_id}; "
+                "re-running implement+batch_test STEPs"
+            )
+            print(
+                json.dumps(
+                    {
+                        "event": "step_repair_rewind",
+                        "req_id": module.node_id,
+                        "validation_repair": local_repair,
+                        "replay_steps": [s.step_id for s in steps_to_run],
+                        "wave": wave_ctx.get("wave_index"),
+                    },
+                    ensure_ascii=False,
+                ),
+                flush=True,
+            )
+
+    try:
+        for wave in waves:
+            wave_modules = [m for g in wave.domains for m in g.modules]
+            print(
+                json.dumps(
+                    {
+                        "event": "wave_started",
+                        "wave_index": wave.wave_index,
+                        "wave_total": len(waves),
+                        "domains": [g.domain_id for g in wave.domains],
+                        "req_ids": [m.node_id for m in wave_modules],
+                        "note": (
+                            "non-conflicting DOMAINs are concurrent tracks; "
+                            "agent runtime runs DOMAIN worktrees sequentially when single-threaded"
+                        ),
+                    },
+                    ensure_ascii=False,
+                ),
+                flush=True,
+            )
+            domain_worktrees: dict[str, Path] = {}
+
+            # --- DOMAIN DEV in worktrees (no BATCH_TEST) ---
+            for group in wave.domains:
+                wt = ensure_domain_worktree(output_dir, group.domain_id)
+                domain_worktrees[group.domain_id] = wt
+                # Ensure SPEC/CLAUDE softener exist in the DOMAIN worktree
+                ensure_arc_spawn_gate_softener(wt)
+                for module in group.modules:
+                    ensure_gsc_spec(wt, module)
+
+                wave_ctx_base = {
+                    "wave_index": wave.wave_index,
+                    "wave_total": len(waves),
+                    "wave_domains": [g.domain_id for g in wave.domains],
+                    "domain_id": group.domain_id,
+                    "worktree": str(wt),
+                    "sibling_reqs": [m.node_id for m in group.modules],
+                    "plan_summary": wave_plan_summary(waves),
+                }
+                print(
+                    json.dumps(
+                        {
+                            "event": "domain_started",
+                            "wave_index": wave.wave_index,
+                            "domain_id": group.domain_id,
+                            "worktree": str(wt),
+                            "req_ids": [m.node_id for m in group.modules],
+                            "depends_on": list(group.depends_on),
+                            "conflicts_with": list(group.conflicts_with),
                         },
                         ensure_ascii=False,
                     ),
                     flush=True,
                 )
 
-        runtime.events.mark_run_completed("All ROOT modules completed")
+                pending_modules: list[RequirementModule] = []
+                for module in group.modules:
+                    if module_already_passed(runtime, module.node_id, output_dir):
+                        print(
+                            json.dumps(
+                                {
+                                    "event": "module_skip",
+                                    "req_id": module.node_id,
+                                    "reason": "PASSED_with_validation_receipt",
+                                    "wave": wave.wave_index,
+                                    "domain": group.domain_id,
+                                },
+                                ensure_ascii=False,
+                            ),
+                            flush=True,
+                        )
+                        if module.node_id not in completed:
+                            completed.append(module.node_id)
+                        continue
+                    pending_modules.append(module)
+
+                pre_implement = [
+                    s
+                    for s in domain_dev_steps()
+                    if s.step_id not in ("implement", "audit_refactor")
+                ]
+                implement_batch = [
+                    s
+                    for s in domain_dev_steps()
+                    if s.step_id in ("implement", "audit_refactor")
+                ]
+
+                for module in pending_modules:
+                    print(
+                        f"[arc-claude-gsc] WAVE{wave.wave_index} DOMAIN {group.domain_id} "
+                        f"module {module.index}/{module.total}: {module.node_id} - {module.name}",
+                        flush=True,
+                    )
+                    runtime.events.mark_design_started(
+                        module.node_id,
+                        f"WAVE{wave.wave_index} DOMAIN {group.domain_id} planning {module.name}",
+                    )
+                    runtime.events.mark_design_done(
+                        module.node_id,
+                        f"Delegated {module.name} to DOMAIN worktree {wt.name}",
+                    )
+                    rc = execute_steps_for_module(
+                        module=module,
+                        steps_to_run=list(pre_implement),
+                        work_dir=wt,
+                        wave_ctx=wave_ctx_base,
+                        do_post_validation=False,
+                    )
+                    if rc != 0:
+                        return rc
+
+                if pending_modules and implement_batch:
+                    primary = pending_modules[0]
+                    print(
+                        json.dumps(
+                            {
+                                "event": "domain_implement_batch",
+                                "wave_index": wave.wave_index,
+                                "domain_id": group.domain_id,
+                                "primary_req": primary.node_id,
+                                "sibling_reqs": [m.node_id for m in pending_modules],
+                                "steps": [s.step_id for s in implement_batch],
+                            },
+                            ensure_ascii=False,
+                        ),
+                        flush=True,
+                    )
+                    rc = execute_steps_for_module(
+                        module=primary,
+                        steps_to_run=list(implement_batch),
+                        work_dir=wt,
+                        wave_ctx=wave_ctx_base,
+                        do_post_validation=False,
+                    )
+                    if rc != 0:
+                        return rc
+                    for sibling in pending_modules[1:]:
+                        for step in implement_batch:
+                            if has_step_receipt(wt, primary.node_id, step.step_id) and not has_step_receipt(
+                                wt, sibling.node_id, step.step_id
+                            ):
+                                src_json = step_receipt_json_path(wt, primary.node_id, step.step_id)
+                                src_ok = step_receipt_ok_path(wt, primary.node_id, step.step_id)
+                                dest_dir = step_dir(wt, sibling.node_id)
+                                dest_dir.mkdir(parents=True, exist_ok=True)
+                                if src_json.is_file():
+                                    raw = src_json.read_text(encoding="utf-8")
+                                    try:
+                                        payload = json.loads(raw)
+                                    except Exception:
+                                        payload = {}
+                                    if isinstance(payload, dict):
+                                        payload["req_id"] = sibling.node_id
+                                        payload["shared_from"] = primary.node_id
+                                        payload["domain_implement_batch"] = True
+                                        step_receipt_json_path(wt, sibling.node_id, step.step_id).write_text(
+                                            json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+                                            encoding="utf-8",
+                                        )
+                                    else:
+                                        step_receipt_json_path(wt, sibling.node_id, step.step_id).write_text(
+                                            raw, encoding="utf-8"
+                                        )
+                                if src_ok.is_file():
+                                    step_receipt_ok_path(wt, sibling.node_id, step.step_id).write_text(
+                                        src_ok.read_text(encoding="utf-8"),
+                                        encoding="utf-8",
+                                    )
+                        runtime.events.mark_implementation_done(
+                            sibling.node_id,
+                            f"DOMAIN IMPLEMENT batch shared from {primary.node_id}",
+                        )
+
+                ok, reason = domain_dev_complete(wt, group, skip_req_ids=set(completed))
+                print(
+                    json.dumps(
+                        {
+                            "event": "domain_accept",
+                            "wave_index": wave.wave_index,
+                            "domain_id": group.domain_id,
+                            "ok": ok,
+                            "reason": reason,
+                            "worktree": str(wt),
+                        },
+                        ensure_ascii=False,
+                    ),
+                    flush=True,
+                )
+                if not ok:
+                    runtime.events.mark_run_failed(
+                        f"DOMAIN {group.domain_id} accept failed before merge: {reason}"
+                    )
+                    return 1
+                commit_domain_worktree(
+                    wt,
+                    group.domain_id,
+                    f"domain {group.domain_id}: DEV accept (WAVE{wave.wave_index})",
+                )
+
+            # --- Merge all passed DOMAIN worktrees to mainline ---
+            for group in wave.domains:
+                wt = domain_worktrees[group.domain_id]
+                print(
+                    json.dumps(
+                        {
+                            "event": "domain_merge",
+                            "wave_index": wave.wave_index,
+                            "domain_id": group.domain_id,
+                            "worktree": str(wt),
+                        },
+                        ensure_ascii=False,
+                    ),
+                    flush=True,
+                )
+                try:
+                    merge_domain_worktree(output_dir, group.domain_id, wt)
+                except Exception as merge_exc:
+                    runtime.events.mark_run_failed(
+                        f"WAVE{wave.wave_index} merge DOMAIN {group.domain_id} failed: {merge_exc}"
+                    )
+                    print(
+                        json.dumps(
+                            {
+                                "event": "domain_merge_failed",
+                                "wave_index": wave.wave_index,
+                                "domain_id": group.domain_id,
+                                "error": str(merge_exc),
+                            },
+                            ensure_ascii=False,
+                        ),
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    return 1
+
+            # Refresh mainline softener after merges
+            ensure_arc_spawn_gate_softener(output_dir)
+
+            # --- Centralized BATCH_TEST after WAVE merge ---
+            print(
+                json.dumps(
+                    {
+                        "event": "wave_batch_test_started",
+                        "wave_index": wave.wave_index,
+                        "req_ids": [m.node_id for m in wave_modules],
+                        "note": "central BATCH_TEST on mainline after all DOMAIN merges",
+                    },
+                    ensure_ascii=False,
+                ),
+                flush=True,
+            )
+            for module in wave_modules:
+                if module_already_passed(runtime, module.node_id, output_dir):
+                    continue
+                wave_ctx_batch = {
+                    "wave_index": wave.wave_index,
+                    "wave_total": len(waves),
+                    "wave_domains": [g.domain_id for g in wave.domains],
+                    "domain_id": module_domain_id(module),
+                    "worktree": str(output_dir),
+                    "sibling_reqs": [m.node_id for m in wave_modules],
+                    "plan_summary": wave_plan_summary(waves),
+                    "phase": "wave_batch_test",
+                }
+                rc = execute_steps_for_module(
+                    module=module,
+                    steps_to_run=list(wave_batch_steps()),
+                    work_dir=output_dir,
+                    wave_ctx=wave_ctx_batch,
+                    do_post_validation=True,
+                )
+                if rc != 0:
+                    return rc
+
+            print(
+                json.dumps(
+                    {
+                        "event": "wave_accepted",
+                        "wave_index": wave.wave_index,
+                        "req_ids": [m.node_id for m in wave_modules],
+                        "domains": [g.domain_id for g in wave.domains],
+                    },
+                    ensure_ascii=False,
+                ),
+                flush=True,
+            )
+
+        runtime.events.mark_run_completed("All WAVEs / ROOT modules completed")
         return 0
     except Exception as exc:
         runtime.events.mark_run_failed(str(exc))
