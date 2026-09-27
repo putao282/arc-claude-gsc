@@ -80,7 +80,16 @@ MCP_TIMEOUT=60000
 ARC_VALIDATION_MAX_REPAIRS=2
 ARC_VALIDATION_TIMEOUT_SECONDS=300
 ARC_FORCE_REVALIDATE=0
+ARC_DISABLE_ANTHROPIC_PROXY=1
+ARC_ENABLE_ANTHROPIC_PROXY=0
 ```
+
+Production Smoke/Official keep `anthropic-proxy` **off** (default). `main.py` maps ARC
+`OPENAI_BASE_URL` / `OPENAI_API_KEY` / `MODEL` into Claude the same way as the official
+Claude Code starter (`ANTHROPIC_API_KEY=""`, `ANTHROPIC_BASE_URL`, `ANTHROPIC_AUTH_TOKEN`,
+raw `--model`). Local ARC-like tests may set `ARC_DISABLE_ANTHROPIC_PROXY=0` and
+`ARC_ENABLE_ANTHROPIC_PROXY=1`, and packagers may set `ARC_PACK_ANTHROPIC_PROXY=1` — never
+for contest submission zips.
 
 GSC MCP is **enabled by default**. `main.py` writes an explicit Claude `--mcp-config` pointing at the packaged GSC `mcp/src/bootstrap.mjs`, and pairs it with `--strict-mcp-config` so only that GSC server is loaded (hooks still come from `--plugin-dir`). Claude `-p` waits for MCP connect up to `MCP_TIMEOUT` ms before the first turn — a softer thrash mitigation than banning `WaitForMcpServers` / MCP tools. Set `ARC_ENABLE_MCP=0` only as an explicit escape hatch (still does not inject "do not use MCP" prompt bans). SPEC scaffolds are HTML 2.0 so GSC MCP can use `spec_read`/`spec_write` without the Markdown migrate dead-end.
 

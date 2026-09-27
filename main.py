@@ -7,6 +7,7 @@ from collections import deque
 import hashlib
 import importlib.metadata
 import json
+import re
 import os
 import pwd
 import shutil
@@ -221,10 +222,50 @@ def env_bool(name: str, default: bool = True) -> bool:
 
 
 
+def apply_official_claude_env(env: dict[str, str], *, base_url: str, api_key: str) -> dict[str, str]:
+    """Map ARC-injected OPENAI_* into Claude env the same way as the official CC starter.
+
+    Official starter (`claude_env_from_openai_env`):
+      ANTHROPIC_API_KEY = ""
+      ANTHROPIC_BASE_URL = OPENAI_BASE_URL (when set)
+      ANTHROPIC_AUTH_TOKEN = OPENAI_API_KEY (when set)
+    No production protocol proxy. Raw MODEL is passed via --model.
+    """
+    out = env.copy()
+    # Prefer auth-token mapping; empty API key so Claude Code does not prefer a stale key.
+    out["ANTHROPIC_API_KEY"] = ""
+    if base_url:
+        out["ANTHROPIC_BASE_URL"] = base_url
+    else:
+        out.pop("ANTHROPIC_BASE_URL", None)
+    if api_key:
+        out["ANTHROPIC_AUTH_TOKEN"] = api_key
+    else:
+        out.pop("ANTHROPIC_AUTH_TOKEN", None)
+    for stale in (
+        "ANTHROPIC_API_KEY_OLD",
+        "CLAUDE_CODE_API_KEY",
+        "CLAUDE_CODE_OAUTH_TOKEN",
+        "ANTHROPIC_CUSTOM_HEADERS",
+    ):
+        out.pop(stale, None)
+    return out
+
+
 def _arc_maybe_start_anthropic_proxy(base_url: str, api_key: str, model: str) -> subprocess.Popen | None:
-    """Claude Messages -> OpenAI chat. Client auth MUST be ANTHROPIC_API_KEY=arc-local."""
+    """LOCAL TEST ONLY. Opt-in via ARC_ENABLE_ANTHROPIC_PROXY=1.
+
+    Production Smoke/Official must NOT use this. Contest path maps ARC OPENAI_* env
+    like the official Claude Code starter (see apply_official_claude_env).
+    Client auth when proxy is enabled MUST be ANTHROPIC_API_KEY=arc-local.
+    """
     gateway_bin = SUBMISSION_DIR / "runtime" / "gateway" / "anthropic-proxy"
-    if not gateway_bin.is_file() or env_bool("ARC_DISABLE_ANTHROPIC_PROXY", False):
+    # Default OFF for contest. Explicit enable required; ARC_DISABLE_ANTHROPIC_PROXY=1 also forces off.
+    if env_bool("ARC_DISABLE_ANTHROPIC_PROXY", True):
+        return None
+    if not env_bool("ARC_ENABLE_ANTHROPIC_PROXY", False):
+        return None
+    if not gateway_bin.is_file():
         return None
     gateway_bin.chmod(0o755)
     chat = base_url.rstrip("/")
@@ -502,7 +543,20 @@ def run_claude_streaming(
     stderr_tail: deque[str] = deque(maxlen=300)
     mcp_tool_counts: dict[str, int] = {}
     skill_loads: list[str] = []
+    skill_tool_available = True  # flipped False on Claude init without Skill tool
     mcp_lock = threading.Lock()
+
+    def _skill_name_from_skill_md_ref(text: str) -> str | None:
+        """Extract skill name from .claude/skills/<name>/SKILL.md or skills/<name>/SKILL.md."""
+        if not text or "SKILL.md" not in text:
+            return None
+        m = re.search(
+            r"(?:\.claude/)?skills/([A-Za-z0-9._-]+)/SKILL\.md",
+            text,
+        )
+        if not m:
+            return None
+        return m.group(1).strip() or None
 
     def _tool_blocks_from_payload(payload: dict) -> list[dict]:
         blocks: list[dict] = []
@@ -523,8 +577,22 @@ def run_claude_streaming(
         return blocks
 
     def note_tools_from_line(line: str) -> None:
-        """Audit MCP tool_use + Skill loads for Official STEP acceptance gates."""
-        if "mcp__" not in line and "Skill" not in line:
+        """Audit MCP tool_use + Skill loads for Official STEP acceptance gates.
+
+        Contest Claude Code may lack the Skill tool (tools list without Skill,
+        skills:[]). In that case, Read/Bash of skills/<name>/SKILL.md counts as
+        fail-closed force-load proof.
+        """
+        nonlocal skill_tool_available
+        # Broad filter: keep init + SKILL.md reads, not only mcp__/Skill strings.
+        if (
+            "mcp__" not in line
+            and "Skill" not in line
+            and "SKILL.md" not in line
+            and "subtype" not in line
+            and ".claude/skills" not in line
+            and "skills/" not in line
+        ):
             return
         try:
             payload = json.loads(line)
@@ -532,6 +600,28 @@ def run_claude_streaming(
             payload = None
         if not isinstance(payload, dict):
             return
+
+        # Detect Skill-tool absence from Claude system init JSON.
+        if payload.get("subtype") == "init":
+            tools = payload.get("tools") if isinstance(payload.get("tools"), list) else []
+            skills_field = payload.get("skills")
+            skills_empty = isinstance(skills_field, list) and len(skills_field) == 0
+            if "Skill" not in tools or skills_empty:
+                if skill_tool_available:
+                    skill_tool_available = False
+                    print(
+                        json.dumps(
+                            {
+                                "event": "skill_tool_unavailable",
+                                "tools_sample": tools[:12],
+                                "skills": skills_field if isinstance(skills_field, list) else skills_field,
+                                "note": "Skill tool missing or skills:[]; accept SKILL.md Read/Bash as force-load proof",
+                            },
+                            ensure_ascii=False,
+                        ),
+                        flush=True,
+                    )
+
         for block in _tool_blocks_from_payload(payload):
             name = block.get("name")
             if not isinstance(name, str):
@@ -565,7 +655,34 @@ def run_claude_streaming(
                     skill_loads.append(skill_name)
                 print(
                     json.dumps(
-                        {"event": "skill_loaded", "skill": skill_name},
+                        {"event": "skill_loaded", "skill": skill_name, "via": "skill_tool"},
+                        ensure_ascii=False,
+                    ),
+                    flush=True,
+                )
+            elif name in ("Read", "Bash") and not skill_tool_available:
+                inp = block.get("input") if isinstance(block.get("input"), dict) else {}
+                blob_parts: list[str] = []
+                for key in ("file_path", "path", "filePath", "command", "cmd"):
+                    val = inp.get(key)
+                    if isinstance(val, str) and val:
+                        blob_parts.append(val)
+                if not blob_parts and isinstance(inp.get("args"), str):
+                    blob_parts.append(inp["args"])
+                blob = chr(10).join(blob_parts)
+                skill_name = _skill_name_from_skill_md_ref(blob)
+                if not skill_name:
+                    continue
+                with mcp_lock:
+                    skill_loads.append(skill_name)
+                print(
+                    json.dumps(
+                        {
+                            "event": "skill_loaded",
+                            "skill": skill_name,
+                            "via": "skill_md_read",
+                            "tool": name,
+                        },
                         ensure_ascii=False,
                     ),
                     flush=True,
@@ -1290,8 +1407,11 @@ def ensure_arc_spawn_gate_softener(output_dir: Path) -> None:
         "6. **batch_test** — FORCE-LOAD Skill `arcbench-runtime-signals`; run batch tests "
         "once after code is done.\n\n"
         "## Per-STEP rules\n"
-        "- FIRST tool action in each STEP: use the Skill tool to load that STEP's required skill(s).\n"
-        "- No skill load => STEP acceptance FAILS (fail-closed); harness will not advance.\n"
+        "- FIRST tool action in each STEP: FORCE-LOAD that STEP's required skill(s).\n"
+        "- Prefer Skill tool when present; if Skill tool is missing, Read/Bash-cat "
+        "`.claude/skills/<name>/SKILL.md` (or `skills/<name>/SKILL.md`) as force-load proof.\n"
+        "- No Skill tool load AND no SKILL.md read proof => STEP acceptance FAILS "
+        "(fail-closed); harness will not advance.\n"
         "- Write receipt JSON to the path given in the STEP prompt when exit criteria are met.\n"
         "- Prefer visible GSC MCP calls (prd/spec_*/state_*) for planning.\n"
         "- Prefer main session; do not spawn Agent/Task.\n"
@@ -1649,8 +1769,13 @@ def step_prompt(
         HARD RULES:
         - GSC MCP stays ON. Never disable WaitForMcpServers / never ARC_ENABLE_MCP=0 / never ban MCP.
         - This round is ONLY for STEP `{step.step_id}`. Do not perform later STEPs.
-        - FORCE-LOAD required skill(s) FIRST via the Skill tool before other work: {skill_lines}
-        - If you skip Skill load, harness acceptance FAILS (fail-closed) and you will not advance.
+        - FORCE-LOAD required skill(s) FIRST before other work: {skill_lines}
+        - If the Skill tool is in your available tools: use it to load each required skill first.
+        - If Skill tool is MISSING from available tools: FIRST action MUST be Read (or Bash cat/head)
+          of `.claude/skills/<name>/SKILL.md` or `skills/<name>/SKILL.md` for each required skill
+          (fail-closed force-load proof when Skill tool absent).
+        - If you provide neither Skill tool load nor SKILL.md read proof, harness acceptance FAILS
+          (fail-closed) and you will not advance.
         - Prefer main session; do NOT spawn Agent/Task.
         - Keep tool outputs small (no huge lockfiles/schemas).
 
@@ -1835,17 +1960,17 @@ def main() -> int:
     env["MCP_TIMEOUT"] = str(mcp_timeout_ms)
     env["PATH"] = os.pathsep.join([str(gsc_dir / "bin"), str(gsc_dir / "lsp" / "web" / "node_modules" / ".bin"), env.get("PATH", "")])
 
+    # Contest default: official OPENAI_* → ANTHROPIC_* mapping (no proxy).
+    # Local ARC-like smoke may set ARC_ENABLE_ANTHROPIC_PROXY=1 + ARC_DISABLE_ANTHROPIC_PROXY=0.
     gateway_proc = _arc_maybe_start_anthropic_proxy(base_url, api_key, model)
-    claude_env = env.copy()
     if gateway_proc is not None:
+        claude_env = env.copy()
         claude_env["ANTHROPIC_BASE_URL"] = "http://127.0.0.1:8787"
         claude_env["ANTHROPIC_API_KEY"] = "arc-local"
-        for _k in ("ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY_OLD", "CLAUDE_CODE_API_KEY"):
+        for _k in ("ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY_OLD", "CLAUDE_CODE_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN"):
             claude_env.pop(_k, None)
     else:
-        claude_env["ANTHROPIC_BASE_URL"] = base_url
-        claude_env["ANTHROPIC_AUTH_TOKEN"] = api_key
-        claude_env["ANTHROPIC_API_KEY"] = ""
+        claude_env = apply_official_claude_env(env, base_url=base_url, api_key=api_key)
     if gateway_proc is not None:
         def _stop_gateway(proc=gateway_proc):
             if proc.poll() is None:
@@ -1999,7 +2124,9 @@ def main() -> int:
                     command.extend(["--max-budget-usd", max_budget_usd])
                 attempt_env = claude_env.copy()
                 if gateway_proc is None:
-                    attempt_env["ANTHROPIC_BASE_URL"] = attempt_base_url
+                    attempt_env = apply_official_claude_env(
+                        attempt_env, base_url=attempt_base_url, api_key=api_key
+                    )
                 return command, attempt_env
 
             # Fail-closed Official STEP loop: skill proof + artifacts before advance.

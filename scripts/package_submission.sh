@@ -52,6 +52,32 @@ with zipfile.ZipFile(src) as zf:
             target.write_bytes(zf.read(info))
 PY
 
+echo "[1b/2] copy contest skills (architect/designer); proxy NOT packed by default"
+# Architect/designer skills (not in Factory starter ZIP)
+for skill in architect designer; do
+  if [[ -d "$ROOT/skills/$skill" ]]; then
+    mkdir -p "$STAGE/skills/$skill"
+    cp -a "$ROOT/skills/$skill/." "$STAGE/skills/$skill/"
+    echo "  + skills/$skill"
+  fi
+done
+# anthropic-proxy is LOCAL TEST ONLY. Contest Smoke/Official follow official CC starter
+# OPENAI_* → ANTHROPIC_* mapping and must NOT require a bundled protocol proxy.
+# Opt-in: ARC_PACK_ANTHROPIC_PROXY=1 (and keep runtime/gateway/anthropic-proxy for local tests).
+if [[ "${ARC_PACK_ANTHROPIC_PROXY:-0}" == "1" ]]; then
+  PROXY_SRC="$ROOT/runtime/gateway/anthropic-proxy"
+  if [[ -f "$PROXY_SRC" ]]; then
+    mkdir -p "$STAGE/runtime/gateway"
+    cp -f "$PROXY_SRC" "$STAGE/runtime/gateway/anthropic-proxy"
+    chmod +x "$STAGE/runtime/gateway/anthropic-proxy"
+    echo "  + runtime/gateway/anthropic-proxy ($(stat -c %s "$STAGE/runtime/gateway/anthropic-proxy") bytes) [ARC_PACK_ANTHROPIC_PROXY=1]"
+  else
+    echo "WARNING: ARC_PACK_ANTHROPIC_PROXY=1 but missing $PROXY_SRC" >&2
+  fi
+else
+  echo "  - skip anthropic-proxy (official mapping; set ARC_PACK_ANTHROPIC_PROXY=1 for local-only packs)"
+fi
+
 echo "[2/2] package slim ARC submission"
 rm -f "$DIST/submission.zip"
 python3 - "$STAGE" "$DIST/submission.zip" <<'PY'
