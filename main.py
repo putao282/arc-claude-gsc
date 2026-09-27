@@ -51,6 +51,8 @@ class ClaudeRunResult:
     subtype: str
     api_error_status: int | None
     tail: str
+    skills_loaded: tuple[str, ...] = ()
+    mcp_tools_used: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -68,6 +70,76 @@ class ValidationResult:
     log_tail: str
     reason: str
     project_dir: str = ""
+
+
+@dataclass(frozen=True)
+class StepDef:
+    """One Official MCP-first harness STEP with force-loaded skills + acceptance gate."""
+    step_id: str
+    title: str
+    required_skills: tuple[str, ...]
+    goal: str
+    exit_criteria: str
+    forbid_mid_dev_tests: bool = False
+    require_batch_test_run: bool = False
+
+
+@dataclass(frozen=True)
+class StepAcceptance:
+    ok: bool
+    reason: str
+    skills_seen: tuple[str, ...] = ()
+    missing_skills: tuple[str, ...] = ()
+    artifacts: tuple[str, ...] = ()
+
+
+# Official STEP loop (fail-closed). Advance only when skill proof + artifacts pass.
+OFFICIAL_STEPS: tuple[StepDef, ...] = (
+    StepDef(
+        step_id="prd",
+        title="PRD",
+        required_skills=("architect",),
+        goal="Build / refine the product PRD for this ROOT module via GSC MCP (prd / state_*).",
+        exit_criteria="PRD artifact under PRD/ or .arc/steps/<id>/prd/ plus skills_loaded proof.",
+    ),
+    StepDef(
+        step_id="spec",
+        title="SPEC",
+        required_skills=("architect",),
+        goal="Derive HTML SPEC under SPEC/arcbench via GSC MCP spec_read/spec_write (no Markdown migrate).",
+        exit_criteria="SPEC/arcbench HTML for this module exists/updated plus skills_loaded proof.",
+    ),
+    StepDef(
+        step_id="test_dag",
+        title="TEST API+UI DAG",
+        required_skills=("arcbench-traceability",),
+        goal="Author API + UI test DAG / cases (files + traceability); do not run the full suite yet.",
+        exit_criteria="Test DAG receipt JSON with api+ui entries and/or real test files; skill proof.",
+    ),
+    StepDef(
+        step_id="pages",
+        title="PAGES + UX-UI designer",
+        required_skills=("designer",),
+        goal="FORCE-LOAD UX-UI designer skill, then design/build pages/UI for this module.",
+        exit_criteria="designer skill proof + UI/page files under frontend/src (or pages receipt).",
+    ),
+    StepDef(
+        step_id="implement",
+        title="DEV implement (no mid-dev tests)",
+        required_skills=("arcbench-checkpoint",),
+        goal="Implement remaining logic/API/UI wiring. Do NOT run tests continuously mid-development.",
+        exit_criteria="Implementation receipt + checkpoint skill proof; no requirement to pass tests yet.",
+        forbid_mid_dev_tests=True,
+    ),
+    StepDef(
+        step_id="batch_test",
+        title="BATCH test (after code done)",
+        required_skills=("arcbench-runtime-signals",),
+        goal="After code is done, run batch/centralized tests once (vitest/npm test).",
+        exit_criteria="runtime-signals skill proof + harness local validation passes.",
+        require_batch_test_run=True,
+    ),
+)
 
 
 RETRYABLE_MARKERS = (
@@ -429,60 +501,77 @@ def run_claude_streaming(
     stdout_tail: deque[str] = deque(maxlen=300)
     stderr_tail: deque[str] = deque(maxlen=300)
     mcp_tool_counts: dict[str, int] = {}
+    skill_loads: list[str] = []
     mcp_lock = threading.Lock()
 
-    def note_mcp_from_line(line: str) -> None:
-        """Emit compact MCP audit events for Official log analysis (MCP value/role)."""
-        if "mcp__" not in line:
+    def _tool_blocks_from_payload(payload: dict) -> list[dict]:
+        blocks: list[dict] = []
+        content = None
+        if isinstance(payload.get("message"), dict):
+            content = payload["message"].get("content")
+        if content is None:
+            content = payload.get("content")
+        if isinstance(content, list):
+            for block in content:
+                if isinstance(block, dict):
+                    blocks.append(block)
+        tool_use = payload.get("tool_use") or payload.get("toolUse")
+        if isinstance(tool_use, dict):
+            blocks.append(tool_use)
+        if isinstance(payload.get("name"), str):
+            blocks.append(payload)
+        return blocks
+
+    def note_tools_from_line(line: str) -> None:
+        """Audit MCP tool_use + Skill loads for Official STEP acceptance gates."""
+        if "mcp__" not in line and "Skill" not in line:
             return
-        name = None
         try:
             payload = json.loads(line)
         except Exception:
             payload = None
-        if isinstance(payload, dict):
-            # stream-json assistant tool_use / content blocks
-            for key in ("name", "tool_name"):
-                val = payload.get(key)
-                if isinstance(val, str) and val.startswith("mcp__"):
-                    name = val
-                    break
-            if name is None:
-                content = payload.get("message", {}).get("content") if isinstance(payload.get("message"), dict) else payload.get("content")
-                blocks = content if isinstance(content, list) else []
-                for block in blocks:
-                    if not isinstance(block, dict):
-                        continue
-                    val = block.get("name")
-                    if isinstance(val, str) and val.startswith("mcp__"):
-                        name = val
-                        break
-            if name is None:
-                tool_use = payload.get("tool_use") or payload.get("toolUse")
-                if isinstance(tool_use, dict):
-                    val = tool_use.get("name")
-                    if isinstance(val, str) and val.startswith("mcp__"):
-                        name = val
-        if name is None:
-            # fallback: first mcp__ token in line
-            for token in line.replace(",", " ").replace('"', " ").split():
-                if token.startswith("mcp__"):
-                    name = token.strip("[]{}() ")
-                    break
-        if not name:
+        if not isinstance(payload, dict):
             return
-        with mcp_lock:
-            mcp_tool_counts[name] = mcp_tool_counts.get(name, 0) + 1
-            count = mcp_tool_counts[name]
-        print(
-            json.dumps(
-                {"event": "mcp_tool_use", "tool": name, "count": count},
-                ensure_ascii=False,
-            ),
-            flush=True,
-        )
+        for block in _tool_blocks_from_payload(payload):
+            name = block.get("name")
+            if not isinstance(name, str):
+                continue
+            if name.startswith("mcp__"):
+                with mcp_lock:
+                    mcp_tool_counts[name] = mcp_tool_counts.get(name, 0) + 1
+                    count = mcp_tool_counts[name]
+                print(
+                    json.dumps(
+                        {"event": "mcp_tool_use", "tool": name, "count": count},
+                        ensure_ascii=False,
+                    ),
+                    flush=True,
+                )
+            elif name == "Skill":
+                inp = block.get("input") if isinstance(block.get("input"), dict) else {}
+                skill_name = (
+                    inp.get("skill")
+                    or inp.get("name")
+                    or inp.get("skill_name")
+                    or inp.get("skillName")
+                    or ""
+                )
+                skill_name = str(skill_name).strip()
+                if not skill_name:
+                    continue
+                # normalize path-ish skill refs to basename
+                skill_name = skill_name.rstrip("/").split("/")[-1]
+                with mcp_lock:
+                    skill_loads.append(skill_name)
+                print(
+                    json.dumps(
+                        {"event": "skill_loaded", "skill": skill_name},
+                        ensure_ascii=False,
+                    ),
+                    flush=True,
+                )
 
-    def pump(stream, sink, tail: deque[str], *, watch_mcp: bool = False) -> None:
+    def pump(stream, sink, tail: deque[str], *, watch_tools: bool = False) -> None:
         if stream is None:
             return
         try:
@@ -490,8 +579,8 @@ def run_claude_streaming(
                 tail.append(line.rstrip("\n"))
                 sink.write(line)
                 sink.flush()
-                if watch_mcp:
-                    note_mcp_from_line(line)
+                if watch_tools:
+                    note_tools_from_line(line)
         finally:
             stream.close()
 
@@ -499,7 +588,7 @@ def run_claude_streaming(
         threading.Thread(
             target=pump,
             args=(process.stdout, sys.stdout, stdout_tail),
-            kwargs={"watch_mcp": True},
+            kwargs={"watch_tools": True},
             daemon=True,
         ),
         threading.Thread(target=pump, args=(process.stderr, sys.stderr, stderr_tail), daemon=True),
@@ -523,6 +612,18 @@ def run_claude_streaming(
             ),
             flush=True,
         )
+    if skill_loads:
+        print(
+            json.dumps(
+                {
+                    "event": "skill_load_summary",
+                    "skills": list(dict.fromkeys(skill_loads)),
+                    "total": len(skill_loads),
+                },
+                ensure_ascii=False,
+            ),
+            flush=True,
+        )
 
     stdout_lines = list(stdout_tail)
     is_error, terminal_reason, subtype, api_error_status = parse_terminal_result(stdout_lines)
@@ -534,6 +635,8 @@ def run_claude_streaming(
         subtype=subtype,
         api_error_status=api_error_status,
         tail=combined_tail,
+        skills_loaded=tuple(dict.fromkeys(skill_loads)),
+        mcp_tools_used=tuple(sorted(mcp_tool_counts.keys())),
     )
 
 
@@ -1166,39 +1269,34 @@ def ensure_gsc_spec(output_dir: Path, module: RequirementModule) -> Path:
 
 
 def ensure_arc_spawn_gate_softener(output_dir: Path) -> None:
-    """Soften GSC SPAWN-GATE without disabling MCP.
-
-    GSC PreToolUse[Agent|Task] hard-denies coding spawns missing ## TASK-HEADER
-    (REQ-AGENTGOV-2). On ARC smoke that burns turns/tokens and feeds autocompact
-    rapid_refill. Official escape hatch: .claude/spawn-gate-off (requires CLAUDE.md
-    so findProjectRoot resolves). Always (re)write CLAUDE.md with Tao MCP-first
-    Official workflow so packaged runs follow PRD→SPEC→TEST DAG→PAGES(designer)→
-    batch test; MCP stays ON (never ban WaitForMcpServers / ARC_ENABLE_MCP=0).
-    """
+    """Soften GSC SPAWN-GATE without disabling MCP; encode Official STEP loop."""
     claude_md = output_dir / "CLAUDE.md"
     claude_md.write_text(
-        "# ARC-Bench project — MCP-first Official workflow\n\n"
+        "# ARC-Bench project — MCP-first Official STEP loop\n\n"
         "HARD: GSC MCP stays ON. Never disable WaitForMcpServers / never set "
         "ARC_ENABLE_MCP=0 / never ban MCP tools.\n\n"
-        "## Mandated workflow (in order)\n"
-        "1. MCP-first planning: from requirements build **PRD → SPEC → TEST cases** "
-        "(API + UI test DAG) via GSC MCP (`prd` / `spec_read` / `spec_write` / "
-        "`state_read` / `state_update` / related). Prefer HTML SPEC under "
-        "`SPEC/arcbench/`; do not invent Markdown SPEC that forces migrate.\n"
-        "2. **PAGES / UI**: before building any page or UI, load the UX-UI "
-        "**`designer` skill** (Skill tool name: `designer`). Then implement UI.\n"
-        "3. **Development**: implement in the main session with Bash/Edit/Write/Read "
-        "+ MCP. Do **NOT** run tests continuously mid-development.\n"
-        "4. **After all code** for the module/subtree is done: **batch / centralized "
-        "testing** once (prefer `frontend` `npx vitest run` / `npm test`).\n"
-        "5. Purpose of Official: rich MCP tool-use in logs for bug audit + MCP "
-        "value analysis — prefer visible MCP calls over silent bypass.\n\n"
-        "## Thrash / spawn controls\n"
-        "- Prefer implementing in the main Claude session; do not spawn Agent/Task "
-        "unless a full `## TASK-HEADER` block is included.\n"
-        "- If WaitForMcpServers appears, wait once then continue; do not dump schemas.\n"
-        "- Keep tool outputs small (no huge lockfiles/schemas) to avoid rapid_refill.\n"
-        "- Harness local tests grant green — MCP planning alone does NOT.\n",
+        "## Harness STEP loop (fail-closed)\n"
+        "The harness runs discrete STEPs. Each STEP is its own Claude round.\n"
+        "Do not advance yourself — the harness advances only after acceptance passes.\n"
+        "Receipts live under `.arc/steps/<module-id>/`.\n\n"
+        "STEPs in order:\n"
+        "1. **prd** — FORCE-LOAD Skill `architect`, build PRD via MCP.\n"
+        "2. **spec** — FORCE-LOAD Skill `architect`, write HTML SPEC via MCP.\n"
+        "3. **test_dag** — FORCE-LOAD Skill `arcbench-traceability`, author API+UI test DAG "
+        "(do not run full suite yet).\n"
+        "4. **pages** — FORCE-LOAD Skill `designer` (UX-UI) BEFORE any page/UI work.\n"
+        "5. **implement** — FORCE-LOAD Skill `arcbench-checkpoint`; implement WITHOUT "
+        "mid-dev continuous tests.\n"
+        "6. **batch_test** — FORCE-LOAD Skill `arcbench-runtime-signals`; run batch tests "
+        "once after code is done.\n\n"
+        "## Per-STEP rules\n"
+        "- FIRST tool action in each STEP: use the Skill tool to load that STEP's required skill(s).\n"
+        "- No skill load => STEP acceptance FAILS (fail-closed); harness will not advance.\n"
+        "- Write receipt JSON to the path given in the STEP prompt when exit criteria are met.\n"
+        "- Prefer visible GSC MCP calls (prd/spec_*/state_*) for planning.\n"
+        "- Prefer main session; do not spawn Agent/Task.\n"
+        "- If WaitForMcpServers appears, wait once then continue; keep outputs small.\n"
+        "- Harness local tests grant final green — MCP alone does not.\n",
         encoding="utf-8",
     )
     off = output_dir / ".claude" / "spawn-gate-off"
@@ -1209,6 +1307,370 @@ def ensure_arc_spawn_gate_softener(output_dir: Path) -> None:
             "# MCP stays ON. Soft reminders may still appear if Agent is used.\n",
             encoding="utf-8",
         )
+
+
+def step_dir(output_dir: Path, node_id: str) -> Path:
+    return output_dir / ".arc" / "steps" / safe_node_id(node_id)
+
+
+def step_receipt_ok_path(output_dir: Path, node_id: str, step_id: str) -> Path:
+    return step_dir(output_dir, node_id) / f"{step_id}.ok"
+
+
+def step_receipt_json_path(output_dir: Path, node_id: str, step_id: str) -> Path:
+    return step_dir(output_dir, node_id) / f"{step_id}.json"
+
+
+def has_step_receipt(output_dir: Path, node_id: str, step_id: str) -> bool:
+    return step_receipt_ok_path(output_dir, node_id, step_id).is_file()
+
+
+def clear_step_receipt(output_dir: Path, node_id: str, step_id: str) -> None:
+    for path in (
+        step_receipt_ok_path(output_dir, node_id, step_id),
+        step_receipt_json_path(output_dir, node_id, step_id),
+    ):
+        if path.exists():
+            path.unlink()
+
+
+def write_step_receipt(
+    output_dir: Path,
+    node_id: str,
+    step: StepDef,
+    acceptance: StepAcceptance,
+    *,
+    claude: ClaudeRunResult | None = None,
+) -> None:
+    dest = step_dir(output_dir, node_id)
+    dest.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "step_id": step.step_id,
+        "title": step.title,
+        "req_id": node_id,
+        "ok": acceptance.ok,
+        "reason": acceptance.reason,
+        "required_skills": list(step.required_skills),
+        "skills_seen": list(acceptance.skills_seen),
+        "missing_skills": list(acceptance.missing_skills),
+        "artifacts": list(acceptance.artifacts),
+        "mcp_tools_used": list(claude.mcp_tools_used) if claude else [],
+    }
+    step_receipt_json_path(output_dir, node_id, step.step_id).write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    if acceptance.ok:
+        step_receipt_ok_path(output_dir, node_id, step.step_id).write_text(
+            f"ok step={step.step_id} skills={','.join(acceptance.skills_seen)}\n",
+            encoding="utf-8",
+        )
+    else:
+        ok_path = step_receipt_ok_path(output_dir, node_id, step.step_id)
+        if ok_path.exists():
+            ok_path.unlink()
+
+
+def _existing_paths(paths: list[Path]) -> list[str]:
+    return [str(p) for p in paths if p.exists()]
+
+
+def evaluate_step_acceptance(
+    output_dir: Path,
+    module: RequirementModule,
+    step: StepDef,
+    result: ClaudeRunResult,
+) -> StepAcceptance:
+    """Fail-closed STEP gate: required Skill loads + step artifacts (+ batch tests)."""
+    skills_seen = tuple(result.skills_loaded)
+    missing = tuple(s for s in step.required_skills if s not in skills_seen)
+    if missing:
+        return StepAcceptance(
+            ok=False,
+            reason=f"skill force-load missing (fail-closed): {', '.join(missing)}",
+            skills_seen=skills_seen,
+            missing_skills=missing,
+        )
+
+    sid = safe_node_id(module.node_id)
+    sdir = step_dir(output_dir, module.node_id)
+    artifacts: list[str] = []
+
+    if step.step_id == "prd":
+        candidates = [
+            output_dir / "PRD",
+            sdir / "prd",
+            sdir / "prd.md",
+            sdir / "prd.json",
+            sdir / "prd.html",
+            sdir / "prd.artifact.json",
+        ]
+        found: list[str] = []
+        prd_root = output_dir / "PRD"
+        if prd_root.is_dir() and any(prd_root.rglob("*")):
+            found.append(str(prd_root))
+        found.extend(_existing_paths(candidates[1:]))
+        found = list(dict.fromkeys(found))
+        mcp_prd = [t for t in result.mcp_tools_used if t.endswith("__prd") or "prd" in t.split("__")[-1]]
+        if not found and not mcp_prd:
+            return StepAcceptance(
+                ok=False,
+                reason="PRD artifact missing under PRD/ or .arc/steps/<id>/prd* (and no MCP prd tool proof)",
+                skills_seen=skills_seen,
+                artifacts=tuple(found),
+            )
+        if not found and mcp_prd:
+            # MCP prd used but no file yet — still fail-closed on artifact
+            return StepAcceptance(
+                ok=False,
+                reason="MCP prd used but PRD artifact file/dir still missing",
+                skills_seen=skills_seen,
+                artifacts=tuple(mcp_prd),
+            )
+        artifacts = found + mcp_prd
+
+    elif step.step_id == "spec":
+        spec_html = output_dir / "SPEC" / "arcbench" / f"{sid}.html"
+        spec_dir = output_dir / "SPEC" / "arcbench"
+        found = []
+        if spec_html.is_file() and spec_html.stat().st_size > 50:
+            found.append(str(spec_html))
+        elif spec_dir.is_dir():
+            htmls = [p for p in spec_dir.glob("*.html") if p.is_file() and p.stat().st_size > 50]
+            found.extend(str(p) for p in htmls[:5])
+        mcp_spec = [t for t in result.mcp_tools_used if "spec_" in t or t.endswith("__prd") or "spec_write" in t or "spec_read" in t]
+        if not found:
+            return StepAcceptance(
+                ok=False,
+                reason="SPEC HTML missing/too small under SPEC/arcbench/",
+                skills_seen=skills_seen,
+            )
+        if not mcp_spec:
+            return StepAcceptance(
+                ok=False,
+                reason="SPEC STEP requires GSC MCP spec_read/spec_write (or prd) tool use proof",
+                skills_seen=skills_seen,
+                artifacts=tuple(found),
+            )
+        artifacts = found + mcp_spec
+
+    elif step.step_id == "test_dag":
+        dag = sdir / "test_dag.json"
+        found = []
+        if dag.is_file():
+            try:
+                payload = json.loads(dag.read_text(encoding="utf-8"))
+            except Exception as exc:
+                return StepAcceptance(
+                    ok=False,
+                    reason=f"test_dag.json unreadable: {exc}",
+                    skills_seen=skills_seen,
+                )
+            has_api = bool(payload.get("api") or payload.get("api_tests"))
+            has_ui = bool(payload.get("ui") or payload.get("ui_tests"))
+            if not (has_api and has_ui):
+                return StepAcceptance(
+                    ok=False,
+                    reason="test_dag.json must include both api and ui test entries",
+                    skills_seen=skills_seen,
+                    artifacts=(str(dag),),
+                )
+            found.append(str(dag))
+        project = discover_test_project(output_dir)
+        test_files = find_test_files(project) if project else []
+        if test_files:
+            found.extend(str(p) for p in test_files[:8])
+        if not found:
+            return StepAcceptance(
+                ok=False,
+                reason="TEST DAG missing: need .arc/steps/<id>/test_dag.json (api+ui) and/or test files",
+                skills_seen=skills_seen,
+            )
+        artifacts = found
+
+    elif step.step_id == "pages":
+        pages_receipt = sdir / "pages.json"
+        ui_roots = [
+            output_dir / "frontend" / "src" / "pages",
+            output_dir / "frontend" / "src" / "components",
+            output_dir / "frontend" / "src",
+        ]
+        found = []
+        if pages_receipt.is_file():
+            found.append(str(pages_receipt))
+        for root in ui_roots:
+            if not root.exists():
+                continue
+            for pattern in ("**/*.tsx", "**/*.jsx", "**/*.vue", "**/*.html"):
+                for p in root.glob(pattern):
+                    if p.is_file() and "node_modules" not in p.parts and p.stat().st_size >= 20:
+                        found.append(str(p))
+                        break
+                if len(found) > 1:
+                    break
+            if len(found) > 1:
+                break
+        found = list(dict.fromkeys(found))
+        if not found:
+            return StepAcceptance(
+                ok=False,
+                reason="PAGES artifacts missing under frontend/src (or pages.json receipt)",
+                skills_seen=skills_seen,
+            )
+        artifacts = found[:12]
+
+    elif step.step_id == "implement":
+        impl_receipt = sdir / "implement.json"
+        found = []
+        if impl_receipt.is_file():
+            found.append(str(impl_receipt))
+        for root_name in ("frontend/src", "backend/src", "src"):
+            root = output_dir / root_name
+            if not root.exists():
+                continue
+            for p in root.rglob("*"):
+                if p.is_file() and p.suffix in {".ts", ".tsx", ".js", ".jsx", ".py"} and p.stat().st_size >= 40:
+                    found.append(str(p))
+                    if len(found) >= 4:
+                        break
+            if len(found) >= 2:
+                break
+        if not found:
+            return StepAcceptance(
+                ok=False,
+                reason="IMPLEMENT artifacts missing (implement.json and/or source files)",
+                skills_seen=skills_seen,
+            )
+        artifacts = list(dict.fromkeys(found))[:12]
+
+    elif step.step_id == "batch_test":
+        validation = run_module_validation(output_dir, module)
+        artifacts = [f"validation:{validation.reason}", f"cmd:{' '.join(validation.cmd)}"]
+        if not validation.ok:
+            return StepAcceptance(
+                ok=False,
+                reason=f"batch_test harness validation failed: {validation.reason}",
+                skills_seen=skills_seen,
+                artifacts=tuple(artifacts),
+            )
+        sdir.mkdir(parents=True, exist_ok=True)
+        (sdir / "batch_validation.json").write_text(
+            json.dumps(
+                {
+                    "ok": validation.ok,
+                    "exit_code": validation.exit_code,
+                    "cmd": validation.cmd,
+                    "reason": validation.reason,
+                    "project_dir": validation.project_dir,
+                    "log_tail": validation.log_tail[-4000:],
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        artifacts.append(str(sdir / "batch_validation.json"))
+    else:
+        return StepAcceptance(ok=False, reason=f"unknown step {step.step_id}", skills_seen=skills_seen)
+
+    return StepAcceptance(
+        ok=True,
+        reason=f"step {step.step_id} acceptance passed",
+        skills_seen=skills_seen,
+        artifacts=tuple(artifacts),
+    )
+
+
+def step_prompt(
+    module: RequirementModule,
+    requirements_dir: Path,
+    skills_dir: Path | None,
+    completed: list[str],
+    task_type: str,
+    step: StepDef,
+    *,
+    attempt: int = 1,
+    prior_failure: str | None = None,
+    validation_failure: str | None = None,
+    validation_repair: int = 0,
+) -> str:
+    completed_text = ", ".join(completed) if completed else "none"
+    skills_text = (
+        f"ARC / project skills directory: {skills_dir}."
+        if skills_dir
+        else "Project skills may be under .claude/skills; GSC plugin skills also available."
+    )
+    receipt_hint = f".arc/steps/{safe_node_id(module.node_id)}/{step.step_id}.json"
+    ok_hint = f".arc/steps/{safe_node_id(module.node_id)}/{step.step_id}.ok"
+    recovery = ""
+    if validation_failure:
+        recovery = (
+            f"VALIDATION REPAIR {validation_repair}: harness batch validation failed earlier.\n"
+            f"{validation_failure}\n"
+        )
+    elif prior_failure:
+        recovery = (
+            f"STEP RETRY {attempt}: previous attempt failed acceptance (fail-closed).\n"
+            f"Failure: {prior_failure}\n"
+            "Fix the missing skill load and/or artifacts, then finish this STEP only.\n"
+        )
+    elif attempt > 1:
+        recovery = (
+            f"RECOVERY ATTEMPT {attempt}: prior Claude ended on transient failure. "
+            "Workspace preserved. Continue THIS STEP only; do not redo earlier STEP receipts.\n"
+        )
+
+    mid_dev = ""
+    if step.forbid_mid_dev_tests:
+        mid_dev = (
+            "FORBIDDEN this STEP: do not run vitest/npm test / playwright continuously. "
+            "Write/adjust code only; batch testing is the next STEP.\n"
+        )
+    batch = ""
+    if step.require_batch_test_run:
+        batch = (
+            "REQUIRED this STEP: after confirming code is done, run batch tests once "
+            "(prefer frontend `npx vitest run` / `npm test`). Fix failures if needed within this STEP.\n"
+        )
+
+    skill_lines = ", ".join(f"`{s}`" for s in step.required_skills)
+    return textwrap.dedent(f"""
+        You are in an ARC-Bench Official harness STEP round (not a mega-prompt).
+        GSC plugin + GSC MCP are loaded. MCP stays ON.
+
+        Target task type: {task_type}
+        ROOT module {module.index}/{module.total}: {module.node_id} - {module.name}
+        Previously completed ROOT modules: {completed_text}
+        Requirement source directory: {requirements_dir}
+        Current STEP: {step.step_id} — {step.title}
+        {recovery}
+
+        HARD RULES:
+        - GSC MCP stays ON. Never disable WaitForMcpServers / never ARC_ENABLE_MCP=0 / never ban MCP.
+        - This round is ONLY for STEP `{step.step_id}`. Do not perform later STEPs.
+        - FORCE-LOAD required skill(s) FIRST via the Skill tool before other work: {skill_lines}
+        - If you skip Skill load, harness acceptance FAILS (fail-closed) and you will not advance.
+        - Prefer main session; do NOT spawn Agent/Task.
+        - Keep tool outputs small (no huge lockfiles/schemas).
+
+        STEP goal: {step.goal}
+        Exit criteria: {step.exit_criteria}
+        {mid_dev}{batch}
+        {skills_text}
+        Also use GSC MCP (`prd` / `spec_read` / `spec_write` / `state_*`) where relevant so logs show MCP value.
+
+        When exit criteria are met, write a short receipt JSON to `{receipt_hint}` with keys:
+        step_id, skills_loaded, artifacts (list of paths), summary.
+        The harness writes `{ok_hint}` only after its own acceptance gate passes (skill proof + artifacts).
+
+        Work only from this ROOT-child subtree:
+        ```json
+        {json.dumps(module.subtree, ensure_ascii=False, indent=2)}
+        ```
+
+        Finish this STEP only. Summarize skills loaded, MCP tools used, and artifacts produced.
+    """).strip()
 
 
 def module_prompt(
@@ -1222,62 +1684,18 @@ def module_prompt(
     validation_failure: str | None = None,
     validation_repair: int = 0,
 ) -> str:
-    completed_text = ", ".join(completed) if completed else "none"
-    skills_text = f"ARC skills are installed at {skills_dir}." if skills_dir else "The adapter emits baseline ARC runtime states and checkpoints."
-    recovery_text = ""
-    if validation_failure:
-        recovery_text = (
-            f"VALIDATION REPAIR {validation_repair}: the harness local validation gate FAILED for this module. "
-            "Claude session success alone does NOT grant green. Fix the implementation and/or tests so the harness "
-            "command (prefer frontend `npx vitest run` / `npm test`) exits 0. Do not claim completion via a tiny "
-            "self-written smoke test or STOP early. MCP SPEC status helps planning but does NOT grant harness green.\n\n"
-            f"Harness validation failure log (tail):\n{validation_failure}"
-        )
-    elif attempt > 1:
-        recovery_text = (
-            f"RECOVERY ATTEMPT {attempt}: previous Claude ended on a transient failure (often autocompact "
-            "rapid_refill). Workspace files were preserved. Inspect existing files first; continue this module; "
-            "do not redo passed ROOT modules. Prefer Bash/Edit/Write/Read plus GSC MCP spec_read/spec_write/"
-            "state_*; do not dump lockfiles or re-list huge tool schemas."
-        )
-    return textwrap.dedent(f"""
-        You are implementing an ARC-Bench Agentic Software Factory task using original Claude Code with the GSC plugin and GSC MCP loaded.
-
-        Target task type: {task_type}
-        Implement ROOT module {module.index}/{module.total}: {module.node_id} - {module.name}
-        Previously completed ROOT modules: {completed_text}
-        Requirement source directory: {requirements_dir}
-        {recovery_text}
-
-        HARD RULES: GSC MCP stays ON. Never disable WaitForMcpServers / never set ARC_ENABLE_MCP=0 / never ban MCP.
-
-        Mandated MCP-first workflow (do in order; encode progress via MCP so logs show MCP value):
-        1) From requirements, use GSC MCP to build PRD → SPEC → TEST cases (API + UI test DAG). Prefer HTML SPEC under SPEC/arcbench/ via spec_read/spec_write/prd/state_*; do not invent Markdown SPEC that forces migrate.
-        2) On PAGES / UI work: BEFORE building any page or UI, load the UX-UI designer skill (Skill tool name: `designer`). Then implement UI.
-        3) During development: implement with Bash/Edit/Write/Read + MCP. Do NOT run tests continuously mid-development.
-        4) After all code for this subtree is done: batch/centralized testing once (prefer frontend `npx vitest run` / `npm test`).
-        5) Prefer visible MCP tool use (planning/state/SPEC) over silent bypass — Official audit needs rich MCP logs.
-
-        The current working directory is the persistent generated project. Preserve working features from earlier modules.
-        Use GSC actively (including GSC MCP SPEC / planning / validation tools) for requirements, implementation planning, coding, validation, and state tracking rather than bypassing it.
-        If WaitForMcpServers appears, wait once for GSC MCP readiness then continue implementation; do not loop reconnecting or dump huge unrelated context.
-        SPAWN thrash control: implement this module in the main Claude session. Do NOT spawn Agent/Task subagents. If a coding spawn is unavoidable, the prompt MUST start with a literal line "## TASK-HEADER" (no trailing colon) plus task/domain/archaeology/reuse-decision/scope/completion/retry/stop fields — otherwise GSC SPAWN-GATE fail-closes.
-        Keep tool outputs small: read files in chunks, avoid pasting huge lockfiles/schemas into the conversation (prevents autocompact rapid_refill_breaker).
-
-        {skills_text}
-        If ARC skills are present, read the runtime-signals, traceability, and checkpoint skill instructions and record detailed requirement-to-interface/file/test traceability.
-        Implement against the ROOT-child subtree below. Prefer adding/keeping real automated tests under frontend/ (or the project package.json) that the harness can run — write them during planning/DAG, run them in the final batch step (not continuously).
-        Do not start a long-running server. Do not erase work from earlier modules.
-
-        Harness bar (authoritative for mark_test_passed): after this Claude session returns, the harness itself runs local validation (prefer `frontend` `npx vitest run` / `npm test`). No test files => cannot green. Your session exit code alone never grants green. GSC MCP SPEC / planning tools help quality but do NOT grant harness green or platform score.
-
-        Do not read the complete requirements.yaml. Work only from this complete ROOT-child subtree:
-        ```json
-        {json.dumps(module.subtree, ensure_ascii=False, indent=2)}
-        ```
-
-        Finish only after the subtree is implemented and ready for harness local validation. Summarize changed files, MCP tools used, and how batch tests cover the requirement.
-    """).strip()
+    """Backward-compatible wrapper; Official path uses step_prompt per STEP."""
+    return step_prompt(
+        module,
+        requirements_dir,
+        skills_dir,
+        completed,
+        task_type,
+        OFFICIAL_STEPS[-1] if validation_failure else OFFICIAL_STEPS[0],
+        attempt=attempt,
+        validation_failure=validation_failure,
+        validation_repair=validation_repair,
+    )
 
 
 def chown_tree(path: Path, uid: int, gid: int) -> None:
@@ -1472,15 +1890,19 @@ def main() -> int:
                 "mcp_timeout_ms": mcp_timeout_ms,
                 "anthropic_proxy": gateway_proc is not None,
                 "mcp_allowed_tools": gsc_mcp_allowed_tools() if enable_mcp else [],
+                "step_loop": [s.step_id for s in OFFICIAL_STEPS],
+                "step_required_skills": {s.step_id: list(s.required_skills) for s in OFFICIAL_STEPS},
                 "thrash_mitigations": [
                     "spawn_gate_off",
                     "disallow_Agent_Task_and_bloat_builtins",
+                    "Skill_allowed_for_STEP_force_load",
                     "mcp_allowedTools_spec_subset",
                     "WaitForMcpServers_once_guidance",
                     "html_spec",
                     "disable_slash_commands",
                     "autocompact_200000",
                     "rapid_refill_retryable_capped",
+                    "official_step_loop_fail_closed",
                 ],
             },
             ensure_ascii=False,
@@ -1512,9 +1934,8 @@ def main() -> int:
             runtime.events.mark_design_started(module.node_id, f"Planning {module.name} from {spec_path.relative_to(output_dir)}")
             runtime.events.mark_design_done(module.node_id, f"Delegated {module.name} to Claude Code + GSC")
 
-            validation_failure_log: str | None = None
+            max_step_retries = env_int("ARC_STEP_MAX_RETRIES", 2, minimum=0, maximum=8)
             validation_repair = 0
-            last_claude_attempts = 0
 
             def on_retry(
                 attempt: int,
@@ -1544,39 +1965,19 @@ def main() -> int:
                     f"Transient upstream/API failure in {module.node_id}; retry {attempt}/{max_retries} after {delay}s"
                 )
 
-            def run_attempt(attempt: int) -> ClaudeRunResult:
+            def build_claude_command(prompt: str, attempt: int) -> tuple[list[str], dict[str, str]]:
                 attempt_base_url = base_url_for_attempt(base_urls, attempt)
-                if attempt > 1 and validation_failure_log is None:
-                    runtime.events.mark_run_resumed(
-                        f"Retry attempt {attempt}/{max_retries + 1} for {module.node_id}; workspace preserved"
-                    )
-                runtime.events.mark_implementation_started(
-                    module.node_id,
-                    f"Implementing {module.name} (attempt {attempt}/{max_retries + 1}"
-                    + (f"; validation_repair {validation_repair}" if validation_repair else "")
-                    + ")",
-                )
                 command = [
                     str(claude_bin),
                     "-p",
-                    module_prompt(
-                        module,
-                        requirements_dir,
-                        skills_dir,
-                        completed,
-                        args.task_type,
-                        attempt=attempt,
-                        validation_failure=validation_failure_log,
-                        validation_repair=validation_repair,
-                    ),
+                    prompt,
                     "--plugin-dir",
                     str(gsc_dir),
                     *claude_mcp_cli_args(enabled=enable_mcp, mcp_config=mcp_config_path),
                     "--model",
                     ("sonnet" if gateway_proc is not None else model),
-                    # Keep MCP ON; shrink builtin bloat. WaitForMcpServers NOT banned.
-                    # Skill allowed so PAGES can load UX-UI `designer` skill (Tao workflow).
-                    # MCP schema shrink is via mcp-config allowedTools (SPEC subset).
+                    # Keep MCP ON; WaitForMcpServers NOT banned.
+                    # Skill allowed so each STEP can FORCE-LOAD its required skills.
                     "--disallowedTools",
                     (
                         "Agent,Task,WebSearch,WebFetch,"
@@ -1599,63 +2000,190 @@ def main() -> int:
                 attempt_env = claude_env.copy()
                 if gateway_proc is None:
                     attempt_env["ANTHROPIC_BASE_URL"] = attempt_base_url
-                return run_claude_streaming(
-                    command,
-                    cwd=output_dir,
-                    env=attempt_env,
-                    preexec_fn=privilege_dropper(identity),
-                )
+                return command, attempt_env
 
-            # Outer loop: Claude (with API self-heal) then harness validation;
-            # validation failures drive a separate repair Claude session (not API retry).
+            # Fail-closed Official STEP loop: skill proof + artifacts before advance.
+            steps_to_run: list[StepDef] = list(OFFICIAL_STEPS)
             while True:
-                result, attempts = execute_with_retry(
-                    run_attempt,
-                    max_retries=max_retries,
-                    base_seconds=retry_base_seconds,
-                    max_seconds=retry_max_seconds,
-                    on_retry=on_retry,
-                )
-                last_claude_attempts = attempts
-                classification = classify_claude_failure(result)
-                if result.returncode != 0 or result.is_error:
-                    terminal = {
-                        "event": "module_terminal_failure",
-                        "req_id": module.node_id,
-                        "attempts": attempts,
-                        "max_retries": max_retries,
-                        "classification": classification.reason,
-                        "terminal_reason": result.terminal_reason or "unknown",
-                        "returncode": result.returncode,
-                        "api_error_status": result.api_error_status,
-                        "upstream_host": host,
-                        "validation_repair": validation_repair,
-                    }
-                    print(json.dumps(terminal, ensure_ascii=False), file=sys.stderr, flush=True)
-                    runtime.events.mark_implementation_failed(
-                        module.node_id,
-                        f"Claude Code failed after {attempts} attempt(s): {classification.reason}",
-                    )
-                    runtime.events.mark_test_failed(module.node_id, "Module did not complete")
-                    runtime.events.mark_run_failed(
-                        f"Module {module.node_id} failed after {attempts} attempt(s): {classification.reason}"
-                    )
-                    return result.returncode or 1
+                step_failed = False
+                for step in steps_to_run:
+                    if has_step_receipt(output_dir, module.node_id, step.step_id):
+                        print(
+                            json.dumps(
+                                {
+                                    "event": "step_skip",
+                                    "req_id": module.node_id,
+                                    "step_id": step.step_id,
+                                    "reason": "receipt_ok_present",
+                                },
+                                ensure_ascii=False,
+                            ),
+                            flush=True,
+                        )
+                        continue
 
+                    prior_failure: str | None = None
+                    accepted = False
+                    last_result: ClaudeRunResult | None = None
+                    # If repairing, inject harness failure log into implement/batch_test prompts.
+                    repair_log = None
+                    repair_note = step_dir(output_dir, module.node_id) / "repair_note.txt"
+                    if validation_repair > 0 and step.step_id in ("implement", "batch_test") and repair_note.is_file():
+                        repair_log = repair_note.read_text(encoding="utf-8", errors="replace")[-6000:]
+
+                    for step_attempt in range(1, max_step_retries + 2):
+                        def run_attempt(attempt: int, _step=step, _prior_ref=lambda: prior_failure, _repair=repair_log, _vrep=validation_repair) -> ClaudeRunResult:
+                            runtime.events.mark_implementation_started(
+                                module.node_id,
+                                f"STEP {_step.step_id} ({_step.title}) attempt {attempt} for {module.name}",
+                            )
+                            prompt = step_prompt(
+                                module,
+                                requirements_dir,
+                                skills_dir,
+                                completed,
+                                args.task_type,
+                                _step,
+                                attempt=attempt,
+                                prior_failure=_prior_ref(),
+                                validation_failure=_repair,
+                                validation_repair=_vrep,
+                            )
+                            command, attempt_env = build_claude_command(prompt, attempt)
+                            print(
+                                json.dumps(
+                                    {
+                                        "event": "step_started",
+                                        "req_id": module.node_id,
+                                        "step_id": _step.step_id,
+                                        "title": _step.title,
+                                        "required_skills": list(_step.required_skills),
+                                        "attempt": attempt,
+                                        "prior_failure": _prior_ref(),
+                                        "validation_repair": _vrep,
+                                    },
+                                    ensure_ascii=False,
+                                ),
+                                flush=True,
+                            )
+                            return run_claude_streaming(
+                                command,
+                                cwd=output_dir,
+                                env=attempt_env,
+                                preexec_fn=privilege_dropper(identity),
+                            )
+
+                        result, api_attempts = execute_with_retry(
+                            run_attempt,
+                            max_retries=max_retries,
+                            base_seconds=retry_base_seconds,
+                            max_seconds=retry_max_seconds,
+                            on_retry=on_retry,
+                        )
+                        last_result = result
+                        classification = classify_claude_failure(result)
+                        if result.returncode != 0 or result.is_error:
+                            terminal = {
+                                "event": "step_terminal_failure",
+                                "req_id": module.node_id,
+                                "step_id": step.step_id,
+                                "step_attempt": step_attempt,
+                                "api_attempts": api_attempts,
+                                "classification": classification.reason,
+                                "terminal_reason": result.terminal_reason or "unknown",
+                                "returncode": result.returncode,
+                                "skills_loaded": list(result.skills_loaded),
+                            }
+                            print(json.dumps(terminal, ensure_ascii=False), file=sys.stderr, flush=True)
+                            prior_failure = classification.reason
+                            if step_attempt >= max_step_retries + 1:
+                                runtime.events.mark_implementation_failed(
+                                    module.node_id,
+                                    f"STEP {step.step_id} Claude failed: {classification.reason}",
+                                )
+                                runtime.events.mark_test_failed(module.node_id, f"STEP {step.step_id} did not complete")
+                                runtime.events.mark_run_failed(
+                                    f"Module {module.node_id} STEP {step.step_id} failed: {classification.reason}"
+                                )
+                                return result.returncode or 1
+                            continue
+
+                        acceptance = evaluate_step_acceptance(output_dir, module, step, result)
+                        write_step_receipt(output_dir, module.node_id, step, acceptance, claude=result)
+                        print(
+                            json.dumps(
+                                {
+                                    "event": "step_acceptance",
+                                    "req_id": module.node_id,
+                                    "step_id": step.step_id,
+                                    "ok": acceptance.ok,
+                                    "reason": acceptance.reason,
+                                    "skills_seen": list(acceptance.skills_seen),
+                                    "missing_skills": list(acceptance.missing_skills),
+                                    "artifacts": list(acceptance.artifacts),
+                                    "step_attempt": step_attempt,
+                                    "mcp_tools_used": list(result.mcp_tools_used),
+                                },
+                                ensure_ascii=False,
+                            ),
+                            flush=True,
+                        )
+                        if acceptance.ok:
+                            accepted = True
+                            break
+                        prior_failure = acceptance.reason
+                        clear_step_receipt(output_dir, module.node_id, step.step_id)
+                        # keep json for debug: rewrite failed receipt without .ok
+                        write_step_receipt(output_dir, module.node_id, step, acceptance, claude=result)
+
+                    if not accepted:
+                        runtime.events.mark_implementation_failed(
+                            module.node_id,
+                            f"STEP {step.step_id} acceptance failed (fail-closed): {prior_failure}",
+                        )
+                        runtime.events.mark_test_failed(
+                            module.node_id,
+                            f"STEP {step.step_id} acceptance failed",
+                        )
+                        runtime.events.mark_run_failed(
+                            f"Module {module.node_id} stopped at STEP {step.step_id}: {prior_failure}"
+                        )
+                        print(
+                            json.dumps(
+                                {
+                                    "event": "step_acceptance_exhausted",
+                                    "req_id": module.node_id,
+                                    "step_id": step.step_id,
+                                    "reason": prior_failure,
+                                    "required_skills": list(step.required_skills),
+                                },
+                                ensure_ascii=False,
+                            ),
+                            file=sys.stderr,
+                            flush=True,
+                        )
+                        return 1
+
+                # All STEPs accepted. batch_test already ran harness validation; persist module receipt.
                 validation = run_module_validation(output_dir, module)
-                validation_event = {
-                    "event": "module_validation",
-                    "req_id": module.node_id,
-                    "ok": validation.ok,
-                    "exit_code": validation.exit_code,
-                    "cmd": validation.cmd,
-                    "reason": validation.reason,
-                    "project_dir": validation.project_dir,
-                    "validation_repair": validation_repair,
-                    "max_validation_repairs": max_validation_repairs,
-                }
-                print(json.dumps(validation_event, ensure_ascii=False), flush=True)
-
+                print(
+                    json.dumps(
+                        {
+                            "event": "module_validation",
+                            "req_id": module.node_id,
+                            "ok": validation.ok,
+                            "exit_code": validation.exit_code,
+                            "cmd": validation.cmd,
+                            "reason": validation.reason,
+                            "project_dir": validation.project_dir,
+                            "validation_repair": validation_repair,
+                            "max_validation_repairs": max_validation_repairs,
+                            "note": "post-STEP-loop confirmation",
+                        },
+                        ensure_ascii=False,
+                    ),
+                    flush=True,
+                )
                 gate = decide_validation_gate(
                     validation,
                     validation_repair=validation_repair,
@@ -1665,18 +2193,17 @@ def main() -> int:
                     write_validation_receipt(output_dir, module.node_id, validation)
                     runtime.events.mark_implementation_done(
                         module.node_id,
-                        f"Implemented {module.name} after {last_claude_attempts} Claude attempt(s)"
+                        f"Implemented {module.name} via Official STEP loop"
                         + (f"; validation_repair {validation_repair}" if validation_repair else ""),
                     )
                     runtime.events.mark_test_passed(
                         module.node_id,
-                        "Harness local validation passed",
+                        "Harness local validation passed after STEP loop",
                     )
                     runtime.git.commit(f"{module.node_id}: {module.name}")
                     completed.append(module.node_id)
                     break
 
-                # Validation failed: never treat as API-retryable; mark failed and maybe repair.
                 clear_validation_receipt(output_dir, module.node_id)
                 fail_msg = validation.reason
                 if validation.log_tail:
@@ -1713,10 +2240,31 @@ def main() -> int:
                     return validation.exit_code or 1
 
                 validation_repair += 1
-                validation_failure_log = fail_msg[-6000:]
+                # Repair: clear implement + batch_test receipts and re-run those STEPs only.
+                for sid in ("implement", "batch_test"):
+                    clear_step_receipt(output_dir, module.node_id, sid)
+                steps_to_run = [s for s in OFFICIAL_STEPS if s.step_id in ("implement", "batch_test")]
+                # Seed prior failure into batch_test via a repair note file
+                repair_note = step_dir(output_dir, module.node_id) / "repair_note.txt"
+                repair_note.parent.mkdir(parents=True, exist_ok=True)
+                repair_note.write_text(fail_msg[-6000:], encoding="utf-8")
                 runtime.events.mark_run_resumed(
-                    f"Validation repair {validation_repair}/{max_validation_repairs} for {module.node_id}; injecting harness failure log"
+                    f"Validation repair {validation_repair}/{max_validation_repairs} for {module.node_id}; "
+                    "re-running implement+batch_test STEPs"
                 )
+                print(
+                    json.dumps(
+                        {
+                            "event": "step_repair_rewind",
+                            "req_id": module.node_id,
+                            "validation_repair": validation_repair,
+                            "replay_steps": [s.step_id for s in steps_to_run],
+                        },
+                        ensure_ascii=False,
+                    ),
+                    flush=True,
+                )
+
         runtime.events.mark_run_completed("All ROOT modules completed")
         return 0
     except Exception as exc:
