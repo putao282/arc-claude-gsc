@@ -465,6 +465,99 @@ class McpAcceptanceV5qTests(unittest.TestCase):
             )
             self.assertTrue(acc2.ok, acc2.reason)
 
+    def test_govern_receipt_alone_insufficient_v5w(self):
+        """v5w hard audit: receipt JSON without matching in-session tool must fail."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            sdir = root / ".arc" / "steps" / "REQ-1"
+            sdir.mkdir(parents=True)
+            (sdir / "prd_govern.json").write_text(
+                '{"ok": true, "source": "forged-receipt"}\n', encoding="utf-8"
+            )
+            (sdir / "spec_govern.json").write_text(
+                '{"ok": true, "source": "forged-receipt"}\n', encoding="utf-8"
+            )
+            acc = mod.evaluate_step_acceptance(
+                root, _module(), _step("govern"),
+                _result(skills=("architect",), mcp=()),
+            )
+            self.assertFalse(acc.ok, acc.reason)
+            self.assertIn("prd_govern", acc.reason)
+            self.assertIn("receipt alone insufficient", acc.reason)
+            # One tool + both receipts still fails (need BOTH tools)
+            acc_one = mod.evaluate_step_acceptance(
+                root, _module(), _step("govern"),
+                _result(skills=("architect",), mcp=("mcp__arch__prd_govern",)),
+            )
+            self.assertFalse(acc_one.ok, acc_one.reason)
+            self.assertIn("spec_govern", acc_one.reason)
+            self.assertIn("receipt alone insufficient", acc_one.reason)
+
+    def test_govern_tools_plus_mirrored_receipts_pass_v5w(self):
+        """Receipts OK as side mirrors when matching in-session tools ran."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            sdir = root / ".arc" / "steps" / "REQ-1"
+            sdir.mkdir(parents=True)
+            (sdir / "prd_govern.json").write_text('{"mirrored": true}\n', encoding="utf-8")
+            (sdir / "spec_govern.json").write_text('{"mirrored": true}\n', encoding="utf-8")
+            acc = mod.evaluate_step_acceptance(
+                root, _module(), _step("govern"),
+                _result(
+                    skills=("architect",),
+                    mcp=("mcp__arch__prd_govern", "mcp__arch__spec_govern"),
+                ),
+            )
+            self.assertTrue(acc.ok, acc.reason)
+            self.assertTrue(any("prd_govern" in t for t in acc.mcp_required))
+            self.assertTrue(any("spec_govern" in t for t in acc.mcp_required))
+
+    def test_spec_file_only_rejected_v5w(self):
+        """SPEC: HTML alone without spec_write must fail (no file-only single signal)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            spec_dir = root / "SPEC" / "arcbench"
+            spec_dir.mkdir(parents=True)
+            (spec_dir / "REQ-1.html").write_text(
+                '<html><section data-req="REQ-1">' + ("x" * 80) + "</section></html>\n",
+                encoding="utf-8",
+            )
+            acc = mod.evaluate_step_acceptance(
+                root, _module(), _step("spec"),
+                _result(skills=("architect",), mcp=()),
+            )
+            self.assertFalse(acc.ok)
+            self.assertIn("spec_write", acc.reason)
+
+    def test_govern_prompt_hard_audit_chain_v5w(self):
+        prompt = mod.step_prompt(
+            _module(),
+            Path("/tmp/req"),
+            None,
+            [],
+            "github",
+            _step("govern"),
+        )
+        low = prompt.lower()
+        self.assertIn("insufficient alone", low)
+        self.assertIn("write + this govern chain", low)
+        self.assertIn("hard audit", low)
+        self.assertIn("single-signal", low)
+
+    def test_spec_prompt_both_html_and_write_v5w(self):
+        prompt = mod.step_prompt(
+            _module(),
+            Path("/tmp/req"),
+            None,
+            [],
+            "github",
+            _step("spec"),
+        )
+        low = prompt.lower()
+        self.assertIn("both", low)
+        self.assertIn("write + govern chain", low)
+        self.assertIn("not file-only", low)
+
 
 if __name__ == "__main__":
     unittest.main()

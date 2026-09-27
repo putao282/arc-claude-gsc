@@ -117,12 +117,13 @@ OFFICIAL_STEPS: tuple[StepDef, ...] = (
         goal=(
             "Derive HTML SPEC under SPEC/arcbench from PRD + ROOT module.subtree atomic "
             "requirements via GSC MCP `spec_write` (HTML write path; no Markdown migrate). "
-            "Seed/expand one section per leaf (data-req). Coverage audit is the next "
-            "govern STEP via mcp__arch__spec_govern — not a homemade trace file."
+            "Seed/expand one section per leaf (data-req). HARD: coverage is only green "
+            "when this write + the next govern STEP (prd_govern+spec_govern) both run — "
+            "not a homemade trace file / not file-only."
         ),
         exit_criteria=(
-            "SPEC/arcbench HTML (>50B) + mcp__arch__spec_write proof. "
-            "Chain/coverage checked later by govern (spec_govern/prd_govern)."
+            "BOTH SPEC/arcbench HTML (>50B) AND mcp__arch__spec_write proof "
+            "(not file-only, not prd-only). Coverage green only after write+govern chain."
         ),
     ),
     StepDef(
@@ -170,13 +171,18 @@ GOVERN_STEP = StepDef(
     title="PRD/SPEC govern audit",
     required_skills=("architect",),
     goal=(
-        "Run mcp__arch__prd_govern and mcp__arch__spec_govern (≥1 each) — MCP is the "
-        "coverage/chain audit path. Demand SPEC coverage vs PRD + ROOT module.subtree "
-        "atomic/leaf requirements. Mirror MCP govern output into "
-        "`.arc/steps/<id>/prd_govern.json` and `spec_govern.json` (side receipts only). "
-        "Do not invent a parallel file-only trace ceremony. Optional soft: mcp__arch__trace."
+        "HARD AUDIT (agent+tool chain, not single signal): run BOTH "
+        "mcp__arch__prd_govern and mcp__arch__spec_govern (≥1 each) in this STEP. "
+        "MCP tool use is required — receipt JSON alone does not pass. Demand SPEC "
+        "coverage vs PRD + ROOT module.subtree atomic/leaf requirements. Mirror MCP "
+        "govern output into `.arc/steps/<id>/prd_govern.json` and `spec_govern.json` "
+        "(side receipts only; must match in-session tool calls). Do not invent a "
+        "parallel file-only trace ceremony. Optional soft: mcp__arch__trace."
     ),
-    exit_criteria="prd_govern + spec_govern MCP proof (and/or receipt JSONs mirroring MCP).",
+    exit_criteria=(
+        "BOTH mcp__arch__prd_govern AND mcp__arch__spec_govern in-session tool use. "
+        "Receipt JSONs are side mirrors only — insufficient alone."
+    ),
 )
 
 AUDIT_REFACTOR_STEP = StepDef(
@@ -1929,7 +1935,7 @@ def ensure_arc_spawn_gate_softener(output_dir: Path) -> None:
     """Soften GSC SPAWN-GATE without disabling MCP; encode Official STEP loop."""
     claude_md = output_dir / "CLAUDE.md"
     claude_md.write_text(
-        "# ARC-Bench project — MCP-first Official STEP loop (v5v SPEC derive from PRD/atomic)\n\n"
+        "# ARC-Bench project — MCP-first Official STEP loop (v5w hard audit = agent+tool chain)\n\n"
         "HARD: GSC MCP stays ON. Never disable WaitForMcpServers / never set "
         "ARC_ENABLE_MCP=0 / never ban MCP tools.\n\n"
         "## Harness STEP loop (fail-closed)\n"
@@ -1940,9 +1946,11 @@ def ensure_arc_spawn_gate_softener(output_dir: Path) -> None:
         "1. **prd** — `mcp__arch__state_read` then `mcp__arch__prd`. Soft: architect|discoverer.\n"
         "2. **spec** — Read PRD/ + subtree atomics; `mcp__arch__spec_read` ≤1 then "
         "`mcp__arch__spec_write` once (HTML 2.0 under SPEC/arcbench, data-req per leaf). "
-        "ANTI-THRASH; FORBIDDEN migrate/invent/rename. Coverage = next govern via spec_govern.\n"
-        "3. **govern** (when enabled) — `mcp__arch__prd_govern` + `mcp__arch__spec_govern` (coverage vs PRD/subtree); "
-        "mirror MCP output to `.arc/steps/<id>/prd_govern.json` + `spec_govern.json`.\n"
+        "BOTH HTML + spec_write required (not file-only). ANTI-THRASH; FORBIDDEN "
+        "migrate/invent/rename. Coverage green only after write + govern chain.\n"
+        "3. **govern** (when enabled) — BOTH `mcp__arch__prd_govern` AND "
+        "`mcp__arch__spec_govern` in-session (coverage vs PRD/subtree); receipts are "
+        "side mirrors only — insufficient alone.\n"
         "4. **test_dag** — non-empty api+ui in test_dag.json. Soft: `mcp__arch__trace`.\n"
         "5. **pages** — MUST call `mcp__arch__design_style` OR "
         "`mcp__arch__design_asset`. Soft: read_image / browser lifecycle.\n"
@@ -1956,6 +1964,8 @@ def ensure_arc_spawn_gate_softener(output_dir: Path) -> None:
         "- Skills are model-invoked via the runtime Skill tool when relevant "
         "(official setting_sources + skills). Do NOT Read/Bash/cat SKILL.md.\n"
         "- Harness acceptance is artifact/MCP gates — NOT skill force-load.\n"
+        "- HARD AUDIT: coverage green only when agent runs write+govern tool chain "
+        "(not a single file/receipt/MCP signal).\n"
         "- Name required tools as `mcp__arch__<short>` from the allowlist; do NOT invent tool names.\n"
         "- NEVER call `mcp__arch__account_manage` or `mcp__arch__debug_binary`.\n"
         "- Do NOT use migrate tools as the main SPEC path (HTML 2.0 via spec_write).\n"
@@ -2057,8 +2067,8 @@ def evaluate_step_acceptance(
     Skills are NOT fail-closed (official CC Skills are model-invoked via setting_sources
     + skills=). Telemetry only: skills_seen / missing_skills recorded as soft_notes.
 
-    P1 MCP hard gates (v5q full-landing):
-      - govern: prd_govern + spec_govern
+    P1 MCP hard gates (v5q full-landing; v5w hard-audit tighten):
+      - govern: BOTH prd_govern AND spec_govern in-session tool use (receipt alone insufficient)
       - pages: design_style | design_asset
       - implement: search_code ≥ 1
     Soft (never alone fail-closed): commit_gate_status on batch_test / audit_refactor.
@@ -2189,26 +2199,49 @@ def evaluate_step_acceptance(
         mcp_required = list(mcp_write)
 
     elif step.step_id == "govern":
-        prd_g = _receipt_or_tool("prd_govern.json", "prd_govern")
-        spec_g = _receipt_or_tool("spec_govern.json", "spec_govern")
+        # v5w hard audit = agent + tool chain (not single signal).
+        # Require BOTH in-session MCP tools. Receipt JSON alone is insufficient;
+        # receipts count only as side mirrors when the matching tool was used this STEP.
+        prd_tools = mcp_tools_matching(used, "prd_govern")
+        spec_tools = mcp_tools_matching(used, "spec_govern")
+        prd_receipt = sdir / "prd_govern.json"
+        spec_receipt = sdir / "spec_govern.json"
+        receipt_paths: list[str] = []
+        if prd_receipt.is_file() and prd_receipt.stat().st_size > 2:
+            receipt_paths.append(str(prd_receipt))
+            if not prd_tools:
+                soft_notes.append("soft:prd_govern_receipt_without_in_session_tool")
+        if spec_receipt.is_file() and spec_receipt.stat().st_size > 2:
+            receipt_paths.append(str(spec_receipt))
+            if not spec_tools:
+                soft_notes.append("soft:spec_govern_receipt_without_in_session_tool")
         mcp_optional.extend(mcp_tools_matching(used, "trace", "state_read"))
-        if not prd_g:
+        if not prd_tools:
             return StepAcceptance(
                 ok=False,
-                reason="govern STEP requires mcp__arch__prd_govern (≥1) and/or .arc/steps/<id>/prd_govern.json",
+                reason=(
+                    "govern STEP requires in-session mcp__arch__prd_govern tool use "
+                    "(receipt alone insufficient)"
+                ),
                 skills_seen=skills_seen,
+                artifacts=tuple(receipt_paths),
                 mcp_optional_seen=tuple(mcp_optional),
+                soft_notes=tuple(soft_notes),
             )
-        if not spec_g:
+        if not spec_tools:
             return StepAcceptance(
                 ok=False,
-                reason="govern STEP requires mcp__arch__spec_govern (≥1) and/or .arc/steps/<id>/spec_govern.json",
+                reason=(
+                    "govern STEP requires in-session mcp__arch__spec_govern tool use "
+                    "(receipt alone insufficient)"
+                ),
                 skills_seen=skills_seen,
-                artifacts=tuple(prd_g),
+                artifacts=tuple(list(prd_tools) + receipt_paths),
                 mcp_optional_seen=tuple(mcp_optional),
+                soft_notes=tuple(soft_notes),
             )
-        artifacts = list(dict.fromkeys(prd_g + spec_g))
-        mcp_required = mcp_tools_matching(used, "prd_govern", "spec_govern") or artifacts[:]
+        artifacts = list(dict.fromkeys(list(prd_tools) + list(spec_tools) + receipt_paths))
+        mcp_required = list(prd_tools) + list(spec_tools)
 
     elif step.step_id == "test_dag":
         dag = sdir / "test_dag.json"
@@ -2577,14 +2610,19 @@ def step_prompt(
             "- FORBIDDEN: looping spec_read; FORBIDDEN as main path: "
             "`mcp__arch__spec_migrate` / `mcp__arch__grok_md_migrate`.\n"
             "- Soft: `mcp__arch__state_read` at most once.\n"
-            "- Acceptance needs `spec_write` proof + HTML under SPEC/arcbench "
-            "(>50B) — not read-only / not mcp prd standing in for spec_write.\n"
+            "- Acceptance needs BOTH `spec_write` proof AND HTML under SPEC/arcbench "
+            "(>50B) — not file-only / not read-only / not mcp prd standing in for "
+            "spec_write. Coverage is only green after write + govern chain.\n"
         )
     elif step.step_id == "govern":
         mcp_extra = (
-            "\nMCP REQUIRED this STEP (fail-closed; MCP is the coverage audit path):\n"
-            f"- Call `mcp__arch__prd_govern` ≥1; mirror MCP output → `{base}/prd_govern.json`.\n"
-            f"- Call `mcp__arch__spec_govern` ≥1; mirror MCP output → `{base}/spec_govern.json`.\n"
+            "\nMCP REQUIRED this STEP (fail-closed; HARD AUDIT = agent+tool chain):\n"
+            "- Coverage is only green when the SPEC write + this govern chain runs "
+            "(spec_write → prd_govern + spec_govern). Single-signal receipts do not pass.\n"
+            f"- Call `mcp__arch__prd_govern` ≥1 (REQUIRED in-session); mirror MCP output → "
+            f"`{base}/prd_govern.json` (side receipt only — insufficient alone).\n"
+            f"- Call `mcp__arch__spec_govern` ≥1 (REQUIRED in-session); mirror MCP output → "
+            f"`{base}/spec_govern.json` (side receipt only — insufficient alone).\n"
             "- HARD: when calling spec_govern / prd_govern, demand coverage of SPEC vs PRD "
             "+ ROOT module.subtree atomic/leaf requirements (ids, accessible names, roles, "
             "seed data, observable states). Note gaps in the MCP-mirrored receipt.\n"
@@ -2946,6 +2984,7 @@ def main() -> int:
                     "v5u_no_skill_md_read_acceptance",
                     "v5u_no_STEP_prompts_forcing_skill_load",
                     "v5v_spec_derive_from_prd_atomic",
+                    "v5w_hard_audit_agent_plus_tool_chain",
                 ],
             },
             ensure_ascii=False,
