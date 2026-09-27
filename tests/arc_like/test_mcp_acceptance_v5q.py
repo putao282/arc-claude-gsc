@@ -211,7 +211,10 @@ class McpAcceptanceV5qTests(unittest.TestCase):
 
             spec_dir = root / "SPEC" / "arcbench"
             spec_dir.mkdir(parents=True)
-            (spec_dir / "REQ-1.html").write_text("<html>" + ("x" * 80) + "</html>\n", encoding="utf-8")
+            (spec_dir / "REQ-1.html").write_text(
+                '<html><section data-req="REQ-1">' + ("x" * 80) + "</section></html>\n",
+                encoding="utf-8",
+            )
             acc3 = mod.evaluate_step_acceptance(
                 root, _module(), _step("spec"),
                 _result(skills=("architect",), mcp=()),
@@ -229,7 +232,10 @@ class McpAcceptanceV5qTests(unittest.TestCase):
             root = Path(tmp)
             spec_dir = root / "SPEC" / "arcbench"
             spec_dir.mkdir(parents=True)
-            (spec_dir / "REQ-1.html").write_text("<html>" + ("x" * 80) + "</html>\n", encoding="utf-8")
+            (spec_dir / "REQ-1.html").write_text(
+                '<html><section data-req="REQ-1">' + ("x" * 80) + "</section></html>\n",
+                encoding="utf-8",
+            )
             acc = mod.evaluate_step_acceptance(
                 root, _module(), _step("spec"),
                 _result(skills=("architect",), mcp=("mcp__arch__spec_read",)),
@@ -267,7 +273,10 @@ class McpAcceptanceV5qTests(unittest.TestCase):
 
             spec_dir = root / "SPEC" / "arcbench"
             spec_dir.mkdir(parents=True)
-            (spec_dir / "REQ-1.html").write_text("<html>" + ("x" * 80) + "</html>\n", encoding="utf-8")
+            (spec_dir / "REQ-1.html").write_text(
+                '<html><section data-req="REQ-1">' + ("x" * 80) + "</section></html>\n",
+                encoding="utf-8",
+            )
             acc2 = mod.evaluate_step_acceptance(
                 root, _module(), _step("spec"),
                 _result(skills=(), mcp=("mcp__arch__spec_write",)),
@@ -299,6 +308,162 @@ class McpAcceptanceV5qTests(unittest.TestCase):
                 _result(skills=(), mcp=()),
             )
             self.assertTrue(acc.ok, acc.reason)
+
+
+
+    def test_spec_stub_html_soft_not_fail_closed_when_leaves_v5v(self):
+        """v5v MCP-first: incomplete data-req is soft; SPEC still passes with spec_write+HTML.
+        Coverage is fail-closed on govern via spec_govern, not homemade trace/HTML matching.
+        """
+        module = mod.RequirementModule(
+            index=1,
+            total=1,
+            node_id="REQ-MOD",
+            name="Module",
+            subtree={
+                "id": "REQ-MOD",
+                "name": "Module",
+                "description": "parent",
+                "children": [
+                    {
+                        "id": "REQ-A",
+                        "name": "Add Item",
+                        "accessible_name": "Add Item",
+                        "role": "button",
+                    },
+                    {
+                        "id": "REQ-B",
+                        "name": "Remove Item",
+                        "accessible_name": "Remove Item",
+                        "role": "button",
+                    },
+                ],
+            },
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            spec_dir = root / "SPEC" / "arcbench"
+            spec_dir.mkdir(parents=True)
+            (spec_dir / "REQ-MOD.html").write_text(
+                "<html>" + ("x" * 80) + "</html>\n", encoding="utf-8"
+            )
+            acc = mod.evaluate_step_acceptance(
+                root, module, _step("spec"),
+                _result(skills=("architect",), mcp=("mcp__arch__spec_write",)),
+            )
+            self.assertTrue(acc.ok, acc.reason)
+            self.assertTrue(
+                any(n.startswith("soft:spec_leaf_data_req_incomplete:") for n in acc.soft_notes),
+                acc.soft_notes,
+            )
+            self.assertTrue(
+                any("govern_via_spec_govern" in n for n in acc.soft_notes),
+                acc.soft_notes,
+            )
+
+    def test_spec_prd_mcp_does_not_count_as_spec_write_v5v(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            spec_dir = root / "SPEC" / "arcbench"
+            spec_dir.mkdir(parents=True)
+            (spec_dir / "REQ-1.html").write_text(
+                '<html><section data-req="REQ-1">' + ("x" * 80) + "</section></html>\n",
+                encoding="utf-8",
+            )
+            acc = mod.evaluate_step_acceptance(
+                root, _module(), _step("spec"),
+                _result(skills=("architect",), mcp=("mcp__arch__prd",)),
+            )
+            self.assertFalse(acc.ok)
+            self.assertIn("spec_write", acc.reason)
+
+    def test_ensure_gsc_spec_seeds_leaf_sections_v5v(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp)
+            module = mod.RequirementModule(
+                index=1,
+                total=1,
+                node_id="REQ-MOD",
+                name="Module",
+                subtree={
+                    "id": "REQ-MOD",
+                    "name": "Module",
+                    "description": "parent",
+                    "children": [
+                        {
+                            "id": "REQ-A",
+                            "name": "Add Item",
+                            "description": "Add button",
+                            "accessible_name": "Add Item",
+                            "role": "button",
+                        },
+                        {
+                            "id": "REQ-B",
+                            "name": "Remove Item",
+                            "description": "Remove",
+                        },
+                    ],
+                },
+            )
+            path = mod.ensure_gsc_spec(output, module)
+            body = path.read_text(encoding="utf-8")
+            self.assertIn('data-req="REQ-A"', body)
+            self.assertIn('data-req="REQ-B"', body)
+            self.assertIn("Add Item", body)
+            self.assertGreater(path.stat().st_size, 50)
+            self.assertFalse((output / "SPEC" / "arcbench" / "REQ-MOD.md").exists())
+
+    def test_spec_prompt_mcp_write_derive_v5v(self):
+        prompt = mod.step_prompt(
+            _module(),
+            Path("/tmp/req"),
+            None,
+            [],
+            "github",
+            _step("spec"),
+        )
+        low = prompt.lower()
+        self.assertIn("prd", low)
+        self.assertIn("spec_write", low)
+        self.assertIn("atomic", low)
+        self.assertIn("invent", low)
+        self.assertIn("mcp is the spec write path", low)
+        self.assertNotIn("spec_trace.json mapping", low)
+        self.assertIn("spec_govern", low)
+
+    def test_govern_prompt_coverage_via_mcp_v5v(self):
+        prompt = mod.step_prompt(
+            _module(),
+            Path("/tmp/req"),
+            None,
+            [],
+            "github",
+            _step("govern"),
+        )
+        low = prompt.lower()
+        self.assertIn("spec_govern", low)
+        self.assertIn("prd_govern", low)
+        self.assertIn("coverage", low)
+        self.assertIn("subtree", low)
+        self.assertIn("do not invent a homemade spec_trace", low)
+
+    def test_govern_still_fail_closed_on_mcp_proof_v5v(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            acc = mod.evaluate_step_acceptance(
+                root, _module(), _step("govern"),
+                _result(skills=("architect",), mcp=("mcp__arch__prd_govern",)),
+            )
+            self.assertFalse(acc.ok)
+            self.assertIn("spec_govern", acc.reason)
+            acc2 = mod.evaluate_step_acceptance(
+                root, _module(), _step("govern"),
+                _result(
+                    skills=("architect",),
+                    mcp=("mcp__arch__prd_govern", "mcp__arch__spec_govern"),
+                ),
+            )
+            self.assertTrue(acc2.ok, acc2.reason)
 
 
 if __name__ == "__main__":

@@ -114,8 +114,16 @@ OFFICIAL_STEPS: tuple[StepDef, ...] = (
         step_id="spec",
         title="SPEC",
         required_skills=("architect",),
-        goal="Derive HTML SPEC under SPEC/arcbench via GSC MCP spec_read/spec_write (no Markdown migrate).",
-        exit_criteria="SPEC/arcbench HTML for this module exists/updated.",
+        goal=(
+            "Derive HTML SPEC under SPEC/arcbench from PRD + ROOT module.subtree atomic "
+            "requirements via GSC MCP `spec_write` (HTML write path; no Markdown migrate). "
+            "Seed/expand one section per leaf (data-req). Coverage audit is the next "
+            "govern STEP via mcp__arch__spec_govern — not a homemade trace file."
+        ),
+        exit_criteria=(
+            "SPEC/arcbench HTML (>50B) + mcp__arch__spec_write proof. "
+            "Chain/coverage checked later by govern (spec_govern/prd_govern)."
+        ),
     ),
     StepDef(
         step_id="test_dag",
@@ -162,11 +170,13 @@ GOVERN_STEP = StepDef(
     title="PRD/SPEC govern audit",
     required_skills=("architect",),
     goal=(
-        "Run mcp__arch__prd_govern and mcp__arch__spec_govern (≥1 each). "
-        "Write `.arc/steps/<id>/prd_govern.json` and `spec_govern.json` summaries. "
-        "Optional soft: mcp__arch__trace."
+        "Run mcp__arch__prd_govern and mcp__arch__spec_govern (≥1 each) — MCP is the "
+        "coverage/chain audit path. Demand SPEC coverage vs PRD + ROOT module.subtree "
+        "atomic/leaf requirements. Mirror MCP govern output into "
+        "`.arc/steps/<id>/prd_govern.json` and `spec_govern.json` (side receipts only). "
+        "Do not invent a parallel file-only trace ceremony. Optional soft: mcp__arch__trace."
     ),
-    exit_criteria="prd_govern + spec_govern MCP proof (and/or receipt JSONs).",
+    exit_criteria="prd_govern + spec_govern MCP proof (and/or receipt JSONs mirroring MCP).",
 )
 
 AUDIT_REFACTOR_STEP = StepDef(
@@ -1741,12 +1751,77 @@ def _html_escape(value: str) -> str:
     )
 
 
+
+def leaf_requirement_nodes(subtree: dict[str, Any]) -> list[dict[str, Any]]:
+    """Return leaf/atomic requirement nodes under a ROOT-child subtree (DFS order).
+
+    A node is a leaf when it has an id/req_id and either no `children` list or an empty one.
+    Nested children are walked; the parent itself is not emitted when it has children.
+    """
+    leaves: list[dict[str, Any]] = []
+
+    def walk(node: Any) -> None:
+        if not isinstance(node, dict):
+            return
+        children_raw = node.get("children")
+        child_list = (
+            [c for c in children_raw if isinstance(c, dict)]
+            if isinstance(children_raw, list)
+            else []
+        )
+        if child_list:
+            for child in child_list:
+                walk(child)
+            return
+        rid = str(node.get("id") or node.get("req_id") or "").strip()
+        if rid:
+            leaves.append(node)
+
+    walk(subtree)
+    return leaves
+
+
+def leaf_requirement_ids(subtree: dict[str, Any]) -> list[str]:
+    """Stable unique leaf/atomic requirement ids from subtree."""
+    seen: set[str] = set()
+    out: list[str] = []
+    for node in leaf_requirement_nodes(subtree):
+        rid = str(node.get("id") or node.get("req_id") or "").strip()
+        if rid and rid not in seen:
+            seen.add(rid)
+            out.append(rid)
+    return out
+
+
+def html_has_data_req(html: str, req_id: str) -> bool:
+    """True if HTML binds a section to req_id via data-req / data-req-id."""
+    if not req_id:
+        return False
+    markers = (
+        f'data-req="{req_id}"',
+        f"data-req='{req_id}'",
+        f'data-req-id="{req_id}"',
+        f"data-req-id='{req_id}'",
+    )
+    return any(m in html for m in markers)
+
+
+    for lid in leaf_ids:
+        val = trace.get(lid)
+        if val is None or (isinstance(val, str) and not val.strip()):
+            return False
+    return True
+
+
 def ensure_gsc_spec(output_dir: Path, module: RequirementModule) -> Path:
     """Materialize the ARC requirement as GSC HTML 2.0 SPEC (never Markdown).
 
     Writing SPEC/*.md forces GSC's migrate path; ARC runners lack a migrate provider,
     which previously caused thrash. HTML 2.0 lets GSC MCP use spec_read/spec_write
     without banning MCP.
+
+    v5v: seed one section per subtree leaf/atomic requirement (id/name/description)
+    so the agent expands from PRD+atomic rather than inventing from a one-line stub.
     """
     spec_dir = output_dir / "SPEC" / "arcbench"
     spec_dir.mkdir(parents=True, exist_ok=True)
@@ -1757,6 +1832,66 @@ def ensure_gsc_spec(output_dir: Path, module: RequirementModule) -> Path:
     html_path = spec_dir / f"{safe_id}.html"
     title = _html_escape(f"{module.node_id}: {module.name}")
     brief = _html_escape(str(module.subtree.get("description") or module.name)[:500])
+    leaves = leaf_requirement_nodes(module.subtree)
+    if not leaves:
+        leaves = [
+            {
+                "id": module.node_id,
+                "name": module.name,
+                "description": module.subtree.get("description") or module.name,
+            }
+        ]
+    section_parts: list[str] = []
+    for idx, leaf in enumerate(leaves, start=1):
+        lid = str(leaf.get("id") or leaf.get("req_id") or f"leaf-{idx}").strip()
+        lname = str(leaf.get("name") or leaf.get("title") or lid).strip()
+        ldesc = str(
+            leaf.get("description")
+            or leaf.get("brief")
+            or leaf.get("summary")
+            or lname
+        ).strip()[:800]
+        accessible = str(
+            leaf.get("accessible_name")
+            or leaf.get("accessibleName")
+            or leaf.get("a11y_name")
+            or lname
+        ).strip()[:200]
+        role = str(leaf.get("role") or leaf.get("ui_role") or "").strip()[:120]
+        seed = str(leaf.get("seed_data") or leaf.get("seed") or leaf.get("fixtures") or "").strip()[:300]
+        states = str(
+            leaf.get("observable_states")
+            or leaf.get("states")
+            or leaf.get("ui_states")
+            or ""
+        ).strip()[:300]
+        sec_id = "s-" + "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in lid)
+        esc_lid = _html_escape(lid)
+        esc_name = _html_escape(lname)
+        esc_desc = _html_escape(ldesc)
+        esc_acc = _html_escape(accessible)
+        esc_role = _html_escape(role) if role else ""
+        esc_seed = _html_escape(seed) if seed else ""
+        esc_states = _html_escape(states) if states else ""
+        extra_lis = ""
+        if esc_role:
+            extra_lis += f'        <li data-field="role">{esc_role}</li>\n'
+        if esc_seed:
+            extra_lis += f'        <li data-field="seed_data">{esc_seed}</li>\n'
+        if esc_states:
+            extra_lis += f'        <li data-field="observable_states">{esc_states}</li>\n'
+        section_parts.append(
+            f'    <section id="{sec_id}" data-section="requirements" '
+            f'data-req="{esc_lid}" data-req-status="unknown" data-req-domain="arcbench">\n'
+            f"      <h2>{esc_name}</h2>\n"
+            f'      <p data-arc-brief>{esc_desc}</p>\n'
+            f"      <ul data-arc-atomic>\n"
+            f'        <li data-field="accessible_name">{esc_acc}</li>\n'
+            f"{extra_lis}"
+            f"      </ul>\n"
+            f"    </section>"
+        )
+    sections_block = "\n".join(section_parts)
     html_path.write_text(
         "<!DOCTYPE html>\n"
         '<html lang="zh-CN" data-spec-root>\n'
@@ -1766,21 +1901,21 @@ def ensure_gsc_spec(output_dir: Path, module: RequirementModule) -> Path:
         '  <meta name="spec-category" content="arcbench">\n'
         f'  <meta name="spec-title" content="{title}">\n'
         '  <script type="application/ld+json">\n'
-        f'  {{ "@context":"https://spec.gsc.local/v1", "@type":"SpecDocument", "id":"{safe_id}", "dependencies":[], "children":[] }}\n'
+        f'  {{ "@context":"https://spec.gsc.local/v1", "@type":"SpecDocument", '
+        f'"id":"{safe_id}", "dependencies":[], "children":[] }}\n'
         "  </script>\n"
         f"  <title>{title}</title>\n"
         "</head>\n"
         "<body>\n"
         "  <header data-spec-header>\n"
         f"    <h1>{title}</h1>\n"
+        f'    <p data-arc-module-brief>{brief}</p>\n'
         "  </header>\n"
         '  <main data-spec-content>\n'
-        f'    <section id="s-req" data-section="requirements" data-req="{_html_escape(module.node_id)}" '
-        'data-req-status="unknown" data-req-domain="arcbench">\n'
-        f"      <h2>{title}</h2>\n"
-        "      <p>Implement from the task JSON in the agent prompt. Prefer GSC MCP SPEC tools when available.</p>\n"        "      <p data-arc-spawn>ARC: implement in the main session; avoid Agent/Task spawn. If you must spawn a coding subagent, include a literal ## TASK-HEADER block (task/domain/archaeology/reuse-decision/scope/completion/retry/stop). WaitForMcpServers at most once. Harness vitest/npm test grants green.</p>\n"
-        f"      <p data-arc-brief>{brief}</p>\n"
-        "    </section>\n"
+        "    <p data-arc-spawn>ARC: derive SPEC from PRD + subtree atomic requirements; "
+        "preserve exact English accessible names/roles/seed/states. "
+        "Prefer GSC MCP SPEC tools. Expand seeded sections; do not invent features.</p>\n"
+        f"{sections_block}\n"
         "  </main>\n"
         "</body>\n"
         "</html>\n",
@@ -1789,11 +1924,12 @@ def ensure_gsc_spec(output_dir: Path, module: RequirementModule) -> Path:
     return html_path
 
 
+
 def ensure_arc_spawn_gate_softener(output_dir: Path) -> None:
     """Soften GSC SPAWN-GATE without disabling MCP; encode Official STEP loop."""
     claude_md = output_dir / "CLAUDE.md"
     claude_md.write_text(
-        "# ARC-Bench project — MCP-first Official STEP loop (v5r SPEC anti-thrash)\n\n"
+        "# ARC-Bench project — MCP-first Official STEP loop (v5v SPEC derive from PRD/atomic)\n\n"
         "HARD: GSC MCP stays ON. Never disable WaitForMcpServers / never set "
         "ARC_ENABLE_MCP=0 / never ban MCP tools.\n\n"
         "## Harness STEP loop (fail-closed)\n"
@@ -1802,10 +1938,11 @@ def ensure_arc_spawn_gate_softener(output_dir: Path) -> None:
         "Receipts live under `.arc/steps/<module-id>/`.\n\n"
         "STEPs in order:\n"
         "1. **prd** — `mcp__arch__state_read` then `mcp__arch__prd`. Soft: architect|discoverer.\n"
-        "2. **spec** — `mcp__arch__spec_read` ≤1 then `mcp__arch__spec_write` once; "
-        "HTML 2.0 under SPEC/arcbench. ANTI-THRASH: never re-read identical SPEC. FORBIDDEN migrate.\n"
-        "3. **govern** (when enabled) — `mcp__arch__prd_govern` + `mcp__arch__spec_govern`; "
-        "write `.arc/steps/<id>/prd_govern.json` + `spec_govern.json`.\n"
+        "2. **spec** — Read PRD/ + subtree atomics; `mcp__arch__spec_read` ≤1 then "
+        "`mcp__arch__spec_write` once (HTML 2.0 under SPEC/arcbench, data-req per leaf). "
+        "ANTI-THRASH; FORBIDDEN migrate/invent/rename. Coverage = next govern via spec_govern.\n"
+        "3. **govern** (when enabled) — `mcp__arch__prd_govern` + `mcp__arch__spec_govern` (coverage vs PRD/subtree); "
+        "mirror MCP output to `.arc/steps/<id>/prd_govern.json` + `spec_govern.json`.\n"
         "4. **test_dag** — non-empty api+ui in test_dag.json. Soft: `mcp__arch__trace`.\n"
         "5. **pages** — MUST call `mcp__arch__design_style` OR "
         "`mcp__arch__design_asset`. Soft: read_image / browser lifecycle.\n"
@@ -2000,10 +2137,9 @@ def evaluate_step_acceptance(
         elif spec_dir.is_dir():
             htmls = [p for p in spec_dir.glob("*.html") if p.is_file() and p.stat().st_size > 50]
             found.extend(str(p) for p in htmls[:5])
-        # v5r: require spec_write (read-only thrash must not satisfy acceptance)
+        # v5r/v5v: require spec_write (read-only thrash / mcp prd must not satisfy acceptance)
         mcp_write = mcp_tools_matching(used, "spec_write")
         mcp_read = mcp_tools_matching(used, "spec_read")
-        mcp_spec = mcp_write or mcp_tools_matching(used, "prd")
         mcp_optional.extend(mcp_read)
         mcp_optional.extend(mcp_tools_matching(used, "state_read", "spec_govern", "spec_similarity"))
         if not mcp_tools_matching(used, "state_read"):
@@ -2017,7 +2153,7 @@ def evaluate_step_acceptance(
                 skills_seen=skills_seen,
                 soft_notes=tuple(soft_notes),
             )
-        if not mcp_spec:
+        if not mcp_write:
             return StepAcceptance(
                 ok=False,
                 reason="SPEC STEP requires GSC MCP spec_write (HTML) tool use proof — not read-only",
@@ -2025,8 +2161,32 @@ def evaluate_step_acceptance(
                 artifacts=tuple(found + mcp_read),
                 soft_notes=tuple(soft_notes),
             )
-        artifacts = found + mcp_spec + mcp_read
-        mcp_required = list(mcp_spec)
+        # v5v MCP-first: coverage/chain audit is govern STEP (spec_govern/prd_govern),
+        # not a homemade spec_trace.json or brittle HTML string gate on this STEP.
+        leaf_ids = leaf_requirement_ids(module.subtree)
+        prd_dir = output_dir / "PRD"
+        prd_hits: list[str] = []
+        if prd_dir.is_dir():
+            prd_hits.extend(str(p) for p in prd_dir.rglob("*") if p.is_file())
+        prd_hits.extend(str(p) for p in sdir.glob("prd*") if p.is_file())
+        if not prd_hits and leaf_ids:
+            soft_notes.append("soft:prd_missing_subtree_rich_ok")
+        if leaf_ids:
+            html_blob = ""
+            for fp in found:
+                try:
+                    html_blob += Path(fp).read_text(encoding="utf-8", errors="replace")
+                except OSError:
+                    pass
+            missing_html = [lid for lid in leaf_ids if not html_has_data_req(html_blob, lid)]
+            if missing_html:
+                soft_notes.append(
+                    "soft:spec_leaf_data_req_incomplete:"
+                    + ",".join(missing_html[:8])
+                    + ";govern_via_spec_govern"
+                )
+        artifacts = found + mcp_write + mcp_read
+        mcp_required = list(mcp_write)
 
     elif step.step_id == "govern":
         prd_g = _receipt_or_tool("prd_govern.json", "prd_govern")
@@ -2400,21 +2560,36 @@ def step_prompt(
         )
     elif step.step_id == "spec":
         mcp_extra = (
-            "\nMCP REQUIRED this STEP (v5r anti-thrash):\n"
+            "\nMCP + CONTENT REQUIRED this STEP (v5v derive from PRD/atomic via MCP write, anti-thrash):\n"
+            "- HARD content: Read PRD artifacts under `PRD/` or "
+            f"`{base}/prd*` when present (use the Read tool — do NOT thrash MCP for this).\n"
+            "- HARD content: Derive HTML SPEC from ROOT `module.subtree` atomic/leaf "
+            "requirements + PRD. Expand seeded leaf sections; every leaf SHOULD have a "
+            '`<section data-req="<id>">`. Preserve exact English accessible names, roles, '
+            "seed data, and observable states from requirements.\n"
+            "- FORBIDDEN: invent features; rename UI strings; expand out-of-scope items "
+            "from the competition summary.\n"
             "- Call `mcp__arch__spec_read` AT MOST ONCE (same args never twice).\n"
-            "- Immediately call `mcp__arch__spec_write` ONCE for HTML SPEC under "
-            "SPEC/arcbench (HTML 2.0), then STOP this STEP.\n"
+            "- Immediately call `mcp__arch__spec_write` ONCE — MCP is the SPEC write path — "
+            "for HTML under SPEC/arcbench (HTML 2.0), then STOP this STEP.\n"
+            "- Do NOT invent a parallel file-only trace ceremony; coverage/chain audit is "
+            "the next govern STEP via `mcp__arch__spec_govern` / `mcp__arch__prd_govern`.\n"
             "- FORBIDDEN: looping spec_read; FORBIDDEN as main path: "
             "`mcp__arch__spec_migrate` / `mcp__arch__grok_md_migrate`.\n"
-            "- Soft: `mcp__arch__state_read` at most once; optional `mcp__arch__spec_govern` "
-            f"(write `{base}/spec_govern.json`).\n"
-            "- Acceptance needs spec_write proof + HTML under SPEC/arcbench — not read-only.\n"
+            "- Soft: `mcp__arch__state_read` at most once.\n"
+            "- Acceptance needs `spec_write` proof + HTML under SPEC/arcbench "
+            "(>50B) — not read-only / not mcp prd standing in for spec_write.\n"
         )
     elif step.step_id == "govern":
         mcp_extra = (
-            "\nMCP REQUIRED this STEP (fail-closed):\n"
-            f"- `mcp__arch__prd_govern` ≥1 → write `{base}/prd_govern.json` summary.\n"
-            f"- `mcp__arch__spec_govern` ≥1 → write `{base}/spec_govern.json` summary.\n"
+            "\nMCP REQUIRED this STEP (fail-closed; MCP is the coverage audit path):\n"
+            f"- Call `mcp__arch__prd_govern` ≥1; mirror MCP output → `{base}/prd_govern.json`.\n"
+            f"- Call `mcp__arch__spec_govern` ≥1; mirror MCP output → `{base}/spec_govern.json`.\n"
+            "- HARD: when calling spec_govern / prd_govern, demand coverage of SPEC vs PRD "
+            "+ ROOT module.subtree atomic/leaf requirements (ids, accessible names, roles, "
+            "seed data, observable states). Note gaps in the MCP-mirrored receipt.\n"
+            "- Do NOT invent a homemade spec_trace.json as the source of truth — "
+            "govern MCP tools own chain/coverage.\n"
             "- Soft: `mcp__arch__trace`.\n"
         )
     elif step.step_id == "test_dag":
@@ -2770,6 +2945,7 @@ def main() -> int:
                     "v5u_delete_skill_force_load_fail_closed",
                     "v5u_no_skill_md_read_acceptance",
                     "v5u_no_STEP_prompts_forcing_skill_load",
+                    "v5v_spec_derive_from_prd_atomic",
                 ],
             },
             ensure_ascii=False,
