@@ -116,8 +116,15 @@ OFFICIAL_STEPS: tuple[StepDef, ...] = (
         step_id="test_dag",
         title="TEST API+UI DAG",
         required_skills=("arcbench-traceability",),
-        goal="Author API + UI test DAG / cases (files + traceability); do not run the full suite yet.",
-        exit_criteria="Test DAG receipt JSON with api+ui entries and/or real test files; skill proof.",
+        goal=(
+            "Author API + UI test DAG. Write `.arc/steps/<id>/test_dag.json` with NON-EMPTY "
+            "top-level keys `api` and `ui` (arrays of test objects). Optionally also create "
+            "matching test files. Do not run the full suite yet."
+        ),
+        exit_criteria=(
+            "`.arc/steps/<id>/test_dag.json` has non-empty `api` and `ui` arrays "
+            "(or equivalent real api+ui test files); skill proof."
+        ),
     ),
     StepDef(
         step_id="pages",
@@ -1747,7 +1754,58 @@ def evaluate_step_acceptance(
 
     elif step.step_id == "test_dag":
         dag = sdir / "test_dag.json"
-        found = []
+        found: list[str] = []
+        has_api = False
+        has_ui = False
+        key_note = "no test_dag.json"
+
+        def _nonempty(value: object) -> bool:
+            if value is None:
+                return False
+            if isinstance(value, (list, dict, tuple, set)):
+                return len(value) > 0
+            if isinstance(value, str):
+                return bool(value.strip())
+            return bool(value)
+
+        def _extract_api_ui(payload: object) -> tuple[bool, bool, str]:
+            if not isinstance(payload, dict):
+                return False, False, f"payload_type={type(payload).__name__}"
+            api = payload.get("api")
+            if not _nonempty(api):
+                api = payload.get("api_tests")
+            ui = payload.get("ui")
+            if not _nonempty(ui):
+                ui = payload.get("ui_tests")
+            tests_obj = payload.get("tests")
+            if isinstance(tests_obj, dict):
+                if not _nonempty(api):
+                    api = tests_obj.get("api") or tests_obj.get("api_tests")
+                if not _nonempty(ui):
+                    ui = tests_obj.get("ui") or tests_obj.get("ui_tests")
+            elif isinstance(tests_obj, list):
+                api_items = [
+                    t for t in tests_obj
+                    if isinstance(t, dict)
+                    and str(t.get("type") or t.get("kind") or "").lower() in {"api", "backend", "http"}
+                ]
+                ui_items = [
+                    t for t in tests_obj
+                    if isinstance(t, dict)
+                    and str(t.get("type") or t.get("kind") or "").lower()
+                    in {"ui", "e2e", "frontend", "playwright", "browser"}
+                ]
+                if not _nonempty(api) and api_items:
+                    api = api_items
+                if not _nonempty(ui) and ui_items:
+                    ui = ui_items
+            top_keys = sorted(str(k) for k in payload.keys())
+            note = (
+                f"keys={top_keys}; "
+                f"api_nonempty={_nonempty(api)}; ui_nonempty={_nonempty(ui)}"
+            )
+            return _nonempty(api), _nonempty(ui), note
+
         if dag.is_file():
             try:
                 payload = json.loads(dag.read_text(encoding="utf-8"))
@@ -1757,20 +1815,40 @@ def evaluate_step_acceptance(
                     reason=f"test_dag.json unreadable: {exc}",
                     skills_seen=skills_seen,
                 )
-            has_api = bool(payload.get("api") or payload.get("api_tests"))
-            has_ui = bool(payload.get("ui") or payload.get("ui_tests"))
-            if not (has_api and has_ui):
-                return StepAcceptance(
-                    ok=False,
-                    reason="test_dag.json must include both api and ui test entries",
-                    skills_seen=skills_seen,
-                    artifacts=(str(dag),),
-                )
+            has_api, has_ui, key_note = _extract_api_ui(payload)
             found.append(str(dag))
+
         project = discover_test_project(output_dir)
         test_files = find_test_files(project) if project else []
+        api_files: list[str] = []
+        ui_files: list[str] = []
+        for p in test_files:
+            low = str(p).lower().replace("\\", "/")
+            name = Path(p).name.lower()
+            if any(tok in low for tok in ("/api/", "api.", "api-", "_api", "backend")) or name.startswith("api"):
+                api_files.append(str(p))
+            if any(
+                tok in low
+                for tok in ("/ui/", "ui.", "ui-", "_ui", "e2e", "playwright", "frontend", "browser")
+            ) or name.startswith("ui"):
+                ui_files.append(str(p))
         if test_files:
             found.extend(str(p) for p in test_files[:8])
+        if api_files:
+            has_api = True
+        if ui_files:
+            has_ui = True
+
+        if not (has_api and has_ui):
+            return StepAcceptance(
+                ok=False,
+                reason=(
+                    "test_dag.json must include both non-empty api and ui test entries "
+                    f"({key_note}; api_files={len(api_files)}, ui_files={len(ui_files)})"
+                ),
+                skills_seen=skills_seen,
+                artifacts=tuple(found[:8]) if found else (),
+            )
         if not found:
             return StepAcceptance(
                 ok=False,
@@ -1926,6 +2004,22 @@ def step_prompt(
         )
 
     skill_lines = ", ".join(f"`{s}`" for s in step.required_skills)
+    schema_extra = ""
+    if step.step_id == "test_dag":
+        schema_extra = (
+            "\n"
+            "HARD schema for THIS STEP — write this file BEFORE ending:\n"
+            f"`{receipt_hint}` MUST be valid JSON with NON-EMPTY top-level arrays `api` and `ui`.\n"
+            "Do NOT use only api_tests/ui_tests. Do NOT leave arrays empty. Do NOT run the full suite yet.\n"
+            "Exact shape example:\n"
+            "```json\n"
+            "{\n"
+            '  "api": [{"id": "api-1", "path": "tests/api/counter.test.ts", "asserts": ["increment"]}],\n'
+            '  "ui": [{"id": "ui-1", "path": "tests/ui/counter.spec.ts", "asserts": ["button visible"]}]\n'
+            "}\n"
+            "```\n"
+            "Also create the referenced test files when practical. Acceptance fails without both api and ui.\n"
+        )
     return textwrap.dedent(f"""
         You are in an ARC-Bench Official harness STEP round (not a mega-prompt).
         GSC plugin + GSC MCP are loaded. MCP stays ON.
@@ -1955,7 +2049,7 @@ def step_prompt(
         {mid_dev}{batch}
         {skills_text}
         Also use GSC MCP (`prd` / `spec_read` / `spec_write` / `state_*`) where relevant so logs show MCP value.
-
+        {schema_extra}
         When exit criteria are met, write a short receipt JSON to `{receipt_hint}` with keys:
         step_id, skills_loaded, artifacts (list of paths), summary.
         The harness writes `{ok_hint}` only after its own acceptance gate passes (skill proof + artifacts).
