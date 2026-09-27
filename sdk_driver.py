@@ -209,7 +209,7 @@ def sdk_model_for_options(contest_model: str) -> str:
 
 
 def apply_contest_model_env(env: dict[str, str], contest_model: str) -> dict[str, str]:
-    """Map contest MODEL into Claude Code gateway env (no proxy)."""
+    """Map model id into Claude Code gateway env (use sonnet under proxy)."""
     out = dict(env)
     model = (contest_model or "").strip()
     if model:
@@ -562,12 +562,12 @@ def describe_driver_policy(
         "official_pattern": "implement_modules_async",
         "permission_mode": "acceptEdits",
         "model_from_MODEL": model,
-        "anthropic_proxy": False,
+        "anthropic_proxy": True,
         "mcp_enabled": enable_mcp,
         "mcp_config": str(mcp_config) if mcp_config else None,
         "mcp_via": "mcp_servers" if enable_mcp else None,
         "gsc_plugins": plugins,
         "gsc_plugin_note": plugin_note,
-        "no_production_proxy": True,
+        "protocol_bridge": "anthropic-proxy Messages to chat/completions",
         "no_cli_subprocess_primary": True,
     }

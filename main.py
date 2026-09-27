@@ -321,19 +321,15 @@ def apply_official_claude_env(
 
 
 def _arc_maybe_start_anthropic_proxy(base_url: str, api_key: str, model: str) -> subprocess.Popen | None:
-    """LOCAL TEST ONLY. Opt-in via ARC_ENABLE_ANTHROPIC_PROXY=1.
+    """Claude Messages → OpenAI chat/completions protocol bridge.
 
-    Production Smoke/Official must NOT use this. Contest path maps ARC OPENAI_* env
-    like the official Claude Code starter (see apply_official_claude_env).
-    Client auth when proxy is enabled MUST be ANTHROPIC_API_KEY=arc-local.
+    Required for contest deepseek (ARC serves chat/completions; ClaudeSDKClient/
+    Claude Code speak Anthropic Messages). Auto-starts when the bundled binary is
+    present. Opt-out: ARC_DISABLE_ANTHROPIC_PROXY=1.
+    Client auth MUST be ANTHROPIC_API_KEY=arc-local (proxy CLIENT_KEY).
     """
     gateway_bin = SUBMISSION_DIR / "runtime" / "gateway" / "anthropic-proxy"
-    # Default OFF for contest. Explicit enable required; ARC_DISABLE_ANTHROPIC_PROXY=1 also forces off.
-    if env_bool("ARC_DISABLE_ANTHROPIC_PROXY", True):
-        return None
-    if not env_bool("ARC_ENABLE_ANTHROPIC_PROXY", False):
-        return None
-    if not gateway_bin.is_file():
+    if not gateway_bin.is_file() or env_bool("ARC_DISABLE_ANTHROPIC_PROXY", False):
         return None
     gateway_bin.chmod(0o755)
     chat = base_url.rstrip("/")
@@ -603,7 +599,7 @@ def run_claude_via_sdk(
     skills_dir: Path | None,
     max_budget_usd: str | float | None,
 ) -> ClaudeRunResult:
-    """Primary contest driver: official ClaudeSDKClient (no CLI -p primary path)."""
+    """Primary contest driver: ClaudeSDKClient (+ anthropic-proxy when active)."""
     plugins = sdk_driver.gsc_plugins(gsc_dir)
     mcp_servers = sdk_driver.gsc_mcp_servers(
         gsc_dir=gsc_dir, mcp_config=mcp_config, enable_mcp=enable_mcp
@@ -614,18 +610,39 @@ def run_claude_via_sdk(
             budget = float(max_budget_usd)
         except (TypeError, ValueError):
             budget = None
-    # Ensure OPENAI_* visible to claude_env_from_openai_env inside the turn.
-    prev = {k: os.environ.get(k) for k in ("OPENAI_API_KEY", "OPENAI_BASE_URL", "MODEL")}
+    using_proxy = (
+        attempt_env.get("ANTHROPIC_API_KEY") == "arc-local"
+        or (attempt_env.get("ANTHROPIC_BASE_URL") or "").startswith("http://127.0.0.1:8787")
+    )
+    # Ensure OPENAI_* visible to claude_env_from_openai_env inside the turn (no-proxy path).
+    prev = {k: os.environ.get(k) for k in ("OPENAI_API_KEY", "OPENAI_BASE_URL", "MODEL", "ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN")}
     try:
-        if attempt_env.get("OPENAI_API_KEY"):
-            os.environ["OPENAI_API_KEY"] = attempt_env["OPENAI_API_KEY"]
-        if attempt_env.get("OPENAI_BASE_URL"):
-            os.environ["OPENAI_BASE_URL"] = attempt_env["OPENAI_BASE_URL"]
-        os.environ["MODEL"] = model
-        # Propagate HOME/GSC/PATH and related into SDK subprocess env.
         sdk_env = {k: v for k, v in attempt_env.items() if isinstance(v, str)}
-        sdk_model = sdk_driver.sdk_model_for_options(model)
-        sdk_env = sdk_driver.apply_contest_model_env(sdk_env, model)
+        if using_proxy:
+            # Bridge: Claude speaks Messages to local proxy; proxy FORCE_MODELs to contest id.
+            # Local CC allowlist needs a builtin alias (sonnet); do NOT remap OPENAI_* over API key.
+            sdk_env["ANTHROPIC_BASE_URL"] = "http://127.0.0.1:8787"
+            sdk_env["ANTHROPIC_API_KEY"] = "arc-local"
+            for _k in ("ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY_OLD", "CLAUDE_CODE_API_KEY"):
+                sdk_env.pop(_k, None)
+            os.environ["ANTHROPIC_BASE_URL"] = "http://127.0.0.1:8787"
+            os.environ["ANTHROPIC_API_KEY"] = "arc-local"
+            os.environ.pop("ANTHROPIC_AUTH_TOKEN", None)
+            os.environ["OPENAI_API_KEY"] = "arc-local"
+            os.environ["OPENAI_BASE_URL"] = "http://127.0.0.1:8787"
+            os.environ["MODEL"] = model
+            sdk_model = "sonnet"
+            sdk_env = sdk_driver.apply_contest_model_env(sdk_env, "sonnet")
+            apply_openai_env = False
+        else:
+            if attempt_env.get("OPENAI_API_KEY"):
+                os.environ["OPENAI_API_KEY"] = attempt_env["OPENAI_API_KEY"]
+            if attempt_env.get("OPENAI_BASE_URL"):
+                os.environ["OPENAI_BASE_URL"] = attempt_env["OPENAI_BASE_URL"]
+            os.environ["MODEL"] = model
+            sdk_model = sdk_driver.sdk_model_for_options(model)
+            sdk_env = sdk_driver.apply_contest_model_env(sdk_env, model)
+            apply_openai_env = True
         options = sdk_driver.build_agent_options(
             cwd=output_dir,
             model=sdk_model,
@@ -644,6 +661,7 @@ def run_claude_via_sdk(
                     "driver": "ClaudeSDKClient",
                     "contest_model": model,
                     "sdk_model": sdk_model,
+                    "anthropic_proxy": using_proxy,
                     "anthropic_base_url": sdk_env.get("ANTHROPIC_BASE_URL") or os.environ.get("ANTHROPIC_BASE_URL"),
                     "permission_mode": "acceptEdits",
                     "mcp_enabled": enable_mcp,
@@ -655,7 +673,7 @@ def run_claude_via_sdk(
             ),
             flush=True,
         )
-        turn = sdk_driver.run_sdk_turn(prompt=prompt, options=options, apply_openai_env=True)
+        turn = sdk_driver.run_sdk_turn(prompt=prompt, options=options, apply_openai_env=apply_openai_env)
     finally:
         for k, v in prev.items():
             if v is None:
@@ -2113,14 +2131,31 @@ def main() -> int:
     env["MCP_TIMEOUT"] = str(mcp_timeout_ms)
     env["PATH"] = os.pathsep.join([str(gsc_dir / "bin"), str(gsc_dir / "lsp" / "web" / "node_modules" / ".bin"), env.get("PATH", "")])
 
-    # Contest primary driver: ClaudeSDKClient + official OPENAI_* → ANTHROPIC_* mapping.
-    # Production MUST NOT start anthropic-proxy. Local-only proxy helper remains unused here.
-    gateway_proc = None
-    # apply_official_claude_env already strips trailing /v1 (Claude appends /v1/messages).
-    claude_env = apply_official_claude_env(env, base_url=base_url, api_key=api_key, model=model)
-    claude_env["ANTHROPIC_API_KEY"] = ""
-    if api_key:
-        claude_env["ANTHROPIC_AUTH_TOKEN"] = api_key
+    # Contest primary driver: ClaudeSDKClient + anthropic-proxy (Messages↔chat/completions).
+    # Proxy auto-starts when runtime/gateway/anthropic-proxy is packed; opt-out ARC_DISABLE_ANTHROPIC_PROXY=1.
+    gateway_proc = _arc_maybe_start_anthropic_proxy(base_url, api_key, model)
+    claude_env = env.copy()
+    if gateway_proc is not None:
+        claude_env["ANTHROPIC_BASE_URL"] = "http://127.0.0.1:8787"
+        claude_env["ANTHROPIC_API_KEY"] = "arc-local"
+        for _k in ("ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY_OLD", "CLAUDE_CODE_API_KEY"):
+            claude_env.pop(_k, None)
+        # Local CC allowlist: sonnet alias; proxy FORCE_MODEL remaps to contest deepseek.
+        claude_env = sdk_driver.apply_contest_model_env(claude_env, "sonnet")
+        def _stop_gateway(proc=gateway_proc):
+            if proc.poll() is None:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=5)
+                except Exception:
+                    proc.kill()
+        atexit.register(_stop_gateway)
+    else:
+        # Fallback: official OPENAI_* → ANTHROPIC_* mapping (no bridge).
+        claude_env = apply_official_claude_env(env, base_url=base_url, api_key=api_key, model=model)
+        claude_env["ANTHROPIC_API_KEY"] = ""
+        if api_key:
+            claude_env["ANTHROPIC_AUTH_TOKEN"] = api_key
     for key in ("SUDO_USER", "SUDO_UID", "SUDO_GID"):
         claude_env.pop(key, None)
     if identity is not None:
@@ -2150,9 +2185,9 @@ def main() -> int:
                 "anthropic_model": claude_env.get("ANTHROPIC_MODEL"),
                 "gateway_model_discovery": claude_env.get("CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY"),
                 "contest_model": model,
-                "sdk_model": sdk_driver.sdk_model_for_options(model),
+                "sdk_model": ("sonnet" if gateway_proc is not None else sdk_driver.sdk_model_for_options(model)),
                 "permission_mode": "acceptEdits",
-                "anthropic_proxy": False,
+                "anthropic_proxy": gateway_proc is not None,
                 "gsc_plugins": sdk_plugins,
                 "gsc_plugin_note": (
                     None
@@ -2180,7 +2215,7 @@ def main() -> int:
                 "mcp_enabled": enable_mcp,
                 "mcp_config": str(mcp_config_path) if mcp_config_path else None,
                 "mcp_timeout_ms": mcp_timeout_ms,
-                "anthropic_proxy": False,
+                "anthropic_proxy": gateway_proc is not None,
                 "driver": "ClaudeSDKClient",
                 "permission_mode": "acceptEdits",
                 "mcp_allowed_tools": gsc_mcp_allowed_tools() if enable_mcp else [],
@@ -2188,6 +2223,7 @@ def main() -> int:
                 "step_required_skills": {s.step_id: list(s.required_skills) for s in OFFICIAL_STEPS},
                 "thrash_mitigations": [
                     "ClaudeSDKClient_official_driver",
+                    "anthropic_proxy_messages_to_chat_completions",
                     "spawn_gate_off",
                     "disallow_Agent_Task_and_bloat_builtins",
                     "Skill_allowed_for_STEP_force_load",
@@ -2198,7 +2234,6 @@ def main() -> int:
                     "autocompact_200000",
                     "rapid_refill_retryable_capped",
                     "official_step_loop_fail_closed",
-                    "no_production_anthropic_proxy",
                 ],
             },
             ensure_ascii=False,
@@ -2349,18 +2384,26 @@ def main() -> int:
                             )
                             attempt_base_url = base_url_for_attempt(base_urls, attempt)
                             attempt_env = claude_env.copy()
-                            # Keep OPENAI_* aligned for official claude_env_from_openai_env.
-                            attempt_env["OPENAI_API_KEY"] = api_key
-                            attempt_env["OPENAI_BASE_URL"] = attempt_base_url
                             attempt_env["MODEL"] = model
-                            # Also mirror official ANTHROPIC_* into subprocess env (SDK merges options.env).
-                            attempt_env = apply_official_claude_env(
-                                attempt_env, base_url=attempt_base_url, api_key=api_key, model=model
-                            )
-                            attempt_env["ANTHROPIC_API_KEY"] = ""
-                            if api_key:
-                                attempt_env["ANTHROPIC_AUTH_TOKEN"] = api_key
-                            attempt_env = sdk_driver.apply_contest_model_env(attempt_env, model)
+                            if gateway_proc is not None:
+                                # Keep bridge auth; upstream key stays inside the proxy process.
+                                attempt_env["ANTHROPIC_BASE_URL"] = "http://127.0.0.1:8787"
+                                attempt_env["ANTHROPIC_API_KEY"] = "arc-local"
+                                for _k in ("ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY_OLD", "CLAUDE_CODE_API_KEY"):
+                                    attempt_env.pop(_k, None)
+                                attempt_env["OPENAI_API_KEY"] = "arc-local"
+                                attempt_env["OPENAI_BASE_URL"] = "http://127.0.0.1:8787"
+                                attempt_env = sdk_driver.apply_contest_model_env(attempt_env, "sonnet")
+                            else:
+                                attempt_env["OPENAI_API_KEY"] = api_key
+                                attempt_env["OPENAI_BASE_URL"] = attempt_base_url
+                                attempt_env = apply_official_claude_env(
+                                    attempt_env, base_url=attempt_base_url, api_key=api_key, model=model
+                                )
+                                attempt_env["ANTHROPIC_API_KEY"] = ""
+                                if api_key:
+                                    attempt_env["ANTHROPIC_AUTH_TOKEN"] = api_key
+                                attempt_env = sdk_driver.apply_contest_model_env(attempt_env, model)
                             print(
                                 json.dumps(
                                     {

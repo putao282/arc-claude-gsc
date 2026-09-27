@@ -52,7 +52,7 @@ with zipfile.ZipFile(src) as zf:
             target.write_bytes(zf.read(info))
 PY
 
-echo "[1b/2] copy contest skills (architect/designer); proxy NOT packed by default"
+echo "[1b/2] copy contest skills + anthropic-proxy (Messages to chat bridge)"
 # Architect/designer skills (not in Factory starter ZIP)
 for skill in architect designer; do
   if [[ -d "$ROOT/skills/$skill" ]]; then
@@ -61,21 +61,16 @@ for skill in architect designer; do
     echo "  + skills/$skill"
   fi
 done
-# anthropic-proxy is LOCAL TEST ONLY. Contest Smoke/Official follow official CC starter
-# OPENAI_* → ANTHROPIC_* mapping and must NOT require a bundled protocol proxy.
-# Opt-in: ARC_PACK_ANTHROPIC_PROXY=1 (and keep runtime/gateway/anthropic-proxy for local tests).
-if [[ "${ARC_PACK_ANTHROPIC_PROXY:-0}" == "1" ]]; then
-  PROXY_SRC="$ROOT/runtime/gateway/anthropic-proxy"
-  if [[ -f "$PROXY_SRC" ]]; then
-    mkdir -p "$STAGE/runtime/gateway"
-    cp -f "$PROXY_SRC" "$STAGE/runtime/gateway/anthropic-proxy"
-    chmod +x "$STAGE/runtime/gateway/anthropic-proxy"
-    echo "  + runtime/gateway/anthropic-proxy ($(stat -c %s "$STAGE/runtime/gateway/anthropic-proxy") bytes) [ARC_PACK_ANTHROPIC_PROXY=1]"
-  else
-    echo "WARNING: ARC_PACK_ANTHROPIC_PROXY=1 but missing $PROXY_SRC" >&2
-  fi
+# Tao chose A (2026-09-27): protocol bridge REQUIRED for ARC deepseek (Messages↔chat/completions).
+# Always pack anthropic-proxy for contest Smoke/Official (opt-out of pack only by removing the binary).
+PROXY_SRC="$ROOT/runtime/gateway/anthropic-proxy"
+if [[ -f "$PROXY_SRC" ]]; then
+  mkdir -p "$STAGE/runtime/gateway"
+  cp -f "$PROXY_SRC" "$STAGE/runtime/gateway/anthropic-proxy"
+  chmod +x "$STAGE/runtime/gateway/anthropic-proxy"
+  echo "  + runtime/gateway/anthropic-proxy ($(stat -c %s "$STAGE/runtime/gateway/anthropic-proxy") bytes)"
 else
-  echo "  - skip anthropic-proxy (official mapping; set ARC_PACK_ANTHROPIC_PROXY=1 for local-only packs)"
+  echo "WARNING: missing $PROXY_SRC — Claude will hit Messages/chat protocol mismatch" >&2
 fi
 
 echo "[2/2] package slim ARC submission"
