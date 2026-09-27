@@ -74,7 +74,7 @@ Runtime controls:
 ARC_MODULE_MAX_RETRIES=5
 ARC_RETRY_BASE_SECONDS=5
 ARC_RETRY_MAX_SECONDS=60
-ARC_MAX_BUDGET_USD=50
+ARC_MAX_BUDGET_USD=150
 ARC_ENABLE_MCP=1
 MCP_TIMEOUT=60000
 ARC_VALIDATION_MAX_REPAIRS=2
@@ -83,6 +83,8 @@ ARC_FORCE_REVALIDATE=0
 ARC_DISABLE_ANTHROPIC_PROXY=1
 ARC_ENABLE_ANTHROPIC_PROXY=0
 ```
+
+Contest floor: `ARC_MAX_BUDGET_USD` defaults to **150** so Smoke/Official runs are not killed by `budget_exhausted` from a low local Claude budget cap. Override upward if needed; never ship packs with a lower default.
 
 Production Smoke/Official keep `anthropic-proxy` **off** (default). `main.py` maps ARC
 `OPENAI_BASE_URL` / `OPENAI_API_KEY` / `MODEL` into Claude the same way as the official

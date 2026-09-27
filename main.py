@@ -2775,7 +2775,7 @@ def main() -> int:
     # Max repair Claude sessions AFTER the first harness validation failure.
     # Total validation attempts = 1 + ARC_VALIDATION_MAX_REPAIRS (default 1+2=3).
     max_validation_repairs = env_int("ARC_VALIDATION_MAX_REPAIRS", 2, minimum=0, maximum=10)
-    max_budget_usd = os.environ.get("ARC_MAX_BUDGET_USD", "50").strip()
+    max_budget_usd = os.environ.get("ARC_MAX_BUDGET_USD", "150").strip()
     base_urls = configured_base_urls(base_url)
     host = upstream_host(base_urls[0])
 
@@ -2847,6 +2847,7 @@ def main() -> int:
                     "v5r_mcp_identical_read_thrash_guard",
                     "v5r_spec_require_spec_write",
                     "v5r_max_turns_soft_accept_if_artifacts_ok",
+                    "v5s_max_budget_usd_floor_150",
                 ],
             },
             ensure_ascii=False,
