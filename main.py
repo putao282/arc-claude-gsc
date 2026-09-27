@@ -892,6 +892,8 @@ def run_claude_via_sdk(
     attempt_env: dict[str, str],
     skills_dir: Path | None,
     max_budget_usd: str | float | None,
+    max_turns: int | None = None,
+    step_id: str | None = None,
 ) -> ClaudeRunResult:
     """Primary contest driver: ClaudeSDKClient (+ anthropic-proxy when active)."""
     plugins = sdk_driver.gsc_plugins(gsc_dir)
@@ -937,6 +939,11 @@ def run_claude_via_sdk(
             sdk_model = sdk_driver.sdk_model_for_options(model)
             sdk_env = sdk_driver.apply_contest_model_env(sdk_env, model)
             apply_openai_env = True
+        turns = (
+            int(max_turns)
+            if max_turns is not None
+            else sdk_driver.max_turns_for_step(step_id)
+        )
         options = sdk_driver.build_agent_options(
             cwd=output_dir,
             model=sdk_model,
@@ -945,6 +952,7 @@ def run_claude_via_sdk(
             cli_path=claude_bin,
             env=sdk_env,
             system_prompt_append=sdk_driver.contest_system_prompt_append(skills_dir),
+            max_turns=turns,
             max_budget_usd=budget,
             permission_mode="acceptEdits",
             extra_disallowed_tools=gsc_mcp_disallowed_tool_names(prefixed=True) if enable_mcp else None,
@@ -959,6 +967,8 @@ def run_claude_via_sdk(
                     "anthropic_proxy": using_proxy,
                     "anthropic_base_url": sdk_env.get("ANTHROPIC_BASE_URL") or os.environ.get("ANTHROPIC_BASE_URL"),
                     "permission_mode": "acceptEdits",
+                    "max_turns": turns,
+                    "step_id": step_id,
                     "mcp_enabled": enable_mcp,
                     "mcp_servers": str(mcp_servers) if mcp_servers is not None else None,
                     "plugins": plugins,
@@ -1855,7 +1865,7 @@ def ensure_arc_spawn_gate_softener(output_dir: Path) -> None:
     """Soften GSC SPAWN-GATE without disabling MCP; encode Official STEP loop."""
     claude_md = output_dir / "CLAUDE.md"
     claude_md.write_text(
-        "# ARC-Bench project — MCP-first Official STEP loop (v5q full MCP landing)\n\n"
+        "# ARC-Bench project — MCP-first Official STEP loop (v5r SPEC anti-thrash)\n\n"
         "HARD: GSC MCP stays ON. Never disable WaitForMcpServers / never set "
         "ARC_ENABLE_MCP=0 / never ban MCP tools.\n\n"
         "## Harness STEP loop (fail-closed)\n"
@@ -1865,8 +1875,8 @@ def ensure_arc_spawn_gate_softener(output_dir: Path) -> None:
         "STEPs in order:\n"
         "1. **prd** — Skill `architect` (SKILL.md Read/Bash if Skill tool missing); "
         "`mcp__arch__state_read` then `mcp__arch__prd`. Soft: architect|discoverer.\n"
-        "2. **spec** — Skill `architect`; `mcp__arch__spec_read` + `mcp__arch__spec_write` "
-        "HTML 2.0 under SPEC/arcbench. FORBIDDEN as main path: spec_migrate / grok_md_migrate.\n"
+        "2. **spec** — Skill `architect`; `mcp__arch__spec_read` ≤1 then `mcp__arch__spec_write` once; "
+        "HTML 2.0 under SPEC/arcbench. ANTI-THRASH: never re-read identical SPEC. FORBIDDEN migrate.\n"
         "3. **govern** (when enabled) — `mcp__arch__prd_govern` + `mcp__arch__spec_govern`; "
         "write `.arc/steps/<id>/prd_govern.json` + `spec_govern.json`.\n"
         "4. **test_dag** — Skill `arcbench-traceability`; non-empty api+ui in test_dag.json. "
@@ -2067,11 +2077,16 @@ def evaluate_step_acceptance(
         elif spec_dir.is_dir():
             htmls = [p for p in spec_dir.glob("*.html") if p.is_file() and p.stat().st_size > 50]
             found.extend(str(p) for p in htmls[:5])
-        mcp_spec = mcp_tools_matching(used, "spec_read", "spec_write", "prd")
-        # Also accept broader spec_* evidence for soft logging
+        # v5r: require spec_write (read-only thrash must not satisfy acceptance)
+        mcp_write = mcp_tools_matching(used, "spec_write")
+        mcp_read = mcp_tools_matching(used, "spec_read")
+        mcp_spec = mcp_write or mcp_tools_matching(used, "prd")
+        mcp_optional.extend(mcp_read)
         mcp_optional.extend(mcp_tools_matching(used, "state_read", "spec_govern", "spec_similarity"))
         if not mcp_tools_matching(used, "state_read"):
             soft_notes.append("soft_missing:state_read")
+        if mcp_read and not mcp_write:
+            soft_notes.append("soft:spec_read_without_write")
         if not found:
             return StepAcceptance(
                 ok=False,
@@ -2082,12 +2097,12 @@ def evaluate_step_acceptance(
         if not mcp_spec:
             return StepAcceptance(
                 ok=False,
-                reason="SPEC STEP requires GSC MCP spec_read/spec_write (or prd) tool use proof",
+                reason="SPEC STEP requires GSC MCP spec_write (HTML) tool use proof — not read-only",
                 skills_seen=skills_seen,
-                artifacts=tuple(found),
+                artifacts=tuple(found + mcp_read),
                 soft_notes=tuple(soft_notes),
             )
-        artifacts = found + mcp_spec
+        artifacts = found + mcp_spec + mcp_read
         mcp_required = list(mcp_spec)
 
     elif step.step_id == "govern":
@@ -2453,20 +2468,24 @@ def step_prompt(
     if step.step_id == "prd":
         mcp_extra = (
             "\nMCP REQUIRED this STEP:\n"
-            "- Call `mcp__arch__prd` (CRUD) and produce PRD artifact under PRD/ or "
+            "- Call `mcp__arch__prd` (CRUD) ONCE (or update once) and produce PRD artifact under PRD/ or "
             f"`{base}/prd*`.\n"
-            "- Soft-required: `mcp__arch__state_read` at start; prefer `mcp__arch__architect` "
+            "- Soft-required: `mcp__arch__state_read` at most ONCE at start; prefer `mcp__arch__architect` "
             "or `mcp__arch__discoverer` once (write architect_ctx.json if useful).\n"
+            "- ANTI-THRASH: never re-call prd/state_read with the same arguments. After write, STOP.\n"
             "- Do NOT call account_manage / debug_binary. Do NOT use migrate as main path.\n"
         )
     elif step.step_id == "spec":
         mcp_extra = (
-            "\nMCP REQUIRED this STEP:\n"
-            "- Call `mcp__arch__spec_read` then `mcp__arch__spec_write` for HTML SPEC under "
-            "SPEC/arcbench (HTML 2.0).\n"
-            "- FORBIDDEN as main path: `mcp__arch__spec_migrate` / `mcp__arch__grok_md_migrate`.\n"
-            "- Soft: `mcp__arch__state_read`; optional `mcp__arch__spec_govern` "
+            "\nMCP REQUIRED this STEP (v5r anti-thrash):\n"
+            "- Call `mcp__arch__spec_read` AT MOST ONCE (same args never twice).\n"
+            "- Immediately call `mcp__arch__spec_write` ONCE for HTML SPEC under "
+            "SPEC/arcbench (HTML 2.0), then STOP this STEP.\n"
+            "- FORBIDDEN: looping spec_read; FORBIDDEN as main path: "
+            "`mcp__arch__spec_migrate` / `mcp__arch__grok_md_migrate`.\n"
+            "- Soft: `mcp__arch__state_read` at most once; optional `mcp__arch__spec_govern` "
             f"(write `{base}/spec_govern.json`).\n"
+            "- Acceptance needs spec_write proof + HTML under SPEC/arcbench — not read-only.\n"
         )
     elif step.step_id == "govern":
         mcp_extra = (
@@ -2824,6 +2843,10 @@ def main() -> int:
                     "autocompact_200000",
                     "rapid_refill_retryable_capped",
                     "official_step_loop_fail_closed",
+                    "v5r_spec_max_turns_140",
+                    "v5r_mcp_identical_read_thrash_guard",
+                    "v5r_spec_require_spec_write",
+                    "v5r_max_turns_soft_accept_if_artifacts_ok",
                 ],
             },
             ensure_ascii=False,
@@ -3017,6 +3040,8 @@ def main() -> int:
                                 attempt_env=attempt_env,
                                 skills_dir=skills_dir,
                                 max_budget_usd=max_budget_usd,
+                                max_turns=sdk_driver.max_turns_for_step(_step.step_id),
+                                step_id=_step.step_id,
                             )
 
                         result, api_attempts = execute_with_retry(
@@ -3029,6 +3054,47 @@ def main() -> int:
                         last_result = result
                         classification = classify_claude_failure(result)
                         if result.returncode != 0 or result.is_error:
+                            term_reason = (result.terminal_reason or "").lower()
+                            max_turns_hit = "max_turns" in term_reason or term_reason.endswith("max_turns")
+                            # v5r: if SPEC/others hit max_turns but artifacts already satisfy
+                            # acceptance (e.g. wrote once then thrashed on identical reads), soft-accept.
+                            if max_turns_hit:
+                                soft_acc = evaluate_step_acceptance(output_dir, module, step, result)
+                                if soft_acc.ok:
+                                    soft_acc = StepAcceptance(
+                                        ok=True,
+                                        reason=f"{soft_acc.reason} (soft-accept after max_turns)",
+                                        skills_seen=soft_acc.skills_seen,
+                                        missing_skills=soft_acc.missing_skills,
+                                        artifacts=soft_acc.artifacts,
+                                        mcp_required=soft_acc.mcp_required,
+                                        mcp_optional_seen=soft_acc.mcp_optional_seen,
+                                        commit_gate_status=soft_acc.commit_gate_status,
+                                        soft_notes=tuple(list(soft_acc.soft_notes) + ["soft_accept:max_turns"]),
+                                    )
+                                    write_step_receipt(output_dir, module.node_id, step, soft_acc, claude=result)
+                                    print(
+                                        json.dumps(
+                                            {
+                                                "event": "step_acceptance",
+                                                "req_id": module.node_id,
+                                                "step_id": step.step_id,
+                                                "ok": True,
+                                                "reason": soft_acc.reason,
+                                                "skills_seen": list(soft_acc.skills_seen),
+                                                "missing_skills": list(soft_acc.missing_skills),
+                                                "artifacts": list(soft_acc.artifacts),
+                                                "step_attempt": step_attempt,
+                                                "mcp_tools_used": list(result.mcp_tools_used),
+                                                "soft_accept_max_turns": True,
+                                                "terminal_reason": result.terminal_reason,
+                                            },
+                                            ensure_ascii=False,
+                                        ),
+                                        flush=True,
+                                    )
+                                    accepted = True
+                                    break
                             terminal = {
                                 "event": "step_terminal_failure",
                                 "req_id": module.node_id,
@@ -3039,6 +3105,7 @@ def main() -> int:
                                 "terminal_reason": result.terminal_reason or "unknown",
                                 "returncode": result.returncode,
                                 "skills_loaded": list(result.skills_loaded),
+                                "max_turns_soft_accept_attempted": max_turns_hit,
                             }
                             print(json.dumps(terminal, ensure_ascii=False), file=sys.stderr, flush=True)
                             prior_failure = classification.reason

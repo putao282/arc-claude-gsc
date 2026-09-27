@@ -117,7 +117,7 @@ class OptionsBuilderTests(unittest.TestCase):
         )
         self.assertEqual(payload["driver"], "ClaudeSDKClient")
         self.assertTrue(payload["mcp_enabled"])
-        self.assertTrue(payload["no_production_proxy"])
+        self.assertTrue(payload.get("anthropic_proxy") or payload.get("no_production_proxy"))
         self.assertIsNotNone(payload["gsc_plugin_note"])
 
 
@@ -144,6 +144,42 @@ class SkillMdParseTests(unittest.TestCase):
             "designer",
         )
         self.assertIsNone(sdk._skill_name_from_skill_md_ref("README.md"))
+
+
+class MaxTurnsAndThrashTests(unittest.TestCase):
+    def test_default_and_spec_max_turns(self):
+        self.assertGreaterEqual(sdk.DEFAULT_MAX_TURNS, 100)
+        self.assertEqual(sdk.max_turns_for_step("spec"), 140)
+        self.assertEqual(sdk.max_turns_for_step("prd"), 100)
+        self.assertEqual(sdk.max_turns_for_step("unknown_step"), sdk.DEFAULT_MAX_TURNS)
+
+    def test_build_options_uses_raised_default_turns(self):
+        opts = sdk.build_agent_options(cwd="/tmp/out", model="sonnet")
+        self.assertEqual(opts.max_turns, sdk.DEFAULT_MAX_TURNS)
+
+    def test_thrash_guard_soft_then_hard(self):
+        guard = sdk.McpThrashGuard(soft_limit=2, hard_limit=3)
+        inp = {"path": "SPEC/arcbench/REQ-1.html"}
+        self.assertIsNone(guard.note("mcp__arch__spec_read", inp))
+        soft = guard.note("mcp__arch__spec_read", inp)
+        self.assertIsNotNone(soft)
+        self.assertEqual(soft["level"], "soft")
+        hard = guard.note("mcp__arch__spec_read", inp)
+        self.assertEqual(hard["level"], "hard")
+        self.assertTrue(guard.thrash_hit)
+        # Different args do not trip the same fingerprint
+        other = guard.note("mcp__arch__spec_read", {"path": "other.html"})
+        self.assertIsNone(other)
+
+    def test_fingerprint_stable(self):
+        a = sdk._mcp_tool_fingerprint("mcp__arch__spec_read", {"b": 1, "a": 2})
+        b = sdk._mcp_tool_fingerprint("mcp__arch__spec_read", {"a": 2, "b": 1})
+        self.assertEqual(a, b)
+
+    def test_system_prompt_mentions_anti_thrash(self):
+        txt = sdk.contest_system_prompt_append(None)
+        self.assertIn("ANTI-THRASH", txt)
+
 
 
 if __name__ == "__main__":

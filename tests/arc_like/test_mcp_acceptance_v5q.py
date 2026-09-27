@@ -224,5 +224,32 @@ class McpAcceptanceV5qTests(unittest.TestCase):
             self.assertTrue(acc4.ok)
 
 
+    def test_spec_read_only_rejected_v5r(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            spec_dir = root / "SPEC" / "arcbench"
+            spec_dir.mkdir(parents=True)
+            (spec_dir / "REQ-1.html").write_text("<html>" + ("x" * 80) + "</html>\n", encoding="utf-8")
+            acc = mod.evaluate_step_acceptance(
+                root, _module(), _step("spec"),
+                _result(skills=("architect",), mcp=("mcp__arch__spec_read",)),
+            )
+            self.assertFalse(acc.ok)
+            self.assertIn("spec_write", acc.reason)
+
+    def test_spec_prompt_anti_thrash_v5r(self):
+        prompt = mod.step_prompt(
+            _module(),
+            Path("/tmp/req"),
+            None,
+            [],
+            "github",
+            _step("spec"),
+        )
+        self.assertIn("anti-thrash", prompt.lower())
+        self.assertIn("AT MOST ONCE", prompt)
+        self.assertIn("spec_write", prompt)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -46,6 +46,117 @@ DEFAULT_DISALLOWED_TOOLS = [
     "ReportFindings",
 ]
 
+# v5r: SPEC thrash burned 33× identical spec_read into default max_turns=60.
+DEFAULT_MAX_TURNS = 100
+STEP_MAX_TURNS = {
+    "prd": 100,
+    "spec": 140,
+    "govern": 100,
+    "test_dag": 100,
+    "pages": 120,
+    "implement": 140,
+    "audit_refactor": 100,
+    "batch_test": 120,
+}
+
+# Read-heavy MCP tools that looped in Smoke v5q SPEC.
+MCP_THRASH_WATCH_SUFFIXES = (
+    "spec_read",
+    "prd",
+    "state_read",
+    "spec_similarity",
+    "artifact_read",
+    "artifact_grep",
+)
+MCP_THRASH_SOFT_LIMIT = 2  # identical fingerprint
+MCP_THRASH_HARD_LIMIT = 3
+
+
+def max_turns_for_step(step_id: str | None, *, default: int | None = None) -> int:
+    """Per-STEP max_turns; SPEC gets extra headroom after v5q thrash."""
+    base = DEFAULT_MAX_TURNS if default is None else int(default)
+    if not step_id:
+        return base
+    return int(STEP_MAX_TURNS.get(str(step_id).strip(), base))
+
+
+def _mcp_tool_fingerprint(name: str, inp: dict[str, Any] | None) -> str:
+    """Stable fingerprint for identical repeated MCP reads."""
+    payload: dict[str, Any] = {}
+    if isinstance(inp, dict):
+        for key in sorted(inp.keys()):
+            val = inp[key]
+            if isinstance(val, (str, int, float, bool)) or val is None:
+                payload[key] = val
+            else:
+                try:
+                    payload[key] = json.dumps(val, sort_keys=True, ensure_ascii=False, default=str)[:500]
+                except Exception:
+                    payload[key] = str(val)[:500]
+    try:
+        body = json.dumps(payload, sort_keys=True, ensure_ascii=False)
+    except Exception:
+        body = str(payload)
+    return f"{name}|{body}"
+
+
+def _is_thrash_watched_mcp(name: str) -> bool:
+    if not name.startswith("mcp__"):
+        return False
+    short = name.rsplit("__", 1)[-1]
+    return short in MCP_THRASH_WATCH_SUFFIXES or name.endswith(tuple(f"__{s}" for s in MCP_THRASH_WATCH_SUFFIXES))
+
+
+class McpThrashGuard:
+    """Count identical MCP read fingerprints; log soft/hard thrash (v5r)."""
+
+    def __init__(
+        self,
+        *,
+        soft_limit: int = MCP_THRASH_SOFT_LIMIT,
+        hard_limit: int = MCP_THRASH_HARD_LIMIT,
+    ) -> None:
+        self.soft_limit = max(1, int(soft_limit))
+        self.hard_limit = max(self.soft_limit, int(hard_limit))
+        self._counts: dict[str, int] = {}
+        self.events: list[dict[str, Any]] = []
+
+    def note(self, name: str, inp: dict[str, Any] | None) -> dict[str, Any] | None:
+        if not _is_thrash_watched_mcp(name):
+            return None
+        fp = _mcp_tool_fingerprint(name, inp)
+        n = self._counts.get(fp, 0) + 1
+        self._counts[fp] = n
+        level = None
+        if n == self.soft_limit:
+            level = "soft"
+        elif n == self.hard_limit:
+            level = "hard"
+        elif n > self.hard_limit and (n - self.hard_limit) % 5 == 0:
+            level = "hard_repeat"
+        if not level:
+            return None
+        event = {
+            "event": "mcp_thrash_guard",
+            "level": level,
+            "tool": name,
+            "identical_count": n,
+            "soft_limit": self.soft_limit,
+            "hard_limit": self.hard_limit,
+            "fingerprint": fp[:240],
+            "advice": (
+                "Do NOT re-call the same MCP read with identical args. "
+                "Use the prior payload; call write/govern next; then STOP this STEP."
+            ),
+        }
+        self.events.append(event)
+        print(json.dumps(event, ensure_ascii=False), flush=True)
+        return event
+
+    @property
+    def thrash_hit(self) -> bool:
+        return any(v >= self.hard_limit for v in self._counts.values())
+
 
 @dataclass(frozen=True)
 class SdkTurnResult:
@@ -231,7 +342,7 @@ def build_agent_options(
     cli_path: Path | str | None = None,
     env: dict[str, str] | None = None,
     system_prompt_append: str | None = None,
-    max_turns: int = 60,
+    max_turns: int = DEFAULT_MAX_TURNS,
     max_budget_usd: float | None = None,
     permission_mode: str = "acceptEdits",
     extra_disallowed_tools: list[str] | None = None,
@@ -294,6 +405,8 @@ def contest_system_prompt_append(skills_dir: Path | None) -> str:
         Prefer GSC MCP tools (mcp__arch__*) for PRD/SPEC/state/design/search when available.
         Never invent tool names; never call mcp__arch__account_manage or mcp__arch__debug_binary.
         Do not use spec_migrate/grok_md_migrate as the main SPEC path (HTML spec_write).
+        ANTI-THRASH: never re-call the same mcp__arch__* read (spec_read/prd/state_read)
+        with identical arguments. One successful read is enough — then write/accept and STOP.
         ARC-Bench skills live under {skills_txt}. Force-load required skills each STEP
         (Skill tool when present; otherwise Read/Bash the skill's SKILL.md).
         Do not start a long-running server. Finish each STEP with a short summary.
@@ -320,6 +433,7 @@ def _note_tool_use(
     skill_tool_available: bool,
     skill_loads: list[str],
     mcp_tool_counts: dict[str, int],
+    thrash_guard: McpThrashGuard | None = None,
 ) -> None:
     if name.startswith("mcp__"):
         mcp_tool_counts[name] = mcp_tool_counts.get(name, 0) + 1
@@ -330,6 +444,8 @@ def _note_tool_use(
             ),
             flush=True,
         )
+        if thrash_guard is not None:
+            thrash_guard.note(name, inp if isinstance(inp, dict) else {})
         return
     if name == "Skill":
         raw = ""
@@ -398,6 +514,7 @@ async def run_sdk_turn_async(
 
     skill_loads: list[str] = []
     mcp_tool_counts: dict[str, int] = {}
+    thrash_guard = McpThrashGuard()
     skill_tool_available = True
     tail_parts: list[str] = []
     result_msg: Any = None
@@ -459,6 +576,7 @@ async def run_sdk_turn_async(
                                 skill_tool_available=skill_tool_available,
                                 skill_loads=skill_loads,
                                 mcp_tool_counts=mcp_tool_counts,
+                                thrash_guard=thrash_guard,
                             )
                     continue
 
@@ -494,6 +612,8 @@ async def run_sdk_turn_async(
                                     "tools": dict(sorted(mcp_tool_counts.items())),
                                     "total": sum(mcp_tool_counts.values()),
                                     "driver": "ClaudeSDKClient",
+                                    "thrash_events": len(thrash_guard.events),
+                                    "thrash_hit": thrash_guard.thrash_hit,
                                 },
                                 ensure_ascii=False,
                             ),

@@ -142,7 +142,9 @@ class McpRestoreTests(unittest.TestCase):
         self.assertIn("GSC MCP", prompt)
         self.assertNotIn("NEVER use MCP", prompt)
         self.assertNotIn("NEVER call WaitForMcpServers", prompt)
-        self.assertNotIn("ANTI-THRASH", prompt)
+        # v5r: ANTI-THRASH guidance is allowed (limits identical re-reads; MCP stays ON)
+        self.assertIn("anti-thrash", prompt.lower())
+        self.assertNotIn("disable MCP", prompt.lower())
 
 
     def test_default_allowlist_is_a_plus_b_without_never_default(self):
