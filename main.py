@@ -77,7 +77,7 @@ class ValidationResult:
 
 @dataclass(frozen=True)
 class StepDef:
-    """One Official MCP-first harness STEP with force-loaded skills + acceptance gate."""
+    """One Official MCP-first harness STEP with runtime Skill loads + acceptance gate."""
     step_id: str
     title: str
     required_skills: tuple[str, ...]
@@ -134,7 +134,7 @@ OFFICIAL_STEPS: tuple[StepDef, ...] = (
         step_id="pages",
         title="PAGES + UX-UI designer",
         required_skills=("designer",),
-        goal="FORCE-LOAD UX-UI designer skill, then design/build pages/UI for this module.",
+        goal="Load UX-UI designer skill via Skill tool, then design/build pages/UI for this module.",
         exit_criteria="designer skill proof + UI/page files under frontend/src (or pages receipt).",
     ),
     StepDef(
@@ -973,6 +973,9 @@ def run_claude_via_sdk(
                     "mcp_servers": str(mcp_servers) if mcp_servers is not None else None,
                     "plugins": plugins,
                     "cli_path": str(claude_bin) if claude_bin else None,
+                    "setting_sources": getattr(options, "setting_sources", None),
+                    "skills": getattr(options, "skills", None),
+                    "allowed_tools_has_Skill": "Skill" in (getattr(options, "allowed_tools", None) or []),
                 },
                 ensure_ascii=False,
             ),
@@ -1091,7 +1094,7 @@ def run_claude_streaming(
                                 "event": "skill_tool_unavailable",
                                 "tools_sample": tools[:12],
                                 "skills": skills_field if isinstance(skills_field, list) else skills_field,
-                                "note": "Skill tool missing or skills:[]; accept SKILL.md Read/Bash as force-load proof",
+                                "note": "Skill tool missing or skills:[]; check setting_sources+skills (do not Read SKILL.md)",
                             },
                             ensure_ascii=False,
                         ),
@@ -1137,6 +1140,7 @@ def run_claude_streaming(
                     flush=True,
                 )
             elif name in ("Read", "Bash") and not skill_tool_available:
+                # Debug-only: SKILL.md Read/Bash is NOT acceptance proof.
                 inp = block.get("input") if isinstance(block.get("input"), dict) else {}
                 blob_parts: list[str] = []
                 for key in ("file_path", "path", "filePath", "command", "cmd"):
@@ -1149,15 +1153,14 @@ def run_claude_streaming(
                 skill_name = _skill_name_from_skill_md_ref(blob)
                 if not skill_name:
                     continue
-                with mcp_lock:
-                    skill_loads.append(skill_name)
                 print(
                     json.dumps(
                         {
-                            "event": "skill_loaded",
+                            "event": "skill_md_read_ignored",
                             "skill": skill_name,
                             "via": "skill_md_read",
                             "tool": name,
+                            "note": "not counted toward skills_loaded; use Skill tool",
                         },
                         ensure_ascii=False,
                     ),
@@ -1873,7 +1876,7 @@ def ensure_arc_spawn_gate_softener(output_dir: Path) -> None:
         "Do not advance yourself — the harness advances only after acceptance passes.\n"
         "Receipts live under `.arc/steps/<module-id>/`.\n\n"
         "STEPs in order:\n"
-        "1. **prd** — Skill `architect` (SKILL.md Read/Bash if Skill tool missing); "
+        "1. **prd** — Skill `architect` via runtime Skill tool; "
         "`mcp__arch__state_read` then `mcp__arch__prd`. Soft: architect|discoverer.\n"
         "2. **spec** — Skill `architect`; `mcp__arch__spec_read` ≤1 then `mcp__arch__spec_write` once; "
         "HTML 2.0 under SPEC/arcbench. ANTI-THRASH: never re-read identical SPEC. FORBIDDEN migrate.\n"
@@ -1890,11 +1893,9 @@ def ensure_arc_spawn_gate_softener(output_dir: Path) -> None:
         "8. **batch_test** — Skill `arcbench-runtime-signals`; harness validation. "
         "Soft: `mcp__arch__commit_gate` → commit_gate.json (failure does not alone kill STEP).\n\n"
         "## Per-STEP rules\n"
-        "- FIRST tool action in each STEP: FORCE-LOAD that STEP's required skill(s).\n"
-        "- Prefer Skill tool when present; if Skill tool is missing, Read/Bash-cat "
-        "`.claude/skills/<name>/SKILL.md` (or `skills/<name>/SKILL.md`) as force-load proof.\n"
-        "- No Skill tool load AND no SKILL.md read proof => STEP acceptance FAILS "
-        "(fail-closed); harness will not advance.\n"
+        "- FIRST tool action in each STEP: load required skill(s) via the runtime Skill tool.\n"
+        "- Do NOT Read/Bash/cat SKILL.md as a Skill substitute — Skill tool only.\n"
+        "- Missing Skill tool load => STEP acceptance FAILS (fail-closed); harness will not advance.\n"
         "- Name required tools as `mcp__arch__<short>` from the allowlist; do NOT invent tool names.\n"
         "- NEVER call `mcp__arch__account_manage` or `mcp__arch__debug_binary`.\n"
         "- Do NOT use migrate tools as the main SPEC path (HTML 2.0 via spec_write).\n"
@@ -2544,13 +2545,10 @@ def step_prompt(
         HARD RULES:
         - GSC MCP stays ON. Never disable WaitForMcpServers / never ARC_ENABLE_MCP=0 / never ban MCP.
         - This round is ONLY for STEP `{step.step_id}`. Do not perform later STEPs.
-        - FORCE-LOAD required skill(s) FIRST before other work: {skill_lines}
-        - If the Skill tool is in your available tools: use it to load each required skill first.
-        - If Skill tool is MISSING from available tools: FIRST action MUST be Read (or Bash cat/head)
-          of `.claude/skills/<name>/SKILL.md` or `skills/<name>/SKILL.md` for each required skill
-          (fail-closed force-load proof when Skill tool absent).
-        - If you provide neither Skill tool load nor SKILL.md read proof, harness acceptance FAILS
-          (fail-closed) and you will not advance.
+        - Load required skill(s) FIRST via the runtime Skill tool before other work: {skill_lines}
+        - Use the Skill tool only. Do NOT Read/Bash/cat SKILL.md as a substitute.
+        - If the Skill tool is missing from available tools, stop and report — do not fake-load via files.
+        - Without a Skill tool load for each required skill, harness acceptance FAILS (fail-closed).
         - Prefer main session; do NOT spawn Agent/Task.
         - Keep tool outputs small (no huge lockfiles/schemas).
 
@@ -2560,7 +2558,7 @@ def step_prompt(
         {skills_text}
         Use only real `mcp__arch__*` tools from the allowlist (never invent names; never account_manage/debug_binary).
         Forbid migrate (`spec_migrate`/`grok_md_migrate`) as the main SPEC path — use HTML spec_write.
-        Skill force-load: Skill tool if present, else Read/Bash `SKILL.md`.
+        Skill force-load: runtime Skill tool only (never Read/Bash SKILL.md).
         {mcp_extra}{schema_extra}
         When exit criteria are met, write a short receipt JSON to `{receipt_hint}` with keys:
         step_id, skills_loaded, artifacts (list of paths), summary.
@@ -2848,6 +2846,9 @@ def main() -> int:
                     "v5r_spec_require_spec_write",
                     "v5r_max_turns_soft_accept_if_artifacts_ok",
                     "v5s_max_budget_usd_floor_150",
+                    "v5t_official_skills_setting_sources_project_user",
+                    "v5t_skills_all_enables_Skill_tool",
+                    "v5t_no_SKILL_md_Read_fallback",
                 ],
             },
             ensure_ascii=False,

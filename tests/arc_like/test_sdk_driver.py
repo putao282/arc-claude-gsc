@@ -97,7 +97,21 @@ class OptionsBuilderTests(unittest.TestCase):
         self.assertEqual(opts.permission_mode, "acceptEdits")
         self.assertIn("Read", opts.allowed_tools)
         self.assertIn("Bash", opts.allowed_tools)
+        self.assertIn("Skill", opts.allowed_tools)
         self.assertTrue(opts.strict_mcp_config)
+        self.assertEqual(opts.setting_sources, ["user", "project"])
+        self.assertEqual(opts.skills, "all")
+
+    def test_build_options_official_skills_wiring(self):
+        """v5t: official Agent SDK Skills must be enabled (not Read-SKILL.md fallback)."""
+        opts = sdk.build_agent_options(cwd="/tmp/out", model="sonnet")
+        self.assertEqual(list(opts.setting_sources), list(sdk.DEFAULT_SETTING_SOURCES))
+        self.assertEqual(opts.skills, sdk.DEFAULT_SKILLS)
+        self.assertIn("Skill", opts.allowed_tools)
+        prompt = sdk.contest_system_prompt_append(None)
+        self.assertIn("Skill", prompt)
+        self.assertNotIn("otherwise Read/Bash", prompt)
+        self.assertNotIn("Read/Bash the skill", prompt)
 
     def test_mcp_servers_path_passthrough(self):
         with tempfile.TemporaryDirectory() as td:
@@ -119,6 +133,9 @@ class OptionsBuilderTests(unittest.TestCase):
         self.assertTrue(payload["mcp_enabled"])
         self.assertTrue(payload.get("anthropic_proxy") or payload.get("no_production_proxy"))
         self.assertIsNotNone(payload["gsc_plugin_note"])
+        self.assertEqual(payload.get("setting_sources"), ["user", "project"])
+        self.assertEqual(payload.get("skills"), "all")
+        self.assertTrue(payload.get("skill_tool_expected"))
 
 
 class ModelAliasTests(unittest.TestCase):
@@ -179,6 +196,9 @@ class MaxTurnsAndThrashTests(unittest.TestCase):
     def test_system_prompt_mentions_anti_thrash(self):
         txt = sdk.contest_system_prompt_append(None)
         self.assertIn("ANTI-THRASH", txt)
+        self.assertIn("runtime Skill", txt)
+        self.assertIn("do NOT Read/Bash/cat SKILL.md", txt)
+        self.assertNotIn("otherwise Read/Bash", txt)
 
 
 

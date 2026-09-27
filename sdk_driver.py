@@ -27,6 +27,12 @@ DEFAULT_ALLOWED_TOOLS = [
     "Skill",
 ]
 
+# Official Agent SDK Skills wiring (code.claude.com/docs/en/agent-sdk/skills):
+# skills= turns Skill on; setting_sources discovers .claude/skills under cwd.
+# Do NOT reimplement Skills — filesystem SKILL.md + runtime Skill tool only.
+DEFAULT_SETTING_SOURCES: list[str] = ["user", "project"]
+DEFAULT_SKILLS: str = "all"
+
 DEFAULT_DISALLOWED_TOOLS = [
     "Agent",
     "Task",
@@ -365,6 +371,9 @@ def build_agent_options(
         "permission_mode": permission_mode,
         "max_turns": max_turns,
         "strict_mcp_config": True,
+        # Official Skills: discover project/user SKILL.md and enable Skill tool.
+        "setting_sources": list(DEFAULT_SETTING_SOURCES),
+        "skills": DEFAULT_SKILLS,
         "extra_args": {
             "disable-slash-commands": None,
             "no-session-persistence": None,
@@ -407,8 +416,8 @@ def contest_system_prompt_append(skills_dir: Path | None) -> str:
         Do not use spec_migrate/grok_md_migrate as the main SPEC path (HTML spec_write).
         ANTI-THRASH: never re-call the same mcp__arch__* read (spec_read/prd/state_read)
         with identical arguments. One successful read is enough — then write/accept and STOP.
-        ARC-Bench skills live under {skills_txt}. Force-load required skills each STEP
-        (Skill tool when present; otherwise Read/Bash the skill's SKILL.md).
+        ARC-Bench skills live under {skills_txt}. Load required skills via the runtime Skill
+        tool only (do NOT Read/Bash/cat SKILL.md as a substitute).
         Do not start a long-running server. Finish each STEP with a short summary.
         """
     ).strip()
@@ -470,6 +479,7 @@ def _note_tool_use(
         )
         return
     if name in ("Read", "Bash") and not skill_tool_available and isinstance(inp, dict):
+        # Debug-only: SKILL.md Read/Bash is NOT acceptance proof (CORRECTION_skills_runtime).
         blob_parts: list[str] = []
         for key in ("file_path", "path", "filePath", "command", "cmd"):
             val = inp.get(key)
@@ -478,14 +488,14 @@ def _note_tool_use(
         skill_name = _skill_name_from_skill_md_ref("\n".join(blob_parts))
         if not skill_name:
             return
-        skill_loads.append(skill_name)
         print(
             json.dumps(
                 {
-                    "event": "skill_loaded",
+                    "event": "skill_md_read_ignored",
                     "skill": skill_name,
                     "via": "skill_md_read",
                     "tool": name,
+                    "note": "not counted toward skills_loaded; use Skill tool",
                 },
                 ensure_ascii=False,
             ),
@@ -547,7 +557,7 @@ async def run_sdk_turn_async(
                                             "tools_sample": tools[:12],
                                             "skills": skills_field,
                                             "driver": "ClaudeSDKClient",
-                                            "note": "Skill tool missing or skills:[]; accept SKILL.md Read/Bash",
+                                            "note": "Skill tool missing or skills:[]; check setting_sources+skills wiring (do not Read SKILL.md)",
                                         },
                                         ensure_ascii=False,
                                     ),
@@ -702,4 +712,7 @@ def describe_driver_policy(
         "gsc_plugin_note": plugin_note,
         "protocol_bridge": "anthropic-proxy Messages to chat/completions",
         "no_cli_subprocess_primary": True,
+        "setting_sources": list(DEFAULT_SETTING_SOURCES),
+        "skills": DEFAULT_SKILLS,
+        "skill_tool_expected": True,
     }
