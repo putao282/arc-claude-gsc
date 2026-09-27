@@ -251,5 +251,55 @@ class McpAcceptanceV5qTests(unittest.TestCase):
         self.assertIn("spec_write", prompt)
 
 
+    def test_no_skill_force_load_fail_closed_v5u(self):
+        """v5u: missing Skill loads must NOT fail PRD/SPEC when artifacts+MCP ok."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            prd = root / "PRD" / "x.md"
+            prd.parent.mkdir(parents=True)
+            prd.write_text("# prd\n", encoding="utf-8")
+            acc = mod.evaluate_step_acceptance(
+                root, _module(), _step("prd"),
+                _result(skills=(), mcp=("mcp__arch__prd",)),
+            )
+            self.assertTrue(acc.ok, acc.reason)
+            self.assertTrue(any(n.startswith("soft_missing_skills:") for n in acc.soft_notes))
+
+            spec_dir = root / "SPEC" / "arcbench"
+            spec_dir.mkdir(parents=True)
+            (spec_dir / "REQ-1.html").write_text("<html>" + ("x" * 80) + "</html>\n", encoding="utf-8")
+            acc2 = mod.evaluate_step_acceptance(
+                root, _module(), _step("spec"),
+                _result(skills=(), mcp=("mcp__arch__spec_write",)),
+            )
+            self.assertTrue(acc2.ok, acc2.reason)
+
+    def test_step_prompt_no_skill_force_load_v5u(self):
+        prompt = mod.step_prompt(
+            _module(),
+            Path("/tmp/req"),
+            None,
+            [],
+            "github",
+            _step("prd"),
+        )
+        low = prompt.lower()
+        self.assertNotIn("load required skill", low)
+        self.assertNotIn("first tool action", low)
+        self.assertNotIn("missing skill tool load", low)
+        self.assertIn("not skill force-load", low)
+        self.assertIn("do not read/bash/cat skill.md", low)
+        self.assertIn("model-invoked", low)
+
+    def test_audit_refactor_soft_passes_without_skill_v5u(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            acc = mod.evaluate_step_acceptance(
+                root, _module(), _step("audit_refactor"),
+                _result(skills=(), mcp=()),
+            )
+            self.assertTrue(acc.ok, acc.reason)
+
+
 if __name__ == "__main__":
     unittest.main()

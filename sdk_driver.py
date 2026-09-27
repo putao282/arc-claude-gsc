@@ -9,7 +9,6 @@ from __future__ import annotations
 import contextlib
 import json
 import os
-import re
 import textwrap
 from collections.abc import Iterator
 from dataclasses import dataclass
@@ -416,30 +415,17 @@ def contest_system_prompt_append(skills_dir: Path | None) -> str:
         Do not use spec_migrate/grok_md_migrate as the main SPEC path (HTML spec_write).
         ANTI-THRASH: never re-call the same mcp__arch__* read (spec_read/prd/state_read)
         with identical arguments. One successful read is enough — then write/accept and STOP.
-        ARC-Bench skills live under {skills_txt}. Load required skills via the runtime Skill
-        tool only (do NOT Read/Bash/cat SKILL.md as a substitute).
+        Project skills under {skills_txt} are discovered via setting_sources; Claude may invoke
+        them with the Skill tool when relevant (do not Read/Bash/cat SKILL.md).
         Do not start a long-running server. Finish each STEP with a short summary.
         """
     ).strip()
-
-
-_SKILL_MD_RE = re.compile(r"(?:\.claude/)?skills/([A-Za-z0-9._-]+)/SKILL\.md")
-
-
-def _skill_name_from_skill_md_ref(text: str) -> str | None:
-    if not text or "SKILL.md" not in text:
-        return None
-    m = _SKILL_MD_RE.search(text)
-    if not m:
-        return None
-    return m.group(1).strip() or None
 
 
 def _note_tool_use(
     name: str,
     inp: dict[str, Any] | None,
     *,
-    skill_tool_available: bool,
     skill_loads: list[str],
     mcp_tool_counts: dict[str, int],
     thrash_guard: McpThrashGuard | None = None,
@@ -478,29 +464,6 @@ def _note_tool_use(
             flush=True,
         )
         return
-    if name in ("Read", "Bash") and not skill_tool_available and isinstance(inp, dict):
-        # Debug-only: SKILL.md Read/Bash is NOT acceptance proof (CORRECTION_skills_runtime).
-        blob_parts: list[str] = []
-        for key in ("file_path", "path", "filePath", "command", "cmd"):
-            val = inp.get(key)
-            if isinstance(val, str) and val:
-                blob_parts.append(val)
-        skill_name = _skill_name_from_skill_md_ref("\n".join(blob_parts))
-        if not skill_name:
-            return
-        print(
-            json.dumps(
-                {
-                    "event": "skill_md_read_ignored",
-                    "skill": skill_name,
-                    "via": "skill_md_read",
-                    "tool": name,
-                    "note": "not counted toward skills_loaded; use Skill tool",
-                },
-                ensure_ascii=False,
-            ),
-            flush=True,
-        )
 
 
 async def run_sdk_turn_async(
@@ -525,7 +488,6 @@ async def run_sdk_turn_async(
     skill_loads: list[str] = []
     mcp_tool_counts: dict[str, int] = {}
     thrash_guard = McpThrashGuard()
-    skill_tool_available = True
     tail_parts: list[str] = []
     result_msg: Any = None
 
@@ -535,34 +497,7 @@ async def run_sdk_turn_async(
             await client.query(prompt)
             async for message in client.receive_response():
                 if isinstance(message, SystemMessage):
-                    data = getattr(message, "data", None) or {}
-                    if str(getattr(message, "subtype", "") or "") == "init" or (
-                        isinstance(data, dict) and data.get("subtype") == "init"
-                    ):
-                        tools = []
-                        skills_field = None
-                        src = data if isinstance(data, dict) else {}
-                        if isinstance(src.get("tools"), list):
-                            tools = src["tools"]
-                        if "skills" in src:
-                            skills_field = src.get("skills")
-                        skills_empty = isinstance(skills_field, list) and len(skills_field) == 0
-                        if tools and ("Skill" not in tools or skills_empty):
-                            if skill_tool_available:
-                                skill_tool_available = False
-                                print(
-                                    json.dumps(
-                                        {
-                                            "event": "skill_tool_unavailable",
-                                            "tools_sample": tools[:12],
-                                            "skills": skills_field,
-                                            "driver": "ClaudeSDKClient",
-                                            "note": "Skill tool missing or skills:[]; check setting_sources+skills wiring (do not Read SKILL.md)",
-                                        },
-                                        ensure_ascii=False,
-                                    ),
-                                    flush=True,
-                                )
+                    # init skills/tools are informational only — no fail-closed Skill gates
                     continue
 
                 if isinstance(message, AssistantMessage):
@@ -583,7 +518,6 @@ async def run_sdk_turn_async(
                             _note_tool_use(
                                 name,
                                 inp if isinstance(inp, dict) else {},
-                                skill_tool_available=skill_tool_available,
                                 skill_loads=skill_loads,
                                 mcp_tool_counts=mcp_tool_counts,
                                 thrash_guard=thrash_guard,

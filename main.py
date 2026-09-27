@@ -77,7 +77,7 @@ class ValidationResult:
 
 @dataclass(frozen=True)
 class StepDef:
-    """One Official MCP-first harness STEP with runtime Skill loads + acceptance gate."""
+    """One Official MCP-first harness STEP with artifact/MCP acceptance gate."""
     step_id: str
     title: str
     required_skills: tuple[str, ...]
@@ -100,21 +100,22 @@ class StepAcceptance:
     soft_notes: tuple[str, ...] = ()
 
 
-# Official STEP loop (fail-closed). Advance only when skill proof + artifacts pass.
+# Official STEP loop (fail-closed). Advance only when artifact/MCP gates pass.
+# Skills: official setting_sources+skills wiring only — NOT force-loaded / fail-closed.
 OFFICIAL_STEPS: tuple[StepDef, ...] = (
     StepDef(
         step_id="prd",
         title="PRD",
         required_skills=("architect",),
         goal="Build / refine the product PRD for this ROOT module via GSC MCP (prd / state_*).",
-        exit_criteria="PRD artifact under PRD/ or .arc/steps/<id>/prd/ plus skills_loaded proof.",
+        exit_criteria="PRD artifact under PRD/ or .arc/steps/<id>/prd*.",
     ),
     StepDef(
         step_id="spec",
         title="SPEC",
         required_skills=("architect",),
         goal="Derive HTML SPEC under SPEC/arcbench via GSC MCP spec_read/spec_write (no Markdown migrate).",
-        exit_criteria="SPEC/arcbench HTML for this module exists/updated plus skills_loaded proof.",
+        exit_criteria="SPEC/arcbench HTML for this module exists/updated.",
     ),
     StepDef(
         step_id="test_dag",
@@ -127,22 +128,22 @@ OFFICIAL_STEPS: tuple[StepDef, ...] = (
         ),
         exit_criteria=(
             "`.arc/steps/<id>/test_dag.json` has non-empty `api` and `ui` arrays "
-            "(or equivalent real api+ui test files); skill proof."
+            "(or equivalent real api+ui test files)."
         ),
     ),
     StepDef(
         step_id="pages",
         title="PAGES + UX-UI designer",
         required_skills=("designer",),
-        goal="Load UX-UI designer skill via Skill tool, then design/build pages/UI for this module.",
-        exit_criteria="designer skill proof + UI/page files under frontend/src (or pages receipt).",
+        goal="Design/build pages/UI for this module (designer skill available via Skill tool).",
+        exit_criteria="UI/page files under frontend/src (or pages receipt) + design MCP proof.",
     ),
     StepDef(
         step_id="implement",
         title="DEV implement (no mid-dev tests)",
         required_skills=("arcbench-checkpoint",),
         goal="Implement remaining logic/API/UI wiring. Do NOT run tests continuously mid-development.",
-        exit_criteria="Implementation receipt + checkpoint skill proof; no requirement to pass tests yet.",
+        exit_criteria="Implementation receipt + search_code MCP proof; no requirement to pass tests yet.",
         forbid_mid_dev_tests=True,
     ),
     StepDef(
@@ -150,7 +151,7 @@ OFFICIAL_STEPS: tuple[StepDef, ...] = (
         title="BATCH test (after code done)",
         required_skills=("arcbench-runtime-signals",),
         goal="After code is done, run batch/centralized tests once (vitest/npm test).",
-        exit_criteria="runtime-signals skill proof + harness local validation passes.",
+        exit_criteria="Harness local validation passes (batch tests).",
         require_batch_test_run=True,
     ),
 )
@@ -165,7 +166,7 @@ GOVERN_STEP = StepDef(
         "Write `.arc/steps/<id>/prd_govern.json` and `spec_govern.json` summaries. "
         "Optional soft: mcp__arch__trace."
     ),
-    exit_criteria="prd_govern + spec_govern MCP proof (and/or receipt JSONs); architect skill proof.",
+    exit_criteria="prd_govern + spec_govern MCP proof (and/or receipt JSONs).",
 )
 
 AUDIT_REFACTOR_STEP = StepDef(
@@ -176,7 +177,7 @@ AUDIT_REFACTOR_STEP = StepDef(
         "Soft: mcp__arch__arch_insight and/or mcp__arch__commit_gate; "
         "optional refactor_code/format_code. Write soft receipts under `.arc/steps/<id>/`."
     ),
-    exit_criteria="checkpoint skill proof; commit_gate/arch_insight soft (missing does not fail-closed).",
+    exit_criteria="Soft STEP: commit_gate/arch_insight optional (missing does not fail-closed).",
 )
 
 
@@ -1022,20 +1023,7 @@ def run_claude_streaming(
     stderr_tail: deque[str] = deque(maxlen=300)
     mcp_tool_counts: dict[str, int] = {}
     skill_loads: list[str] = []
-    skill_tool_available = True  # flipped False on Claude init without Skill tool
     mcp_lock = threading.Lock()
-
-    def _skill_name_from_skill_md_ref(text: str) -> str | None:
-        """Extract skill name from .claude/skills/<name>/SKILL.md or skills/<name>/SKILL.md."""
-        if not text or "SKILL.md" not in text:
-            return None
-        m = re.search(
-            r"(?:\.claude/)?skills/([A-Za-z0-9._-]+)/SKILL\.md",
-            text,
-        )
-        if not m:
-            return None
-        return m.group(1).strip() or None
 
     def _tool_blocks_from_payload(payload: dict) -> list[dict]:
         blocks: list[dict] = []
@@ -1056,22 +1044,8 @@ def run_claude_streaming(
         return blocks
 
     def note_tools_from_line(line: str) -> None:
-        """Audit MCP tool_use + Skill loads for Official STEP acceptance gates.
-
-        Contest Claude Code may lack the Skill tool (tools list without Skill,
-        skills:[]). In that case, Read/Bash of skills/<name>/SKILL.md counts as
-        fail-closed force-load proof.
-        """
-        nonlocal skill_tool_available
-        # Broad filter: keep init + SKILL.md reads, not only mcp__/Skill strings.
-        if (
-            "mcp__" not in line
-            and "Skill" not in line
-            and "SKILL.md" not in line
-            and "subtype" not in line
-            and ".claude/skills" not in line
-            and "skills/" not in line
-        ):
+        """Audit MCP tool_use + optional Skill tool telemetry (not fail-closed)."""
+        if "mcp__" not in line and "Skill" not in line:
             return
         try:
             payload = json.loads(line)
@@ -1079,27 +1053,6 @@ def run_claude_streaming(
             payload = None
         if not isinstance(payload, dict):
             return
-
-        # Detect Skill-tool absence from Claude system init JSON.
-        if payload.get("subtype") == "init":
-            tools = payload.get("tools") if isinstance(payload.get("tools"), list) else []
-            skills_field = payload.get("skills")
-            skills_empty = isinstance(skills_field, list) and len(skills_field) == 0
-            if "Skill" not in tools or skills_empty:
-                if skill_tool_available:
-                    skill_tool_available = False
-                    print(
-                        json.dumps(
-                            {
-                                "event": "skill_tool_unavailable",
-                                "tools_sample": tools[:12],
-                                "skills": skills_field if isinstance(skills_field, list) else skills_field,
-                                "note": "Skill tool missing or skills:[]; check setting_sources+skills (do not Read SKILL.md)",
-                            },
-                            ensure_ascii=False,
-                        ),
-                        flush=True,
-                    )
 
         for block in _tool_blocks_from_payload(payload):
             name = block.get("name")
@@ -1128,40 +1081,12 @@ def run_claude_streaming(
                 skill_name = str(skill_name).strip()
                 if not skill_name:
                     continue
-                # normalize path-ish skill refs to basename
                 skill_name = skill_name.rstrip("/").split("/")[-1]
                 with mcp_lock:
                     skill_loads.append(skill_name)
                 print(
                     json.dumps(
                         {"event": "skill_loaded", "skill": skill_name, "via": "skill_tool"},
-                        ensure_ascii=False,
-                    ),
-                    flush=True,
-                )
-            elif name in ("Read", "Bash") and not skill_tool_available:
-                # Debug-only: SKILL.md Read/Bash is NOT acceptance proof.
-                inp = block.get("input") if isinstance(block.get("input"), dict) else {}
-                blob_parts: list[str] = []
-                for key in ("file_path", "path", "filePath", "command", "cmd"):
-                    val = inp.get(key)
-                    if isinstance(val, str) and val:
-                        blob_parts.append(val)
-                if not blob_parts and isinstance(inp.get("args"), str):
-                    blob_parts.append(inp["args"])
-                blob = chr(10).join(blob_parts)
-                skill_name = _skill_name_from_skill_md_ref(blob)
-                if not skill_name:
-                    continue
-                print(
-                    json.dumps(
-                        {
-                            "event": "skill_md_read_ignored",
-                            "skill": skill_name,
-                            "via": "skill_md_read",
-                            "tool": name,
-                            "note": "not counted toward skills_loaded; use Skill tool",
-                        },
                         ensure_ascii=False,
                     ),
                     flush=True,
@@ -1876,26 +1801,24 @@ def ensure_arc_spawn_gate_softener(output_dir: Path) -> None:
         "Do not advance yourself — the harness advances only after acceptance passes.\n"
         "Receipts live under `.arc/steps/<module-id>/`.\n\n"
         "STEPs in order:\n"
-        "1. **prd** — Skill `architect` via runtime Skill tool; "
-        "`mcp__arch__state_read` then `mcp__arch__prd`. Soft: architect|discoverer.\n"
-        "2. **spec** — Skill `architect`; `mcp__arch__spec_read` ≤1 then `mcp__arch__spec_write` once; "
+        "1. **prd** — `mcp__arch__state_read` then `mcp__arch__prd`. Soft: architect|discoverer.\n"
+        "2. **spec** — `mcp__arch__spec_read` ≤1 then `mcp__arch__spec_write` once; "
         "HTML 2.0 under SPEC/arcbench. ANTI-THRASH: never re-read identical SPEC. FORBIDDEN migrate.\n"
         "3. **govern** (when enabled) — `mcp__arch__prd_govern` + `mcp__arch__spec_govern`; "
         "write `.arc/steps/<id>/prd_govern.json` + `spec_govern.json`.\n"
-        "4. **test_dag** — Skill `arcbench-traceability`; non-empty api+ui in test_dag.json. "
-        "Soft: `mcp__arch__trace`.\n"
-        "5. **pages** — Skill `designer`; MUST call `mcp__arch__design_style` OR "
+        "4. **test_dag** — non-empty api+ui in test_dag.json. Soft: `mcp__arch__trace`.\n"
+        "5. **pages** — MUST call `mcp__arch__design_style` OR "
         "`mcp__arch__design_asset`. Soft: read_image / browser lifecycle.\n"
-        "6. **implement** — Skill `arcbench-checkpoint`; MUST call `mcp__arch__search_code`≥1; "
+        "6. **implement** — MUST call `mcp__arch__search_code`≥1; "
         "write search_code.json. Soft: kb_query. No mid-dev continuous tests.\n"
         "7. **audit_refactor** (when enabled) — soft `mcp__arch__arch_insight` / "
         "`mcp__arch__commit_gate`.\n"
-        "8. **batch_test** — Skill `arcbench-runtime-signals`; harness validation. "
+        "8. **batch_test** — harness validation. "
         "Soft: `mcp__arch__commit_gate` → commit_gate.json (failure does not alone kill STEP).\n\n"
         "## Per-STEP rules\n"
-        "- FIRST tool action in each STEP: load required skill(s) via the runtime Skill tool.\n"
-        "- Do NOT Read/Bash/cat SKILL.md as a Skill substitute — Skill tool only.\n"
-        "- Missing Skill tool load => STEP acceptance FAILS (fail-closed); harness will not advance.\n"
+        "- Skills are model-invoked via the runtime Skill tool when relevant "
+        "(official setting_sources + skills). Do NOT Read/Bash/cat SKILL.md.\n"
+        "- Harness acceptance is artifact/MCP gates — NOT skill force-load.\n"
         "- Name required tools as `mcp__arch__<short>` from the allowlist; do NOT invent tool names.\n"
         "- NEVER call `mcp__arch__account_manage` or `mcp__arch__debug_binary`.\n"
         "- Do NOT use migrate tools as the main SPEC path (HTML 2.0 via spec_write).\n"
@@ -1992,7 +1915,10 @@ def evaluate_step_acceptance(
     step: StepDef,
     result: ClaudeRunResult,
 ) -> StepAcceptance:
-    """Fail-closed STEP gate: required Skill loads + step artifacts (+ batch tests).
+    """Fail-closed STEP gate: step artifacts + MCP proofs (+ batch tests).
+
+    Skills are NOT fail-closed (official CC Skills are model-invoked via setting_sources
+    + skills=). Telemetry only: skills_seen / missing_skills recorded as soft_notes.
 
     P1 MCP hard gates (v5q full-landing):
       - govern: prd_govern + spec_govern
@@ -2003,13 +1929,7 @@ def evaluate_step_acceptance(
     """
     skills_seen = tuple(result.skills_loaded)
     missing = tuple(s for s in step.required_skills if s not in skills_seen)
-    if missing:
-        return StepAcceptance(
-            ok=False,
-            reason=f"skill force-load missing (fail-closed): {', '.join(missing)}",
-            skills_seen=skills_seen,
-            missing_skills=missing,
-        )
+    # soft only — never fail-closed on missing Skill tool loads (v5u)
 
     sid = safe_node_id(module.node_id)
     sdir = step_dir(output_dir, module.node_id)
@@ -2019,6 +1939,8 @@ def evaluate_step_acceptance(
     soft_notes: list[str] = []
     commit_gate_status: str | None = None
     used = tuple(result.mcp_tools_used)
+    if missing:
+        soft_notes.append("soft_missing_skills:" + ",".join(missing))
 
     def _receipt_or_tool(filename: str, *tool_shorts: str) -> list[str]:
         found: list[str] = []
@@ -2424,7 +2346,7 @@ def step_prompt(
         recovery = (
             f"STEP RETRY {attempt}: previous attempt failed acceptance (fail-closed).\n"
             f"Failure: {prior_failure}\n"
-            "Fix the missing skill load and/or artifacts, then finish this STEP only.\n"
+            "Fix the missing artifacts/MCP proofs, then finish this STEP only.\n"
         )
     elif attempt > 1:
         recovery = (
@@ -2545,31 +2467,29 @@ def step_prompt(
         HARD RULES:
         - GSC MCP stays ON. Never disable WaitForMcpServers / never ARC_ENABLE_MCP=0 / never ban MCP.
         - This round is ONLY for STEP `{step.step_id}`. Do not perform later STEPs.
-        - Load required skill(s) FIRST via the runtime Skill tool before other work: {skill_lines}
-        - Use the Skill tool only. Do NOT Read/Bash/cat SKILL.md as a substitute.
-        - If the Skill tool is missing from available tools, stop and report — do not fake-load via files.
-        - Without a Skill tool load for each required skill, harness acceptance FAILS (fail-closed).
         - Prefer main session; do NOT spawn Agent/Task.
         - Keep tool outputs small (no huge lockfiles/schemas).
+        - Do NOT Read/Bash/cat SKILL.md. Skills (if any) are model-invoked via the Skill tool.
+        - Harness acceptance is artifact/MCP gates — not skill force-load.
 
         STEP goal: {step.goal}
         Exit criteria: {step.exit_criteria}
         {mid_dev}{batch}
         {skills_text}
+        Optional related project skills (model-invoked, not required for acceptance): {skill_lines}
         Use only real `mcp__arch__*` tools from the allowlist (never invent names; never account_manage/debug_binary).
         Forbid migrate (`spec_migrate`/`grok_md_migrate`) as the main SPEC path — use HTML spec_write.
-        Skill force-load: runtime Skill tool only (never Read/Bash SKILL.md).
         {mcp_extra}{schema_extra}
         When exit criteria are met, write a short receipt JSON to `{receipt_hint}` with keys:
-        step_id, skills_loaded, artifacts (list of paths), summary.
-        The harness writes `{ok_hint}` only after its own acceptance gate passes (skill proof + artifacts).
+        step_id, artifacts (list of paths), summary.
+        The harness writes `{ok_hint}` only after its own acceptance gate passes (artifacts + MCP proofs).
 
         Work only from this ROOT-child subtree:
         ```json
         {json.dumps(module.subtree, ensure_ascii=False, indent=2)}
         ```
 
-        Finish this STEP only. Summarize skills loaded, MCP tools used, and artifacts produced.
+        Finish this STEP only. Summarize MCP tools used and artifacts produced.
     """).strip()
 
 
@@ -2833,14 +2753,13 @@ def main() -> int:
                     "anthropic_proxy_messages_to_chat_completions",
                     "spawn_gate_off",
                     "disallow_Agent_Task_and_bloat_builtins",
-                    "Skill_allowed_for_STEP_force_load",
                     "mcp_allowedTools_spec_subset",
                     "WaitForMcpServers_once_guidance",
                     "html_spec",
                     "disable_slash_commands",
                     "autocompact_200000",
                     "rapid_refill_retryable_capped",
-                    "official_step_loop_fail_closed",
+                    "official_step_loop_fail_closed_artifact_mcp",
                     "v5r_spec_max_turns_140",
                     "v5r_mcp_identical_read_thrash_guard",
                     "v5r_spec_require_spec_write",
@@ -2848,7 +2767,9 @@ def main() -> int:
                     "v5s_max_budget_usd_floor_150",
                     "v5t_official_skills_setting_sources_project_user",
                     "v5t_skills_all_enables_Skill_tool",
-                    "v5t_no_SKILL_md_Read_fallback",
+                    "v5u_delete_skill_force_load_fail_closed",
+                    "v5u_no_skill_md_read_acceptance",
+                    "v5u_no_STEP_prompts_forcing_skill_load",
                 ],
             },
             ensure_ascii=False,
@@ -2923,7 +2844,7 @@ def main() -> int:
                     "--model",
                     claude_cli_model(model=model, using_proxy=gateway_proc is not None),
                     # Keep MCP ON; WaitForMcpServers NOT banned.
-                    # Skill allowed so each STEP can FORCE-LOAD its required skills.
+                    # Skill remains allowed (official skills wiring); not force-loaded by harness.
                     "--disallowedTools",
                     claude_disallowed_tools_csv(),
                     "--disable-slash-commands",
@@ -2945,7 +2866,7 @@ def main() -> int:
                     )
                 return command, attempt_env
 
-            # Fail-closed Official STEP loop: skill proof + artifacts before advance.
+            # Fail-closed Official STEP loop: artifact/MCP gates before advance (skills soft).
             steps_to_run: list[StepDef] = list(official_steps())
             while True:
                 step_failed = False

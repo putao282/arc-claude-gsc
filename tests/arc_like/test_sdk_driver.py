@@ -103,7 +103,7 @@ class OptionsBuilderTests(unittest.TestCase):
         self.assertEqual(opts.skills, "all")
 
     def test_build_options_official_skills_wiring(self):
-        """v5t: official Agent SDK Skills must be enabled (not Read-SKILL.md fallback)."""
+        """Official Agent SDK Skills wiring: setting_sources + skills=all (no force-load)."""
         opts = sdk.build_agent_options(cwd="/tmp/out", model="sonnet")
         self.assertEqual(list(opts.setting_sources), list(sdk.DEFAULT_SETTING_SOURCES))
         self.assertEqual(opts.skills, sdk.DEFAULT_SKILLS)
@@ -150,18 +150,6 @@ class ModelAliasTests(unittest.TestCase):
         self.assertEqual(out["CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY"], "1")
 
 
-class SkillMdParseTests(unittest.TestCase):
-    def test_skill_md_path_extract(self):
-        self.assertEqual(
-            sdk._skill_name_from_skill_md_ref(".claude/skills/architect/SKILL.md"),
-            "architect",
-        )
-        self.assertEqual(
-            sdk._skill_name_from_skill_md_ref("skills/designer/SKILL.md"),
-            "designer",
-        )
-        self.assertIsNone(sdk._skill_name_from_skill_md_ref("README.md"))
-
 
 class MaxTurnsAndThrashTests(unittest.TestCase):
     def test_default_and_spec_max_turns(self):
@@ -196,8 +184,9 @@ class MaxTurnsAndThrashTests(unittest.TestCase):
     def test_system_prompt_mentions_anti_thrash(self):
         txt = sdk.contest_system_prompt_append(None)
         self.assertIn("ANTI-THRASH", txt)
-        self.assertIn("runtime Skill", txt)
-        self.assertIn("do NOT Read/Bash/cat SKILL.md", txt)
+        self.assertIn("Skill tool", txt)
+        self.assertIn("setting_sources", txt)
+        self.assertIn("do not Read/Bash/cat SKILL.md", txt)
         self.assertNotIn("otherwise Read/Bash", txt)
 
 
