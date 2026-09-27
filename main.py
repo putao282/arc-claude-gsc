@@ -428,8 +428,61 @@ def run_claude_streaming(
     _children.append(process)
     stdout_tail: deque[str] = deque(maxlen=300)
     stderr_tail: deque[str] = deque(maxlen=300)
+    mcp_tool_counts: dict[str, int] = {}
+    mcp_lock = threading.Lock()
 
-    def pump(stream, sink, tail: deque[str]) -> None:
+    def note_mcp_from_line(line: str) -> None:
+        """Emit compact MCP audit events for Official log analysis (MCP value/role)."""
+        if "mcp__" not in line:
+            return
+        name = None
+        try:
+            payload = json.loads(line)
+        except Exception:
+            payload = None
+        if isinstance(payload, dict):
+            # stream-json assistant tool_use / content blocks
+            for key in ("name", "tool_name"):
+                val = payload.get(key)
+                if isinstance(val, str) and val.startswith("mcp__"):
+                    name = val
+                    break
+            if name is None:
+                content = payload.get("message", {}).get("content") if isinstance(payload.get("message"), dict) else payload.get("content")
+                blocks = content if isinstance(content, list) else []
+                for block in blocks:
+                    if not isinstance(block, dict):
+                        continue
+                    val = block.get("name")
+                    if isinstance(val, str) and val.startswith("mcp__"):
+                        name = val
+                        break
+            if name is None:
+                tool_use = payload.get("tool_use") or payload.get("toolUse")
+                if isinstance(tool_use, dict):
+                    val = tool_use.get("name")
+                    if isinstance(val, str) and val.startswith("mcp__"):
+                        name = val
+        if name is None:
+            # fallback: first mcp__ token in line
+            for token in line.replace(",", " ").replace('"', " ").split():
+                if token.startswith("mcp__"):
+                    name = token.strip("[]{}() ")
+                    break
+        if not name:
+            return
+        with mcp_lock:
+            mcp_tool_counts[name] = mcp_tool_counts.get(name, 0) + 1
+            count = mcp_tool_counts[name]
+        print(
+            json.dumps(
+                {"event": "mcp_tool_use", "tool": name, "count": count},
+                ensure_ascii=False,
+            ),
+            flush=True,
+        )
+
+    def pump(stream, sink, tail: deque[str], *, watch_mcp: bool = False) -> None:
         if stream is None:
             return
         try:
@@ -437,11 +490,18 @@ def run_claude_streaming(
                 tail.append(line.rstrip("\n"))
                 sink.write(line)
                 sink.flush()
+                if watch_mcp:
+                    note_mcp_from_line(line)
         finally:
             stream.close()
 
     threads = [
-        threading.Thread(target=pump, args=(process.stdout, sys.stdout, stdout_tail), daemon=True),
+        threading.Thread(
+            target=pump,
+            args=(process.stdout, sys.stdout, stdout_tail),
+            kwargs={"watch_mcp": True},
+            daemon=True,
+        ),
         threading.Thread(target=pump, args=(process.stderr, sys.stderr, stderr_tail), daemon=True),
     ]
     for thread in threads:
@@ -449,6 +509,20 @@ def run_claude_streaming(
     returncode = process.wait()
     for thread in threads:
         thread.join(timeout=5.0)
+
+    if mcp_tool_counts:
+        print(
+            json.dumps(
+                {
+                    "event": "mcp_tool_use_summary",
+                    "tools": dict(sorted(mcp_tool_counts.items())),
+                    "total": sum(mcp_tool_counts.values()),
+                    "note": "Official audit: MCP role/value from observed tool_use",
+                },
+                ensure_ascii=False,
+            ),
+            flush=True,
+        )
 
     stdout_lines = list(stdout_tail)
     is_error, terminal_reason, subtype, api_error_status = parse_terminal_result(stdout_lines)
@@ -1097,21 +1171,36 @@ def ensure_arc_spawn_gate_softener(output_dir: Path) -> None:
     GSC PreToolUse[Agent|Task] hard-denies coding spawns missing ## TASK-HEADER
     (REQ-AGENTGOV-2). On ARC smoke that burns turns/tokens and feeds autocompact
     rapid_refill. Official escape hatch: .claude/spawn-gate-off (requires CLAUDE.md
-    so findProjectRoot resolves). Also keep a short CLAUDE.md that *encourages*
-    GSC MCP rather than banning it.
+    so findProjectRoot resolves). Always (re)write CLAUDE.md with Tao MCP-first
+    Official workflow so packaged runs follow PRD→SPEC→TEST DAG→PAGES(designer)→
+    batch test; MCP stays ON (never ban WaitForMcpServers / ARC_ENABLE_MCP=0).
     """
     claude_md = output_dir / "CLAUDE.md"
-    if not claude_md.exists():
-        claude_md.write_text(
-            "# ARC-Bench project\n\n"
-            "Use GSC MCP SPEC tools (spec_read/spec_write/state_*) when available.\n"
-            "Prefer implementing in the main Claude session with Bash/Edit/Write/Read.\n"
-            "Do not spawn Agent/Task subagents for this ARC module unless a full "
-            "`## TASK-HEADER` block is included.\n"
-            "If WaitForMcpServers appears, wait once then continue; do not dump schemas.\n"
-            "Harness local tests (frontend vitest/npm test) grant green — not MCP alone.\n",
-            encoding="utf-8",
-        )
+    claude_md.write_text(
+        "# ARC-Bench project — MCP-first Official workflow\n\n"
+        "HARD: GSC MCP stays ON. Never disable WaitForMcpServers / never set "
+        "ARC_ENABLE_MCP=0 / never ban MCP tools.\n\n"
+        "## Mandated workflow (in order)\n"
+        "1. MCP-first planning: from requirements build **PRD → SPEC → TEST cases** "
+        "(API + UI test DAG) via GSC MCP (`prd` / `spec_read` / `spec_write` / "
+        "`state_read` / `state_update` / related). Prefer HTML SPEC under "
+        "`SPEC/arcbench/`; do not invent Markdown SPEC that forces migrate.\n"
+        "2. **PAGES / UI**: before building any page or UI, load the UX-UI "
+        "**`designer` skill** (Skill tool name: `designer`). Then implement UI.\n"
+        "3. **Development**: implement in the main session with Bash/Edit/Write/Read "
+        "+ MCP. Do **NOT** run tests continuously mid-development.\n"
+        "4. **After all code** for the module/subtree is done: **batch / centralized "
+        "testing** once (prefer `frontend` `npx vitest run` / `npm test`).\n"
+        "5. Purpose of Official: rich MCP tool-use in logs for bug audit + MCP "
+        "value analysis — prefer visible MCP calls over silent bypass.\n\n"
+        "## Thrash / spawn controls\n"
+        "- Prefer implementing in the main Claude session; do not spawn Agent/Task "
+        "unless a full `## TASK-HEADER` block is included.\n"
+        "- If WaitForMcpServers appears, wait once then continue; do not dump schemas.\n"
+        "- Keep tool outputs small (no huge lockfiles/schemas) to avoid rapid_refill.\n"
+        "- Harness local tests grant green — MCP planning alone does NOT.\n",
+        encoding="utf-8",
+    )
     off = output_dir / ".claude" / "spawn-gate-off"
     off.parent.mkdir(parents=True, exist_ok=True)
     if not off.exists():
@@ -1160,16 +1249,24 @@ def module_prompt(
         Requirement source directory: {requirements_dir}
         {recovery_text}
 
+        HARD RULES: GSC MCP stays ON. Never disable WaitForMcpServers / never set ARC_ENABLE_MCP=0 / never ban MCP.
+
+        Mandated MCP-first workflow (do in order; encode progress via MCP so logs show MCP value):
+        1) From requirements, use GSC MCP to build PRD → SPEC → TEST cases (API + UI test DAG). Prefer HTML SPEC under SPEC/arcbench/ via spec_read/spec_write/prd/state_*; do not invent Markdown SPEC that forces migrate.
+        2) On PAGES / UI work: BEFORE building any page or UI, load the UX-UI designer skill (Skill tool name: `designer`). Then implement UI.
+        3) During development: implement with Bash/Edit/Write/Read + MCP. Do NOT run tests continuously mid-development.
+        4) After all code for this subtree is done: batch/centralized testing once (prefer frontend `npx vitest run` / `npm test`).
+        5) Prefer visible MCP tool use (planning/state/SPEC) over silent bypass — Official audit needs rich MCP logs.
+
         The current working directory is the persistent generated project. Preserve working features from earlier modules.
         Use GSC actively (including GSC MCP SPEC / planning / validation tools) for requirements, implementation planning, coding, validation, and state tracking rather than bypassing it.
-        Prefer the HTML SPEC under SPEC/arcbench/ via GSC MCP spec_read/spec_write; do not invent Markdown SPEC that forces migrate.
         If WaitForMcpServers appears, wait once for GSC MCP readiness then continue implementation; do not loop reconnecting or dump huge unrelated context.
         SPAWN thrash control: implement this module in the main Claude session. Do NOT spawn Agent/Task subagents. If a coding spawn is unavoidable, the prompt MUST start with a literal line "## TASK-HEADER" (no trailing colon) plus task/domain/archaeology/reuse-decision/scope/completion/retry/stop fields — otherwise GSC SPAWN-GATE fail-closes.
         Keep tool outputs small: read files in chunks, avoid pasting huge lockfiles/schemas into the conversation (prevents autocompact rapid_refill_breaker).
 
         {skills_text}
         If ARC skills are present, read the runtime-signals, traceability, and checkpoint skill instructions and record detailed requirement-to-interface/file/test traceability.
-        Implement against the ROOT-child subtree below. Prefer adding/keeping real automated tests under frontend/ (or the project package.json) that the harness can run.
+        Implement against the ROOT-child subtree below. Prefer adding/keeping real automated tests under frontend/ (or the project package.json) that the harness can run — write them during planning/DAG, run them in the final batch step (not continuously).
         Do not start a long-running server. Do not erase work from earlier modules.
 
         Harness bar (authoritative for mark_test_passed): after this Claude session returns, the harness itself runs local validation (prefer `frontend` `npx vitest run` / `npm test`). No test files => cannot green. Your session exit code alone never grants green. GSC MCP SPEC / planning tools help quality but do NOT grant harness green or platform score.
@@ -1179,7 +1276,7 @@ def module_prompt(
         {json.dumps(module.subtree, ensure_ascii=False, indent=2)}
         ```
 
-        Finish only after the subtree is implemented and ready for harness local validation. Summarize changed files and how tests cover the requirement.
+        Finish only after the subtree is implemented and ready for harness local validation. Summarize changed files, MCP tools used, and how batch tests cover the requirement.
     """).strip()
 
 
@@ -1478,10 +1575,11 @@ def main() -> int:
                     "--model",
                     ("sonnet" if gateway_proc is not None else model),
                     # Keep MCP ON; shrink builtin bloat. WaitForMcpServers NOT banned.
+                    # Skill allowed so PAGES can load UX-UI `designer` skill (Tao workflow).
                     # MCP schema shrink is via mcp-config allowedTools (SPEC subset).
                     "--disallowedTools",
                     (
-                        "Agent,Task,Skill,WebSearch,WebFetch,"
+                        "Agent,Task,WebSearch,WebFetch,"
                         "CronCreate,CronDelete,CronList,NotebookEdit,"
                         "EnterWorktree,ExitWorktree,ListAgents,"
                         "ScheduleWakeup,SendMessage,Workflow,DesignSync,ReportFindings"
