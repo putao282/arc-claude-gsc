@@ -279,5 +279,122 @@ class PreToolUseThrashDenyTests(unittest.TestCase):
         self.assertIn("Write", outs[2]["hookSpecificOutput"]["permissionDecisionReason"])
 
 
+
+class GovernThrashV5yTests(unittest.TestCase):
+    """v5y: *_govern on thrash watch + accept-already-green PreToolUse deny."""
+
+    def test_govern_tools_are_thrash_watched(self):
+        self.assertIn("prd_govern", sdk.MCP_THRASH_WATCH_SUFFIXES)
+        self.assertIn("spec_govern", sdk.MCP_THRASH_WATCH_SUFFIXES)
+        self.assertTrue(sdk._is_thrash_watched_mcp("mcp__arch__prd_govern"))
+        self.assertTrue(sdk._is_thrash_watched_mcp("mcp__arch__spec_govern"))
+
+    def test_identical_govern_denied_at_hard_limit(self):
+        import asyncio
+
+        guard = sdk.McpThrashGuard(soft_limit=2, hard_limit=3, step_id="govern")
+        hooks = sdk.build_thrash_pretool_hooks(guard)
+        cb = hooks["PreToolUse"][0].hooks[0]
+        inp = {"focus": "REQ-1"}
+
+        async def call():
+            return await cb(
+                {
+                    "hook_event_name": "PreToolUse",
+                    "tool_name": "mcp__arch__prd_govern",
+                    "tool_input": inp,
+                },
+                None,
+                None,
+            )
+
+        async def run():
+            return [await call() for _ in range(4)]
+
+        outs = asyncio.run(run())
+        for o in outs[:2]:
+            self.assertNotEqual(
+                (o.get("hookSpecificOutput") or {}).get("permissionDecision"), "deny"
+            )
+        self.assertEqual(outs[2]["hookSpecificOutput"]["permissionDecision"], "deny")
+        self.assertIn("identical", outs[2]["hookSpecificOutput"]["permissionDecisionReason"].lower())
+        self.assertTrue(guard.deny_events)
+
+    def test_accept_green_denies_further_govern_reaudit(self):
+        import asyncio
+
+        guard = sdk.McpThrashGuard(soft_limit=2, hard_limit=3, step_id="govern")
+        hooks = sdk.build_thrash_pretool_hooks(guard)
+        cb = hooks["PreToolUse"][0].hooks[0]
+
+        async def call(tool, inp=None):
+            return await cb(
+                {
+                    "hook_event_name": "PreToolUse",
+                    "tool_name": tool,
+                    "tool_input": inp or {"n": 1},
+                },
+                None,
+                None,
+            )
+
+        async def run():
+            # Completing pair must be allowed
+            a = await call("mcp__arch__prd_govern", {"k": "a"})
+            b = await call("mcp__arch__spec_govern", {"k": "b"})
+            # Further re-audit (even different args) denied
+            c = await call("mcp__arch__prd_govern", {"k": "c-different"})
+            d = await call("mcp__arch__spec_govern", {"k": "d-different"})
+            return a, b, c, d
+
+        a, b, c, d = asyncio.run(run())
+        self.assertNotEqual((a.get("hookSpecificOutput") or {}).get("permissionDecision"), "deny")
+        self.assertNotEqual((b.get("hookSpecificOutput") or {}).get("permissionDecision"), "deny")
+        self.assertTrue(guard.govern_accept_met())
+        self.assertEqual(c["hookSpecificOutput"]["permissionDecision"], "deny")
+        reason = c["hookSpecificOutput"]["permissionDecisionReason"]
+        self.assertIn("already met", reason.lower())
+        self.assertIn("STOP", reason)
+        self.assertEqual(d["hookSpecificOutput"]["permissionDecision"], "deny")
+        self.assertTrue(
+            any(e.get("reason") == "govern_accept_already_green" for e in guard.deny_events)
+        )
+
+    def test_accept_green_deny_only_on_govern_step(self):
+        import asyncio
+
+        guard = sdk.McpThrashGuard(soft_limit=2, hard_limit=3, step_id="spec")
+        hooks = sdk.build_thrash_pretool_hooks(guard)
+        cb = hooks["PreToolUse"][0].hooks[0]
+
+        async def run():
+            for tool in ("mcp__arch__prd_govern", "mcp__arch__spec_govern"):
+                await cb(
+                    {
+                        "hook_event_name": "PreToolUse",
+                        "tool_name": tool,
+                        "tool_input": {"x": 1},
+                    },
+                    None,
+                    None,
+                )
+            # On non-govern STEP, further govern calls are NOT accept-green-denied
+            # (still subject to identical thrash). Different args → allow.
+            return await cb(
+                {
+                    "hook_event_name": "PreToolUse",
+                    "tool_name": "mcp__arch__prd_govern",
+                    "tool_input": {"x": 2},
+                },
+                None,
+                None,
+            )
+
+        out = asyncio.run(run())
+        self.assertTrue(guard.govern_accept_met())
+        self.assertNotEqual(
+            (out.get("hookSpecificOutput") or {}).get("permissionDecision"), "deny"
+        )
+
 if __name__ == "__main__":
     unittest.main()

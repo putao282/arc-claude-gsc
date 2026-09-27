@@ -72,12 +72,17 @@ MCP_THRASH_WATCH_SUFFIXES = (
     "spec_similarity",
     "artifact_read",
     "artifact_grep",
+    # v5y: govern soft-stall re-audit (v5u burned hours on prd_govern/spec_govern)
+    "prd_govern",
+    "spec_govern",
 )
 MCP_THRASH_SOFT_LIMIT = 2  # identical fingerprint
 MCP_THRASH_HARD_LIMIT = 3
 # Optional: consecutive builtin Read with no Write/Edit on implement/spec → deny further Read.
 READ_ONLY_STREAK_LIMIT = 8
 READ_STREAK_STEPS = frozenset({"implement", "spec"})
+# After BOTH prd_govern + spec_govern ≥1 in govern STEP, deny further *_govern re-audits.
+GOVERN_ACCEPT_GREEN_TOOLS = frozenset({"prd_govern", "spec_govern"})
 THRASH_DENY_ADVICE = (
     "Do NOT re-call the same MCP read with identical args. "
     "Use the prior payload; call write/govern next; then STOP this STEP."
@@ -85,6 +90,10 @@ THRASH_DENY_ADVICE = (
 READ_STREAK_DENY_ADVICE = (
     "Read-only streak on this STEP — stop re-reading. "
     "You MUST Write or Edit business paths under frontend|backend|src now."
+)
+GOVERN_ACCEPT_GREEN_ADVICE = (
+    "Govern accept criteria already met (prd_govern + spec_govern ≥1). "
+    "Do NOT re-audit. Write receipts if needed, then STOP this STEP now."
 )
 
 
@@ -124,7 +133,7 @@ def _is_thrash_watched_mcp(name: str) -> bool:
 
 
 class McpThrashGuard:
-    """Count identical MCP read fingerprints; log soft/hard thrash; enforce via PreToolUse (v5x)."""
+    """Count identical MCP read fingerprints; log soft/hard thrash; enforce via PreToolUse (v5x/v5y)."""
 
     def __init__(
         self,
@@ -139,13 +148,36 @@ class McpThrashGuard:
         self.read_streak_limit = max(1, int(read_streak_limit))
         self.step_id = (step_id or "").strip() or None
         self._counts: dict[str, int] = {}
+        self._tool_totals: dict[str, int] = {}
         self.events: list[dict[str, Any]] = []
         self._read_streak = 0
         self.deny_events: list[dict[str, Any]] = []
 
+    @staticmethod
+    def _short_name(name: str) -> str:
+        return name.rsplit("__", 1)[-1] if name else ""
+
+    def tool_total(self, short: str) -> int:
+        return int(self._tool_totals.get(short, 0))
+
+    def govern_accept_met(self) -> bool:
+        """True when both in-session govern tools already fired ≥1 (acceptance green)."""
+        return self.tool_total("prd_govern") >= 1 and self.tool_total("spec_govern") >= 1
+
+    def should_deny_govern_reaudit(self, name: str) -> bool:
+        """Deny further *_govern after accept already green (v5y soft-stall cure)."""
+        if (self.step_id or "") != "govern":
+            return False
+        short = self._short_name(name)
+        if short not in GOVERN_ACCEPT_GREEN_TOOLS:
+            return False
+        return self.govern_accept_met()
+
     def note(self, name: str, inp: dict[str, Any] | None) -> dict[str, Any] | None:
         if not _is_thrash_watched_mcp(name):
             return None
+        short = self._short_name(name)
+        self._tool_totals[short] = self._tool_totals.get(short, 0) + 1
         fp = _mcp_tool_fingerprint(name, inp)
         n = self._counts.get(fp, 0) + 1
         self._counts[fp] = n
@@ -230,7 +262,8 @@ def build_thrash_pretool_hooks(
 ) -> dict[str, list[Any]]:
     """ClaudeAgentOptions.hooks PreToolUse: identical MCP read ≥ hard_limit → deny.
 
-    Also optional Read-only streak deny on implement/spec. Keeps existing log events.
+    Also optional Read-only streak deny on implement/spec, and v5y govern
+    accept-already-green deny for further prd_govern/spec_govern. Keeps log events.
     """
 
     async def pre_tool_use(input_data: dict[str, Any], tool_use_id: str | None, context: Any) -> dict[str, Any]:
@@ -248,6 +281,32 @@ def build_thrash_pretool_hooks(
                 return _hook_deny(event_name, streak_event.get("advice") or READ_STREAK_DENY_ADVICE)
 
         if _is_thrash_watched_mcp(name):
+            # v5y: if govern accept already green, deny further *_govern re-audits
+            # BEFORE counting this call (first completing pair still allowed).
+            if thrash_guard.should_deny_govern_reaudit(name):
+                deny_ev = {
+                    "event": "mcp_thrash_pretool_deny",
+                    "reason": "govern_accept_already_green",
+                    "tool": name,
+                    "prd_govern_count": thrash_guard.tool_total("prd_govern"),
+                    "spec_govern_count": thrash_guard.tool_total("spec_govern"),
+                    "advice": GOVERN_ACCEPT_GREEN_ADVICE,
+                }
+                thrash_guard.deny_events.append(deny_ev)
+                thrash_guard.events.append(
+                    {
+                        "event": "mcp_thrash_guard",
+                        "level": "govern_accept_green_deny",
+                        "tool": name,
+                        "identical_count": thrash_guard.identical_count(name, inp),
+                        "soft_limit": thrash_guard.soft_limit,
+                        "hard_limit": thrash_guard.hard_limit,
+                        "fingerprint": f"govern_accept_green|{name}",
+                        "advice": GOVERN_ACCEPT_GREEN_ADVICE,
+                    }
+                )
+                print(json.dumps(deny_ev, ensure_ascii=False), flush=True)
+                return _hook_deny(event_name, GOVERN_ACCEPT_GREEN_ADVICE)
             # Increment + log soft/hard (same events as v5r observation path).
             thrash_guard.note(name, inp)
             if thrash_guard.should_deny_identical_mcp(name, inp):

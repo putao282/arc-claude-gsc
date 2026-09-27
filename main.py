@@ -183,7 +183,8 @@ GOVERN_STEP = StepDef(
     required_skills=("architect",),
     goal=(
         "HARD AUDIT (agent+tool chain, not single signal): run BOTH "
-        "mcp__arch__prd_govern and mcp__arch__spec_govern (≥1 each) in this STEP. "
+        "mcp__arch__prd_govern and mcp__arch__spec_govern (≥1 each) in this STEP, "
+        "then STOP this STEP (do NOT re-call / re-audit). "
         "MCP tool use is required — receipt JSON alone does not pass. Demand SPEC "
         "coverage vs PRD + ROOT module.subtree atomic/leaf requirements. Mirror MCP "
         "govern output into `.arc/steps/<id>/prd_govern.json` and `spec_govern.json` "
@@ -191,8 +192,9 @@ GOVERN_STEP = StepDef(
         "parallel file-only trace ceremony. Optional soft: mcp__arch__trace."
     ),
     exit_criteria=(
-        "BOTH mcp__arch__prd_govern AND mcp__arch__spec_govern in-session tool use. "
-        "Receipt JSONs are side mirrors only — insufficient alone."
+        "BOTH mcp__arch__prd_govern AND mcp__arch__spec_govern in-session tool use, "
+        "then STOP. Receipt JSONs are side mirrors only — insufficient alone. "
+        "Re-audit after coverage green is forbidden."
     ),
 )
 
@@ -2060,7 +2062,7 @@ def ensure_arc_spawn_gate_softener(output_dir: Path) -> None:
     """Soften GSC SPAWN-GATE without disabling MCP; encode Official STEP loop."""
     claude_md = output_dir / "CLAUDE.md"
     claude_md.write_text(
-        "# ARC-Bench project — MCP-first Official STEP loop (v5x Phase A write-gate + thrash deny)\n\n"
+        "# ARC-Bench project — MCP-first Official STEP loop (v5y govern STOP + thrash deny)\n\n"
         "HARD: GSC MCP stays ON. Never disable WaitForMcpServers / never set "
         "ARC_ENABLE_MCP=0 / never ban MCP tools.\n\n"
         "## Harness STEP loop (fail-closed)\n"
@@ -2074,8 +2076,8 @@ def ensure_arc_spawn_gate_softener(output_dir: Path) -> None:
         "BOTH HTML + spec_write required (not file-only). ANTI-THRASH; FORBIDDEN "
         "migrate/invent/rename. Coverage green only after write + govern chain.\n"
         "3. **govern** (when enabled) — BOTH `mcp__arch__prd_govern` AND "
-        "`mcp__arch__spec_govern` in-session (coverage vs PRD/subtree); receipts are "
-        "side mirrors only — insufficient alone.\n"
+        "`mcp__arch__spec_govern` in-session (coverage vs PRD/subtree), then STOP "
+        "this STEP (no re-audit). Receipts are side mirrors only — insufficient alone.\n"
         "4. **test_dag** — non-empty api+ui in test_dag.json. Soft: `mcp__arch__trace`.\n"
         "5. **pages** — MUST call `mcp__arch__design_style` OR "
         "`mcp__arch__design_asset`. Soft: read_image / browser lifecycle.\n"
@@ -2758,7 +2760,7 @@ def step_prompt(
         )
     elif step.step_id == "govern":
         mcp_extra = (
-            "\nMCP REQUIRED this STEP (fail-closed; HARD AUDIT = agent+tool chain):\n"
+            "\nMCP REQUIRED this STEP (fail-closed; HARD AUDIT = agent+tool chain; anti-thrash):\n"
             "- Coverage is only green when the SPEC write + this govern chain runs "
             "(spec_write → prd_govern + spec_govern). Single-signal receipts do not pass.\n"
             f"- Call `mcp__arch__prd_govern` ≥1 (REQUIRED in-session); mirror MCP output → "
@@ -2768,9 +2770,12 @@ def step_prompt(
             "- HARD: when calling spec_govern / prd_govern, demand coverage of SPEC vs PRD "
             "+ ROOT module.subtree atomic/leaf requirements (ids, accessible names, roles, "
             "seed data, observable states). Note gaps in the MCP-mirrored receipt.\n"
-            "- Do NOT invent a homemade spec_trace.json as the source of truth — "
-            "govern MCP tools own chain/coverage.\n"
-            "- Soft: `mcp__arch__trace`.\n"
+            "- After BOTH prd_govern ≥1 AND spec_govern ≥1 succeed coverage, "
+            "then STOP this STEP. Do NOT re-call prd_govern/spec_govern/spec_read/state_read "
+            "with the same or near-same args (harness thrash-denies re-audit).\n"
+            "- FORBIDDEN: looping re-audit after coverage green; FORBIDDEN as main path: "
+            "homemade spec_trace.json — govern MCP tools own chain/coverage.\n"
+            "- Soft: `mcp__arch__trace` at most once.\n"
         )
     elif step.step_id == "test_dag":
         mcp_extra = (
@@ -3132,6 +3137,7 @@ def main() -> int:
                     "v5v_spec_derive_from_prd_atomic",
                     "v5w_hard_audit_agent_plus_tool_chain",
                     "v5x_phaseA_write_gate_thrash_deny_refill_degrade",
+                    "v5y_govern_stop_thrash_accept_green_deny",
                 ],
             },
             ensure_ascii=False,

@@ -520,7 +520,43 @@ class McpAcceptanceV5qTests(unittest.TestCase):
         self.assertNotIn("spec_trace.json mapping", low)
         self.assertIn("spec_govern", low)
 
+    def test_govern_prompt_stop_after_coverage_v5y(self):
+        prompt = mod.step_prompt(
+            _module(),
+            Path("/tmp/req"),
+            None,
+            [],
+            "github",
+            _step("govern"),
+        )
+        self.assertIn("STOP this STEP", prompt)
+        low = prompt.lower()
+        self.assertIn("anti-thrash", low)
+        self.assertIn("do not re-call", low)
+        self.assertIn("prd_govern", low)
+        self.assertIn("spec_govern", low)
+        self.assertNotIn("load required skill", low)
+        self.assertNotIn("first tool action", low)
+
+    def test_govern_soft_accept_ready_when_both_green_v5y(self):
+        """G7-style: when both governs already green, acceptance ok for soft-accept@max_turns."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            acc = mod.evaluate_step_acceptance(
+                root,
+                _module(),
+                _step("govern"),
+                _result(
+                    skills=("architect",),
+                    mcp=("mcp__arch__prd_govern", "mcp__arch__spec_govern"),
+                ),
+            )
+            self.assertTrue(acc.ok, acc.reason)
+            self.assertTrue(any("prd_govern" in t for t in acc.mcp_required))
+            self.assertTrue(any("spec_govern" in t for t in acc.mcp_required))
+
     def test_govern_prompt_coverage_via_mcp_v5v(self):
+
         prompt = mod.step_prompt(
             _module(),
             Path("/tmp/req"),
@@ -534,7 +570,7 @@ class McpAcceptanceV5qTests(unittest.TestCase):
         self.assertIn("prd_govern", low)
         self.assertIn("coverage", low)
         self.assertIn("subtree", low)
-        self.assertIn("do not invent a homemade spec_trace", low)
+        self.assertIn("homemade spec_trace", low)
 
     def test_govern_still_fail_closed_on_mcp_proof_v5v(self):
         with tempfile.TemporaryDirectory() as tmp:
