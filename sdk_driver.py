@@ -62,6 +62,21 @@ class SdkTurnResult:
     driver: str = "ClaudeSDKClient"
 
 
+
+def _normalize_anthropic_base_url(base_url: str) -> str:
+    """Claude Code appends /v1/messages to ANTHROPIC_BASE_URL.
+
+    ARC injects OPENAI_BASE_URL ending in /v1. Keep host but strip a trailing
+    /v1 so we do not request .../v1/v1/messages (HTTP 404 on Smoke v5m).
+    Official starter assigns OPENAI_BASE_URL as-is; ARC's /v1 suffix requires
+    this normalize for the Messages path.
+    """
+    u = (base_url or "").strip().rstrip("/")
+    if u.endswith("/v1"):
+        u = u[:-3].rstrip("/")
+    return u
+
+
 @contextlib.contextmanager
 def claude_env_from_openai_env() -> Iterator[None]:
     """Preserve the existing ARC-Bench OpenAI-compatible → Claude SDK mapping.
@@ -78,7 +93,7 @@ def claude_env_from_openai_env() -> Iterator[None]:
 
     os.environ["ANTHROPIC_API_KEY"] = ""
     if openai_base_url:
-        os.environ["ANTHROPIC_BASE_URL"] = openai_base_url
+        os.environ["ANTHROPIC_BASE_URL"] = _normalize_anthropic_base_url(openai_base_url)
     else:
         os.environ.pop("ANTHROPIC_BASE_URL", None)
     if openai_key:
@@ -160,6 +175,51 @@ def gsc_plugins(gsc_dir: Path | None) -> list[dict[str, str]]:
     if any(m.exists() for m in markers) or (root / "mcp").is_dir():
         return [{"type": "local", "path": str(root)}]
     return []
+
+
+
+def _is_claude_builtin_model_alias(model: str) -> bool:
+    m = (model or "").strip().lower()
+    if not m:
+        return False
+    builtins = {
+        "sonnet", "opus", "haiku", "claude",
+        "claude-sonnet-4", "claude-opus-4", "claude-haiku-4",
+        "claude-3-5-sonnet", "claude-3-5-haiku", "claude-3-opus",
+        "claude-3-sonnet", "claude-3-haiku",
+    }
+    if m in builtins:
+        return True
+    return m.startswith("claude-")
+
+
+def sdk_model_for_options(contest_model: str) -> str:
+    """ClaudeAgentOptions.model value.
+
+    Official starter passes MODEL as-is. Contest MODEL may be a non-Claude id
+    (e.g. deepseek-v4-flash). Claude Code 2.1 emits unrecognized_model locally
+    before any upstream call for those ids. Use a builtin alias for options.model
+    and apply the contest id via ANTHROPIC_DEFAULT_* / ANTHROPIC_MODEL env
+    (see apply_contest_model_env).
+    """
+    model = (contest_model or "").strip()
+    if _is_claude_builtin_model_alias(model):
+        return model
+    return "sonnet"
+
+
+def apply_contest_model_env(env: dict[str, str], contest_model: str) -> dict[str, str]:
+    """Map contest MODEL into Claude Code gateway env (no proxy)."""
+    out = dict(env)
+    model = (contest_model or "").strip()
+    if model:
+        out["ANTHROPIC_MODEL"] = model
+        out["ANTHROPIC_DEFAULT_OPUS_MODEL"] = model
+        out["ANTHROPIC_DEFAULT_SONNET_MODEL"] = model
+        out["ANTHROPIC_DEFAULT_HAIKU_MODEL"] = model
+        out["CLAUDE_CODE_SUBAGENT_MODEL"] = model
+    out["CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY"] = "1"
+    return out
 
 
 def build_agent_options(

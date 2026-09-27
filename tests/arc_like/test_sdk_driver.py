@@ -78,7 +78,7 @@ class ClaudeEnvMappingTests(unittest.TestCase):
         os.environ["ANTHROPIC_AUTH_TOKEN"] = "stale-token"
         with sdk.claude_env_from_openai_env():
             self.assertEqual(os.environ.get("ANTHROPIC_API_KEY"), "")
-            self.assertEqual(os.environ.get("ANTHROPIC_BASE_URL"), "https://api.arc-bench.com/v1")
+            self.assertEqual(os.environ.get("ANTHROPIC_BASE_URL"), "https://api.arc-bench.com")
             self.assertEqual(os.environ.get("ANTHROPIC_AUTH_TOKEN"), "sk-test-key")
         self.assertEqual(os.environ.get("ANTHROPIC_API_KEY"), "stale")
         self.assertEqual(os.environ.get("ANTHROPIC_BASE_URL"), "https://stale.example")
@@ -119,6 +119,18 @@ class OptionsBuilderTests(unittest.TestCase):
         self.assertTrue(payload["mcp_enabled"])
         self.assertTrue(payload["no_production_proxy"])
         self.assertIsNotNone(payload["gsc_plugin_note"])
+
+
+class ModelAliasTests(unittest.TestCase):
+    def test_sdk_model_alias_for_contest_ids(self):
+        self.assertEqual(sdk.sdk_model_for_options("deepseek-v4-flash"), "sonnet")
+        self.assertEqual(sdk.sdk_model_for_options("sonnet"), "sonnet")
+        self.assertEqual(sdk.sdk_model_for_options("claude-sonnet-4"), "claude-sonnet-4")
+
+    def test_apply_contest_model_env(self):
+        out = sdk.apply_contest_model_env({}, "deepseek-v4-flash")
+        self.assertEqual(out["ANTHROPIC_DEFAULT_SONNET_MODEL"], "deepseek-v4-flash")
+        self.assertEqual(out["CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY"], "1")
 
 
 class SkillMdParseTests(unittest.TestCase):

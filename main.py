@@ -624,9 +624,11 @@ def run_claude_via_sdk(
         os.environ["MODEL"] = model
         # Propagate HOME/GSC/PATH and related into SDK subprocess env.
         sdk_env = {k: v for k, v in attempt_env.items() if isinstance(v, str)}
+        sdk_model = sdk_driver.sdk_model_for_options(model)
+        sdk_env = sdk_driver.apply_contest_model_env(sdk_env, model)
         options = sdk_driver.build_agent_options(
             cwd=output_dir,
-            model=model,
+            model=sdk_model,
             mcp_servers=mcp_servers,
             plugins=plugins,
             cli_path=claude_bin,
@@ -640,7 +642,9 @@ def run_claude_via_sdk(
                 {
                     "event": "sdk_turn_start",
                     "driver": "ClaudeSDKClient",
-                    "model": model,
+                    "contest_model": model,
+                    "sdk_model": sdk_model,
+                    "anthropic_base_url": sdk_env.get("ANTHROPIC_BASE_URL") or os.environ.get("ANTHROPIC_BASE_URL"),
                     "permission_mode": "acceptEdits",
                     "mcp_enabled": enable_mcp,
                     "mcp_servers": str(mcp_servers) if mcp_servers is not None else None,
@@ -2112,10 +2116,9 @@ def main() -> int:
     # Contest primary driver: ClaudeSDKClient + official OPENAI_* → ANTHROPIC_* mapping.
     # Production MUST NOT start anthropic-proxy. Local-only proxy helper remains unused here.
     gateway_proc = None
+    # apply_official_claude_env already strips trailing /v1 (Claude appends /v1/messages).
     claude_env = apply_official_claude_env(env, base_url=base_url, api_key=api_key, model=model)
-    # Official starter sets ANTHROPIC_BASE_URL = OPENAI_BASE_URL as-is (no /v1 strip).
     claude_env["ANTHROPIC_API_KEY"] = ""
-    claude_env["ANTHROPIC_BASE_URL"] = base_url
     if api_key:
         claude_env["ANTHROPIC_AUTH_TOKEN"] = api_key
     for key in ("SUDO_USER", "SUDO_UID", "SUDO_GID"):
@@ -2147,7 +2150,7 @@ def main() -> int:
                 "anthropic_model": claude_env.get("ANTHROPIC_MODEL"),
                 "gateway_model_discovery": claude_env.get("CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY"),
                 "contest_model": model,
-                "sdk_model": model,
+                "sdk_model": sdk_driver.sdk_model_for_options(model),
                 "permission_mode": "acceptEdits",
                 "anthropic_proxy": False,
                 "gsc_plugins": sdk_plugins,
@@ -2354,11 +2357,10 @@ def main() -> int:
                             attempt_env = apply_official_claude_env(
                                 attempt_env, base_url=attempt_base_url, api_key=api_key, model=model
                             )
-                            # Official mapping: ANTHROPIC_BASE_URL = OPENAI_BASE_URL as-is (no /v1 strip).
                             attempt_env["ANTHROPIC_API_KEY"] = ""
-                            attempt_env["ANTHROPIC_BASE_URL"] = attempt_base_url
                             if api_key:
                                 attempt_env["ANTHROPIC_AUTH_TOKEN"] = api_key
+                            attempt_env = sdk_driver.apply_contest_model_env(attempt_env, model)
                             print(
                                 json.dumps(
                                     {
