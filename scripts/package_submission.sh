@@ -16,7 +16,7 @@ command -v python3 >/dev/null 2>&1 || { echo "missing required command: python3"
 
 rm -rf "$STAGE"
 mkdir -p "$STAGE"
-cp "$ROOT/main.py" "$ROOT/runtime.lock.json" "$ROOT/requirements.txt" "$STAGE/"
+cp "$ROOT/main.py" "$ROOT/sdk_driver.py" "$ROOT/runtime.lock.json" "$ROOT/requirements.txt" "$STAGE/"
 
 echo "[1/2] import current ARC-Bench Factory starter assets"
 python3 - "$STARTER_ZIP" "$STAGE" <<'PY'

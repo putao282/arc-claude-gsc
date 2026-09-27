@@ -219,6 +219,7 @@ class FalseGreenGateTests(unittest.TestCase):
             self.assertFalse(mod.module_already_passed(Runtime(), "REQ-1", output))
 
     def test_module_prompt_states_harness_bar_not_self_stop(self):
+        # Official path uses STEP prompts; harness alone grants green via acceptance gate.
         prompt = mod.module_prompt(
             _module(),
             Path("/req"),
@@ -226,12 +227,11 @@ class FalseGreenGateTests(unittest.TestCase):
             [],
             "web",
         )
-        self.assertIn("Harness bar", prompt)
-        self.assertIn("do NOT grant", prompt)
+        self.assertIn("Official harness STEP", prompt)
+        self.assertIn("acceptance gate", prompt)
+        self.assertIn("fail-closed", prompt)
         self.assertNotIn("one small vitest", prompt.lower())
-        self.assertNotIn("STOP early", prompt)  # only allowed in repair wording below
-        # baseline prompt should not encourage early STOP
-        self.assertNotRegex(prompt, r"\bSTOP\b")
+        self.assertNotIn("STOP early", prompt)
 
         repair = mod.module_prompt(
             _module(),
@@ -244,7 +244,7 @@ class FalseGreenGateTests(unittest.TestCase):
         )
         self.assertIn("VALIDATION REPAIR", repair)
         self.assertIn("FAIL LOG HERE", repair)
-        self.assertIn("does NOT grant harness green", repair)
+        self.assertIn("harness batch validation failed", repair)
 
     def test_mark_test_passed_requires_validation_in_orchestrated_gate(self):
         """Simulate post-Claude path: success alone must not green; validation ok does."""

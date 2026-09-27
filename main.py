@@ -27,6 +27,8 @@ import yaml
 import claude_agent_sdk
 from arcbench_agent_runtime import AgentRuntime
 
+import sdk_driver
+
 
 SUBMISSION_DIR = Path(os.environ.get("ARCBENCH_SUBMISSION_DIR", Path(__file__).resolve().parent))
 LOCK_PATH = SUBMISSION_DIR / "runtime.lock.json"
@@ -222,26 +224,92 @@ def env_bool(name: str, default: bool = True) -> bool:
 
 
 
-def apply_official_claude_env(env: dict[str, str], *, base_url: str, api_key: str) -> dict[str, str]:
+def _anthropic_base_url_from_openai(base_url: str) -> str:
+    """Claude Code talks Anthropic Messages API and appends /v1/messages.
+
+    ARC injects OpenAI-compatible OPENAI_BASE_URL (often .../v1). Strip a trailing
+    /v1 so we do not request .../v1/v1/messages. Keep the host/path otherwise.
+    """
+    u = (base_url or "").strip().rstrip("/")
+    if u.endswith("/v1"):
+        u = u[:-3].rstrip("/")
+    return u
+
+
+
+def _is_claude_builtin_model_alias(model: str) -> bool:
+    """True for Claude Code local allowlist aliases (sonnet/opus/haiku/...)."""
+    m = (model or "").strip().lower()
+    if not m:
+        return False
+    # Common Anthropic / Claude Code aliases and versioned ids.
+    builtins = {
+        "sonnet", "opus", "haiku", "claude",
+        "claude-sonnet-4", "claude-opus-4", "claude-haiku-4",
+        "claude-3-5-sonnet", "claude-3-5-haiku", "claude-3-opus",
+        "claude-3-sonnet", "claude-3-haiku",
+    }
+    if m in builtins:
+        return True
+    return m.startswith("claude-")
+
+
+def claude_cli_model(*, model: str, using_proxy: bool) -> str:
+    """Model string passed to `claude --model`.
+
+    Proxy path historically used `sonnet` and remapped upstream.
+    Official/no-proxy path must also avoid raw contest ids like deepseek-v4-flash:
+    Claude Code 2.1 emits unrecognized_model locally before any API call.
+    Contest MODEL is applied via ANTHROPIC_DEFAULT_*_MODEL in apply_official_claude_env.
+    """
+    if using_proxy:
+        return "sonnet"
+    if _is_claude_builtin_model_alias(model):
+        return model
+    return "sonnet"
+
+def apply_official_claude_env(
+    env: dict[str, str],
+    *,
+    base_url: str,
+    api_key: str,
+    model: str = "",
+) -> dict[str, str]:
     """Map ARC-injected OPENAI_* into Claude env the same way as the official CC starter.
 
     Official starter (`claude_env_from_openai_env`):
       ANTHROPIC_API_KEY = ""
-      ANTHROPIC_BASE_URL = OPENAI_BASE_URL (when set)
+      ANTHROPIC_BASE_URL = OPENAI_BASE_URL (when set; trailing /v1 stripped)
       ANTHROPIC_AUTH_TOKEN = OPENAI_API_KEY (when set)
     No production protocol proxy. Raw MODEL is passed via --model.
+
+    Extra (needed for Claude Code 2.1+ with non-Anthropic contest models such as
+    deepseek-v4-flash; matches DeepSeek/OpenRouter CC gateway guidance):
+      ANTHROPIC_MODEL / ANTHROPIC_DEFAULT_{OPUS,SONNET,HAIKU}_MODEL / CLAUDE_CODE_SUBAGENT_MODEL
+      CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1
+    Without these, CC emits unrecognized_model locally (duration_api_ms=0) before any
+    upstream call — the failure mode Smoke v5j hit with anthropic_proxy=false.
     """
     out = env.copy()
     # Prefer auth-token mapping; empty API key so Claude Code does not prefer a stale key.
     out["ANTHROPIC_API_KEY"] = ""
     if base_url:
-        out["ANTHROPIC_BASE_URL"] = base_url
+        out["ANTHROPIC_BASE_URL"] = _anthropic_base_url_from_openai(base_url)
     else:
         out.pop("ANTHROPIC_BASE_URL", None)
     if api_key:
         out["ANTHROPIC_AUTH_TOKEN"] = api_key
     else:
         out.pop("ANTHROPIC_AUTH_TOKEN", None)
+    model = (model or "").strip()
+    if model:
+        out["ANTHROPIC_MODEL"] = model
+        out["ANTHROPIC_DEFAULT_OPUS_MODEL"] = model
+        out["ANTHROPIC_DEFAULT_SONNET_MODEL"] = model
+        out["ANTHROPIC_DEFAULT_HAIKU_MODEL"] = model
+        out["CLAUDE_CODE_SUBAGENT_MODEL"] = model
+    # Allow non-Anthropic model ids through Claude Code's local allowlist.
+    out["CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY"] = "1"
     for stale in (
         "ANTHROPIC_API_KEY_OLD",
         "CLAUDE_CODE_API_KEY",
@@ -519,6 +587,87 @@ def execute_with_retry(
         sleep_fn(delay)
     assert last_result is not None
     return last_result, total_attempts
+
+
+
+def run_claude_via_sdk(
+    *,
+    prompt: str,
+    output_dir: Path,
+    model: str,
+    claude_bin: Path | None,
+    gsc_dir: Path | None,
+    mcp_config: Path | None,
+    enable_mcp: bool,
+    attempt_env: dict[str, str],
+    skills_dir: Path | None,
+    max_budget_usd: str | float | None,
+) -> ClaudeRunResult:
+    """Primary contest driver: official ClaudeSDKClient (no CLI -p primary path)."""
+    plugins = sdk_driver.gsc_plugins(gsc_dir)
+    mcp_servers = sdk_driver.gsc_mcp_servers(
+        gsc_dir=gsc_dir, mcp_config=mcp_config, enable_mcp=enable_mcp
+    )
+    budget = None
+    if max_budget_usd not in (None, ""):
+        try:
+            budget = float(max_budget_usd)
+        except (TypeError, ValueError):
+            budget = None
+    # Ensure OPENAI_* visible to claude_env_from_openai_env inside the turn.
+    prev = {k: os.environ.get(k) for k in ("OPENAI_API_KEY", "OPENAI_BASE_URL", "MODEL")}
+    try:
+        if attempt_env.get("OPENAI_API_KEY"):
+            os.environ["OPENAI_API_KEY"] = attempt_env["OPENAI_API_KEY"]
+        if attempt_env.get("OPENAI_BASE_URL"):
+            os.environ["OPENAI_BASE_URL"] = attempt_env["OPENAI_BASE_URL"]
+        os.environ["MODEL"] = model
+        # Propagate HOME/GSC/PATH and related into SDK subprocess env.
+        sdk_env = {k: v for k, v in attempt_env.items() if isinstance(v, str)}
+        options = sdk_driver.build_agent_options(
+            cwd=output_dir,
+            model=model,
+            mcp_servers=mcp_servers,
+            plugins=plugins,
+            cli_path=claude_bin,
+            env=sdk_env,
+            system_prompt_append=sdk_driver.contest_system_prompt_append(skills_dir),
+            max_budget_usd=budget,
+            permission_mode="acceptEdits",
+        )
+        print(
+            json.dumps(
+                {
+                    "event": "sdk_turn_start",
+                    "driver": "ClaudeSDKClient",
+                    "model": model,
+                    "permission_mode": "acceptEdits",
+                    "mcp_enabled": enable_mcp,
+                    "mcp_servers": str(mcp_servers) if mcp_servers is not None else None,
+                    "plugins": plugins,
+                    "cli_path": str(claude_bin) if claude_bin else None,
+                },
+                ensure_ascii=False,
+            ),
+            flush=True,
+        )
+        turn = sdk_driver.run_sdk_turn(prompt=prompt, options=options, apply_openai_env=True)
+    finally:
+        for k, v in prev.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+    return ClaudeRunResult(
+        returncode=turn.returncode,
+        is_error=turn.is_error,
+        terminal_reason=turn.terminal_reason,
+        subtype=turn.subtype,
+        api_error_status=turn.api_error_status,
+        tail=turn.tail,
+        skills_loaded=turn.skills_loaded,
+        mcp_tools_used=turn.mcp_tools_used,
+    )
 
 
 def run_claude_streaming(
@@ -1960,26 +2109,15 @@ def main() -> int:
     env["MCP_TIMEOUT"] = str(mcp_timeout_ms)
     env["PATH"] = os.pathsep.join([str(gsc_dir / "bin"), str(gsc_dir / "lsp" / "web" / "node_modules" / ".bin"), env.get("PATH", "")])
 
-    # Contest default: official OPENAI_* → ANTHROPIC_* mapping (no proxy).
-    # Local ARC-like smoke may set ARC_ENABLE_ANTHROPIC_PROXY=1 + ARC_DISABLE_ANTHROPIC_PROXY=0.
-    gateway_proc = _arc_maybe_start_anthropic_proxy(base_url, api_key, model)
-    if gateway_proc is not None:
-        claude_env = env.copy()
-        claude_env["ANTHROPIC_BASE_URL"] = "http://127.0.0.1:8787"
-        claude_env["ANTHROPIC_API_KEY"] = "arc-local"
-        for _k in ("ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY_OLD", "CLAUDE_CODE_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN"):
-            claude_env.pop(_k, None)
-    else:
-        claude_env = apply_official_claude_env(env, base_url=base_url, api_key=api_key)
-    if gateway_proc is not None:
-        def _stop_gateway(proc=gateway_proc):
-            if proc.poll() is None:
-                proc.terminate()
-                try:
-                    proc.wait(timeout=5)
-                except Exception:
-                    proc.kill()
-        atexit.register(_stop_gateway)
+    # Contest primary driver: ClaudeSDKClient + official OPENAI_* → ANTHROPIC_* mapping.
+    # Production MUST NOT start anthropic-proxy. Local-only proxy helper remains unused here.
+    gateway_proc = None
+    claude_env = apply_official_claude_env(env, base_url=base_url, api_key=api_key, model=model)
+    # Official starter sets ANTHROPIC_BASE_URL = OPENAI_BASE_URL as-is (no /v1 strip).
+    claude_env["ANTHROPIC_API_KEY"] = ""
+    claude_env["ANTHROPIC_BASE_URL"] = base_url
+    if api_key:
+        claude_env["ANTHROPIC_AUTH_TOKEN"] = api_key
     for key in ("SUDO_USER", "SUDO_UID", "SUDO_GID"):
         claude_env.pop(key, None)
     if identity is not None:
@@ -1997,6 +2135,32 @@ def main() -> int:
     base_urls = configured_base_urls(base_url)
     host = upstream_host(base_urls[0])
 
+    sdk_plugins = sdk_driver.gsc_plugins(gsc_dir)
+    print(
+        json.dumps(
+            {
+                "event": "official_claude_env",
+                "driver": "ClaudeSDKClient",
+                "anthropic_base_url": claude_env.get("ANTHROPIC_BASE_URL"),
+                "anthropic_api_key_empty": claude_env.get("ANTHROPIC_API_KEY") == "",
+                "anthropic_auth_token_set": bool(claude_env.get("ANTHROPIC_AUTH_TOKEN")),
+                "anthropic_model": claude_env.get("ANTHROPIC_MODEL"),
+                "gateway_model_discovery": claude_env.get("CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY"),
+                "contest_model": model,
+                "sdk_model": model,
+                "permission_mode": "acceptEdits",
+                "anthropic_proxy": False,
+                "gsc_plugins": sdk_plugins,
+                "gsc_plugin_note": (
+                    None
+                    if sdk_plugins
+                    else "GSC plugin attach via SDK plugins may be unavailable; MCP stays ON via mcp_servers"
+                ),
+            },
+            ensure_ascii=False,
+        ),
+        flush=True,
+    )
     print(
         json.dumps(
             {
@@ -2013,11 +2177,14 @@ def main() -> int:
                 "mcp_enabled": enable_mcp,
                 "mcp_config": str(mcp_config_path) if mcp_config_path else None,
                 "mcp_timeout_ms": mcp_timeout_ms,
-                "anthropic_proxy": gateway_proc is not None,
+                "anthropic_proxy": False,
+                "driver": "ClaudeSDKClient",
+                "permission_mode": "acceptEdits",
                 "mcp_allowed_tools": gsc_mcp_allowed_tools() if enable_mcp else [],
                 "step_loop": [s.step_id for s in OFFICIAL_STEPS],
                 "step_required_skills": {s.step_id: list(s.required_skills) for s in OFFICIAL_STEPS},
                 "thrash_mitigations": [
+                    "ClaudeSDKClient_official_driver",
                     "spawn_gate_off",
                     "disallow_Agent_Task_and_bloat_builtins",
                     "Skill_allowed_for_STEP_force_load",
@@ -2028,6 +2195,7 @@ def main() -> int:
                     "autocompact_200000",
                     "rapid_refill_retryable_capped",
                     "official_step_loop_fail_closed",
+                    "no_production_anthropic_proxy",
                 ],
             },
             ensure_ascii=False,
@@ -2100,7 +2268,7 @@ def main() -> int:
                     str(gsc_dir),
                     *claude_mcp_cli_args(enabled=enable_mcp, mcp_config=mcp_config_path),
                     "--model",
-                    ("sonnet" if gateway_proc is not None else model),
+                    claude_cli_model(model=model, using_proxy=gateway_proc is not None),
                     # Keep MCP ON; WaitForMcpServers NOT banned.
                     # Skill allowed so each STEP can FORCE-LOAD its required skills.
                     "--disallowedTools",
@@ -2125,7 +2293,7 @@ def main() -> int:
                 attempt_env = claude_env.copy()
                 if gateway_proc is None:
                     attempt_env = apply_official_claude_env(
-                        attempt_env, base_url=attempt_base_url, api_key=api_key
+                        attempt_env, base_url=attempt_base_url, api_key=api_key, model=model
                     )
                 return command, attempt_env
 
@@ -2176,7 +2344,21 @@ def main() -> int:
                                 validation_failure=_repair,
                                 validation_repair=_vrep,
                             )
-                            command, attempt_env = build_claude_command(prompt, attempt)
+                            attempt_base_url = base_url_for_attempt(base_urls, attempt)
+                            attempt_env = claude_env.copy()
+                            # Keep OPENAI_* aligned for official claude_env_from_openai_env.
+                            attempt_env["OPENAI_API_KEY"] = api_key
+                            attempt_env["OPENAI_BASE_URL"] = attempt_base_url
+                            attempt_env["MODEL"] = model
+                            # Also mirror official ANTHROPIC_* into subprocess env (SDK merges options.env).
+                            attempt_env = apply_official_claude_env(
+                                attempt_env, base_url=attempt_base_url, api_key=api_key, model=model
+                            )
+                            # Official mapping: ANTHROPIC_BASE_URL = OPENAI_BASE_URL as-is (no /v1 strip).
+                            attempt_env["ANTHROPIC_API_KEY"] = ""
+                            attempt_env["ANTHROPIC_BASE_URL"] = attempt_base_url
+                            if api_key:
+                                attempt_env["ANTHROPIC_AUTH_TOKEN"] = api_key
                             print(
                                 json.dumps(
                                     {
@@ -2188,16 +2370,23 @@ def main() -> int:
                                         "attempt": attempt,
                                         "prior_failure": _prior_ref(),
                                         "validation_repair": _vrep,
+                                        "driver": "ClaudeSDKClient",
                                     },
                                     ensure_ascii=False,
                                 ),
                                 flush=True,
                             )
-                            return run_claude_streaming(
-                                command,
-                                cwd=output_dir,
-                                env=attempt_env,
-                                preexec_fn=privilege_dropper(identity),
+                            return run_claude_via_sdk(
+                                prompt=prompt,
+                                output_dir=output_dir,
+                                model=model,
+                                claude_bin=claude_bin,
+                                gsc_dir=gsc_dir,
+                                mcp_config=mcp_config_path,
+                                enable_mcp=enable_mcp,
+                                attempt_env=attempt_env,
+                                skills_dir=skills_dir,
+                                max_budget_usd=max_budget_usd,
                             )
 
                         result, api_attempts = execute_with_retry(
