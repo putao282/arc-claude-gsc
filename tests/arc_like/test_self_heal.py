@@ -226,6 +226,73 @@ class SelfHealTests(unittest.TestCase):
         self.assertEqual(calls["n"], 2)
         self.assertEqual(result.terminal_reason, "rapid_refill_breaker")
 
+    def test_rapid_refill_classifies_as_needs_degrade(self):
+        result = mod.ClaudeRunResult(
+            returncode=1,
+            is_error=True,
+            terminal_reason="rapid_refill_breaker",
+            subtype="success",
+            api_error_status=None,
+            tail="autocompact is thrashing: rapid_refill",
+        )
+        clf = mod.classify_claude_failure(result)
+        self.assertTrue(clf.retryable)
+        self.assertEqual(clf.reason, "retryable:rapid_refill_needs_degrade")
+
+    def test_rapid_refill_retry_arms_degrade_without_disabling_breaker(self):
+        calls = []
+        degrade_flags = []
+
+        def run_attempt(attempt):
+            calls.append(attempt)
+            # Simulate harness: attempt>=2 would be degrade_mode True after on_retry
+            degrade_flags.append(attempt > 1)
+            return mod.ClaudeRunResult(
+                returncode=1,
+                is_error=True,
+                terminal_reason="rapid_refill_breaker",
+                subtype="success",
+                api_error_status=None,
+                tail="rapid_refill",
+            )
+
+        armed = {"degrade": False}
+
+        def on_retry(attempt, result, classification, delay):
+            if "rapid_refill" in classification.reason:
+                armed["degrade"] = True
+
+        old = mod.os.environ.get("ARC_RAPID_REFILL_MAX_ATTEMPTS")
+        try:
+            mod.os.environ["ARC_RAPID_REFILL_MAX_ATTEMPTS"] = "2"
+            result, attempts = mod.execute_with_retry(
+                run_attempt,
+                max_retries=5,
+                base_seconds=0,
+                max_seconds=0,
+                on_retry=on_retry,
+                sleep_fn=lambda _s: None,
+            )
+        finally:
+            if old is None:
+                mod.os.environ.pop("ARC_RAPID_REFILL_MAX_ATTEMPTS", None)
+            else:
+                mod.os.environ["ARC_RAPID_REFILL_MAX_ATTEMPTS"] = old
+        self.assertEqual(attempts, 2)
+        self.assertEqual(calls, [1, 2])
+        self.assertTrue(armed["degrade"])
+        # Cap still enforced (not full max_retries+1)
+        self.assertLess(attempts, 6)
+        # Disallowed regenerate uses narrower allow for implement
+        deny_full = mod.gsc_mcp_disallowed_tool_names(prefixed=False)
+        deny_deg = mod.gsc_mcp_disallowed_tool_names(
+            prefixed=False, allow_override=list(mod.IMPLEMENT_DEGRADED_MCP_ALLOW)
+        )
+        self.assertGreater(len(deny_deg), len(deny_full) - 5)  # narrower allow → more denied
+        for keep in mod.IMPLEMENT_DEGRADED_MCP_ALLOW:
+            self.assertNotIn(keep, deny_deg)
+        self.assertIn("DEGRADED MODE", mod.DEGRADED_SYSTEM_APPEND)
+
 
 if __name__ == "__main__":
     unittest.main()

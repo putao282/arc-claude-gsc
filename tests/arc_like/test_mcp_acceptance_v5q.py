@@ -51,7 +51,7 @@ def _module(node_id="REQ-1", name="Demo"):
     )
 
 
-def _result(*, skills=("architect",), mcp=(), returncode=0):
+def _result(*, skills=("architect",), mcp=(), returncode=0, writes=(), step_started_at=None):
     return mod.ClaudeRunResult(
         returncode=returncode,
         is_error=False,
@@ -61,6 +61,8 @@ def _result(*, skills=("architect",), mcp=(), returncode=0):
         tail="",
         skills_loaded=tuple(skills),
         mcp_tools_used=tuple(mcp),
+        builtin_writes=tuple(writes),
+        step_started_at=step_started_at,
     )
 
 
@@ -103,11 +105,85 @@ class McpAcceptanceV5qTests(unittest.TestCase):
             )
             self.assertFalse(acc.ok)
             self.assertIn("search_code", acc.reason)
+            # search_code alone without in-STEP write progress must fail (v5x G1)
             acc2 = mod.evaluate_step_acceptance(
                 root, _module(), _step("implement"),
                 _result(skills=("arcbench-checkpoint",), mcp=("mcp__arch__search_code",)),
             )
-            self.assertTrue(acc2.ok)
+            self.assertFalse(acc2.ok)
+            self.assertIn("write progress", acc2.reason.lower())
+            # Write|Edit business path + search_code → pass
+            acc3 = mod.evaluate_step_acceptance(
+                root, _module(), _step("implement"),
+                _result(
+                    skills=("arcbench-checkpoint",),
+                    mcp=("mcp__arch__search_code",),
+                    writes=("frontend/src/app.ts",),
+                ),
+            )
+            self.assertTrue(acc3.ok)
+
+    def test_implement_leftover_pages_plus_search_code_fails(self):
+        """G1: pages leftover files + search_code alone must NOT pass."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            page = root / "frontend" / "src" / "pages" / "Home.tsx"
+            page.parent.mkdir(parents=True)
+            page.write_text("export default function Home(){return <div/>}\n" + ("// pad\n" * 10), encoding="utf-8")
+            acc = mod.evaluate_step_acceptance(
+                root, _module(), _step("implement"),
+                _result(skills=("arcbench-checkpoint",), mcp=("mcp__arch__search_code",)),
+            )
+            self.assertFalse(acc.ok)
+            self.assertIn("write progress", acc.reason.lower())
+
+    def test_implement_write_plus_search_code_passes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            src = root / "frontend" / "src" / "app.ts"
+            src.parent.mkdir(parents=True)
+            src.write_text("export const x = 1;\n" + ("// pad\n" * 10), encoding="utf-8")
+            acc = mod.evaluate_step_acceptance(
+                root, _module(), _step("implement"),
+                _result(
+                    skills=("arcbench-checkpoint",),
+                    mcp=("mcp__arch__search_code",),
+                    writes=(str(src),),
+                ),
+            )
+            self.assertTrue(acc.ok)
+
+    def test_implement_json_files_written_mtime_gate(self):
+        import time
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            src = root / "backend" / "src" / "server.ts"
+            src.parent.mkdir(parents=True)
+            step_start = time.time()
+            time.sleep(0.05)
+            src.write_text("export const server = 1;\n" + ("// pad\n" * 10), encoding="utf-8")
+            sdir = root / ".arc" / "steps" / "REQ-1"
+            sdir.mkdir(parents=True)
+            (sdir / "search_code.json").write_text('{"hits":["server"]}\n', encoding="utf-8")
+            (sdir / "implement.json").write_text(
+                json.dumps({"files_written": ["backend/src/server.ts"], "step_id": "implement"}),
+                encoding="utf-8",
+            )
+            # Old mtime (before step_start) → fail
+            import os
+            os.utime(src, (step_start - 120, step_start - 120))
+            acc_old = mod.evaluate_step_acceptance(
+                root, _module(), _step("implement"),
+                _result(skills=("arcbench-checkpoint",), mcp=(), step_started_at=step_start),
+            )
+            self.assertFalse(acc_old.ok)
+            # Fresh mtime ≥ step_start → pass
+            os.utime(src, None)
+            acc_new = mod.evaluate_step_acceptance(
+                root, _module(), _step("implement"),
+                _result(skills=("arcbench-checkpoint",), mcp=(), step_started_at=step_start),
+            )
+            self.assertTrue(acc_new.ok)
 
     def test_implement_accepts_search_code_receipt_file(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -118,11 +194,24 @@ class McpAcceptanceV5qTests(unittest.TestCase):
             sdir = root / ".arc" / "steps" / "REQ-1"
             sdir.mkdir(parents=True)
             (sdir / "search_code.json").write_text('{"hits":["App"]}\n', encoding="utf-8")
+            # receipt alone without write progress fails
             acc = mod.evaluate_step_acceptance(
                 root, _module(), _step("implement"),
                 _result(skills=("arcbench-checkpoint",), mcp=()),
             )
-            self.assertTrue(acc.ok)
+            self.assertFalse(acc.ok)
+            acc2 = mod.evaluate_step_acceptance(
+                root, _module(), _step("implement"),
+                _result(skills=("arcbench-checkpoint",), mcp=(), writes=("frontend/src/app.ts",)),
+            )
+            self.assertTrue(acc2.ok)
+
+    def test_implement_step_prompt_mentions_write_gate(self):
+        prompt = mod.step_prompt(
+            _module(), Path("/tmp/req"), None, [], "web", _step("implement")
+        )
+        self.assertIn("WRITE PROGRESS HARD GATE", prompt)
+        self.assertIn("frontend/src", prompt)
 
     def test_govern_requires_both_govern_tools(self):
         with tempfile.TemporaryDirectory() as tmp:

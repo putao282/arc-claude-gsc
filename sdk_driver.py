@@ -75,6 +75,17 @@ MCP_THRASH_WATCH_SUFFIXES = (
 )
 MCP_THRASH_SOFT_LIMIT = 2  # identical fingerprint
 MCP_THRASH_HARD_LIMIT = 3
+# Optional: consecutive builtin Read with no Write/Edit on implement/spec → deny further Read.
+READ_ONLY_STREAK_LIMIT = 8
+READ_STREAK_STEPS = frozenset({"implement", "spec"})
+THRASH_DENY_ADVICE = (
+    "Do NOT re-call the same MCP read with identical args. "
+    "Use the prior payload; call write/govern next; then STOP this STEP."
+)
+READ_STREAK_DENY_ADVICE = (
+    "Read-only streak on this STEP — stop re-reading. "
+    "You MUST Write or Edit business paths under frontend|backend|src now."
+)
 
 
 def max_turns_for_step(step_id: str | None, *, default: int | None = None) -> int:
@@ -113,18 +124,24 @@ def _is_thrash_watched_mcp(name: str) -> bool:
 
 
 class McpThrashGuard:
-    """Count identical MCP read fingerprints; log soft/hard thrash (v5r)."""
+    """Count identical MCP read fingerprints; log soft/hard thrash; enforce via PreToolUse (v5x)."""
 
     def __init__(
         self,
         *,
         soft_limit: int = MCP_THRASH_SOFT_LIMIT,
         hard_limit: int = MCP_THRASH_HARD_LIMIT,
+        read_streak_limit: int = READ_ONLY_STREAK_LIMIT,
+        step_id: str | None = None,
     ) -> None:
         self.soft_limit = max(1, int(soft_limit))
         self.hard_limit = max(self.soft_limit, int(hard_limit))
+        self.read_streak_limit = max(1, int(read_streak_limit))
+        self.step_id = (step_id or "").strip() or None
         self._counts: dict[str, int] = {}
         self.events: list[dict[str, Any]] = []
+        self._read_streak = 0
+        self.deny_events: list[dict[str, Any]] = []
 
     def note(self, name: str, inp: dict[str, Any] | None) -> dict[str, Any] | None:
         if not _is_thrash_watched_mcp(name):
@@ -149,18 +166,115 @@ class McpThrashGuard:
             "soft_limit": self.soft_limit,
             "hard_limit": self.hard_limit,
             "fingerprint": fp[:240],
-            "advice": (
-                "Do NOT re-call the same MCP read with identical args. "
-                "Use the prior payload; call write/govern next; then STOP this STEP."
-            ),
+            "advice": THRASH_DENY_ADVICE,
         }
         self.events.append(event)
+        print(json.dumps(event, ensure_ascii=False), flush=True)
+        return event
+
+    def identical_count(self, name: str, inp: dict[str, Any] | None) -> int:
+        if not _is_thrash_watched_mcp(name):
+            return 0
+        return int(self._counts.get(_mcp_tool_fingerprint(name, inp), 0))
+
+    def should_deny_identical_mcp(self, name: str, inp: dict[str, Any] | None) -> bool:
+        """True when identical fingerprint count has reached hard_limit (deny this call)."""
+        return self.identical_count(name, inp) >= self.hard_limit
+
+    def note_builtin_tool(self, name: str) -> dict[str, Any] | None:
+        """Track Read-only streak; return deny event dict when streak limit hit."""
+        if name in ("Write", "Edit"):
+            self._read_streak = 0
+            return None
+        if name != "Read":
+            return None
+        if self.step_id not in READ_STREAK_STEPS:
+            return None
+        self._read_streak += 1
+        if self._read_streak < self.read_streak_limit:
+            return None
+        event = {
+            "event": "mcp_thrash_guard",
+            "level": "read_streak_deny",
+            "tool": name,
+            "identical_count": self._read_streak,
+            "soft_limit": self.soft_limit,
+            "hard_limit": self.hard_limit,
+            "read_streak_limit": self.read_streak_limit,
+            "step_id": self.step_id,
+            "fingerprint": f"Read|streak={self._read_streak}",
+            "advice": READ_STREAK_DENY_ADVICE,
+        }
+        self.events.append(event)
+        self.deny_events.append(event)
         print(json.dumps(event, ensure_ascii=False), flush=True)
         return event
 
     @property
     def thrash_hit(self) -> bool:
         return any(v >= self.hard_limit for v in self._counts.values())
+
+
+def _hook_deny(hook_event_name: str, reason: str) -> dict[str, Any]:
+    return {
+        "hookSpecificOutput": {
+            "hookEventName": hook_event_name or "PreToolUse",
+            "permissionDecision": "deny",
+            "permissionDecisionReason": reason,
+        }
+    }
+
+
+def build_thrash_pretool_hooks(
+    thrash_guard: McpThrashGuard,
+) -> dict[str, list[Any]]:
+    """ClaudeAgentOptions.hooks PreToolUse: identical MCP read ≥ hard_limit → deny.
+
+    Also optional Read-only streak deny on implement/spec. Keeps existing log events.
+    """
+
+    async def pre_tool_use(input_data: dict[str, Any], tool_use_id: str | None, context: Any) -> dict[str, Any]:
+        del tool_use_id, context
+        if not isinstance(input_data, dict):
+            return {}
+        event_name = str(input_data.get("hook_event_name") or "PreToolUse")
+        name = str(input_data.get("tool_name") or "")
+        raw_inp = input_data.get("tool_input")
+        inp = raw_inp if isinstance(raw_inp, dict) else {}
+
+        if name in ("Write", "Edit", "Read"):
+            streak_event = thrash_guard.note_builtin_tool(name)
+            if streak_event is not None and name == "Read":
+                return _hook_deny(event_name, streak_event.get("advice") or READ_STREAK_DENY_ADVICE)
+
+        if _is_thrash_watched_mcp(name):
+            # Increment + log soft/hard (same events as v5r observation path).
+            thrash_guard.note(name, inp)
+            if thrash_guard.should_deny_identical_mcp(name, inp):
+                deny_ev = {
+                    "event": "mcp_thrash_pretool_deny",
+                    "tool": name,
+                    "identical_count": thrash_guard.identical_count(name, inp),
+                    "hard_limit": thrash_guard.hard_limit,
+                    "advice": THRASH_DENY_ADVICE,
+                }
+                thrash_guard.deny_events.append(deny_ev)
+                print(json.dumps(deny_ev, ensure_ascii=False), flush=True)
+                return _hook_deny(event_name, THRASH_DENY_ADVICE)
+        return {}
+
+    try:
+        from claude_agent_sdk import HookMatcher  # type: ignore
+    except ImportError:
+        class HookMatcher:  # type: ignore
+            def __init__(self, matcher=None, hooks=None, timeout=None):
+                self.matcher = matcher
+                self.hooks = hooks or []
+                self.timeout = timeout
+
+    # Matcher covers watched MCP + Read/Write/Edit (Write/Edit reset streak).
+    matcher = r"^mcp__|^(Read|Write|Edit)$"
+    return {"PreToolUse": [HookMatcher(matcher=matcher, hooks=[pre_tool_use])]}
 
 
 @dataclass(frozen=True)
@@ -175,6 +289,7 @@ class SdkTurnResult:
     tail: str
     skills_loaded: tuple[str, ...] = ()
     mcp_tools_used: tuple[str, ...] = ()
+    builtin_writes: tuple[str, ...] = ()
     driver: str = "ClaudeSDKClient"
 
 
@@ -351,11 +466,16 @@ def build_agent_options(
     max_budget_usd: float | None = None,
     permission_mode: str = "acceptEdits",
     extra_disallowed_tools: list[str] | None = None,
+    step_id: str | None = None,
+    thrash_guard: McpThrashGuard | None = None,
+    hooks: dict[str, list[Any]] | None = None,
 ) -> Any:
     """ClaudeAgentOptions mirroring the official starter, plus MCP/GSC.
 
     extra_disallowed_tools: typically mcp__arch__* names = inventory − allowlist
     so init schema surface shrinks even when plugin MCP advertises ~70 tools.
+
+    hooks: when None, wire PreToolUse thrash deny (v5x G2) via thrash_guard.
     """
     ClaudeAgentOptions, *_ = _require_claude_sdk()
     disallowed = list(DEFAULT_DISALLOWED_TOOLS)
@@ -363,6 +483,10 @@ def build_agent_options(
         for name in extra_disallowed_tools:
             if name and name not in disallowed:
                 disallowed.append(name)
+    guard = thrash_guard if thrash_guard is not None else McpThrashGuard(step_id=step_id)
+    if thrash_guard is not None and step_id and not thrash_guard.step_id:
+        thrash_guard.step_id = (step_id or "").strip() or None
+    wired_hooks = hooks if hooks is not None else build_thrash_pretool_hooks(guard)
     options_kwargs: dict[str, Any] = {
         "cwd": str(cwd),
         "allowed_tools": list(DEFAULT_ALLOWED_TOOLS),
@@ -378,6 +502,7 @@ def build_agent_options(
             "no-session-persistence": None,
             "autocompact": "200000",
         },
+        "hooks": wired_hooks,
     }
     model = (model or "").strip()
     if model:
@@ -400,7 +525,13 @@ def build_agent_options(
         options_kwargs["env"] = dict(env)
     if max_budget_usd is not None:
         options_kwargs["max_budget_usd"] = float(max_budget_usd)
-    return ClaudeAgentOptions(**options_kwargs)
+    options = ClaudeAgentOptions(**options_kwargs)
+    # Stash guard for run_sdk_turn_async so logging + deny share one counter.
+    try:
+        setattr(options, "_arc_thrash_guard", guard)
+    except Exception:
+        pass
+    return options
 
 
 def contest_system_prompt_append(skills_dir: Path | None) -> str:
@@ -429,7 +560,17 @@ def _note_tool_use(
     skill_loads: list[str],
     mcp_tool_counts: dict[str, int],
     thrash_guard: McpThrashGuard | None = None,
+    builtin_writes: list[str] | None = None,
+    thrash_via_hooks: bool = False,
 ) -> None:
+    if name in ("Write", "Edit") and builtin_writes is not None:
+        path = ""
+        if isinstance(inp, dict):
+            path = str(inp.get("file_path") or inp.get("path") or "").strip()
+        if path:
+            builtin_writes.append(path)
+        if thrash_guard is not None and not thrash_via_hooks:
+            thrash_guard.note_builtin_tool(name)
     if name.startswith("mcp__"):
         mcp_tool_counts[name] = mcp_tool_counts.get(name, 0) + 1
         print(
@@ -439,7 +580,8 @@ def _note_tool_use(
             ),
             flush=True,
         )
-        if thrash_guard is not None:
+        # When PreToolUse hooks own thrash counting, skip note() here to avoid double-count.
+        if thrash_guard is not None and not thrash_via_hooks:
             thrash_guard.note(name, inp if isinstance(inp, dict) else {})
         return
     if name == "Skill":
@@ -487,7 +629,12 @@ async def run_sdk_turn_async(
 
     skill_loads: list[str] = []
     mcp_tool_counts: dict[str, int] = {}
-    thrash_guard = McpThrashGuard()
+    builtin_writes: list[str] = []
+    thrash_guard = getattr(options, "_arc_thrash_guard", None)
+    if thrash_guard is None:
+        thrash_guard = McpThrashGuard()
+    # Hooks already wired in build_agent_options share this guard — avoid double-count.
+    thrash_via_hooks = bool(getattr(options, "hooks", None))
     tail_parts: list[str] = []
     result_msg: Any = None
 
@@ -521,6 +668,8 @@ async def run_sdk_turn_async(
                                 skill_loads=skill_loads,
                                 mcp_tool_counts=mcp_tool_counts,
                                 thrash_guard=thrash_guard,
+                                builtin_writes=builtin_writes,
+                                thrash_via_hooks=thrash_via_hooks,
                             )
                     continue
 
@@ -585,6 +734,7 @@ async def run_sdk_turn_async(
                         tail="\n".join(tail_parts)[-8000:],
                         skills_loaded=tuple(dict.fromkeys(skill_loads)),
                         mcp_tools_used=tuple(sorted(mcp_tool_counts.keys())),
+                        builtin_writes=tuple(dict.fromkeys(builtin_writes)),
                     )
 
     # No ResultMessage — treat as failure.
@@ -597,6 +747,7 @@ async def run_sdk_turn_async(
         tail="\n".join(tail_parts)[-8000:],
         skills_loaded=tuple(dict.fromkeys(skill_loads)),
         mcp_tools_used=tuple(sorted(mcp_tool_counts.keys())),
+        builtin_writes=tuple(dict.fromkeys(builtin_writes)),
     )
 
 

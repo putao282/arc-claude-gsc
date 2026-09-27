@@ -49,12 +49,19 @@ def _install_stubs() -> None:
         class ToolUseBlock:
             pass
 
+        class HookMatcher:
+            def __init__(self, matcher=None, hooks=None, timeout=None):
+                self.matcher = matcher
+                self.hooks = hooks or []
+                self.timeout = timeout
+
         mod.ClaudeAgentOptions = ClaudeAgentOptions
         mod.ClaudeSDKClient = ClaudeSDKClient
         mod.ResultMessage = ResultMessage
         mod.AssistantMessage = AssistantMessage
         mod.SystemMessage = SystemMessage
         mod.ToolUseBlock = ToolUseBlock
+        mod.HookMatcher = HookMatcher
         sys.modules["claude_agent_sdk"] = mod
 
 
@@ -189,6 +196,87 @@ class MaxTurnsAndThrashTests(unittest.TestCase):
         self.assertIn("do not Read/Bash/cat SKILL.md", txt)
         self.assertNotIn("otherwise Read/Bash", txt)
 
+
+
+class PreToolUseThrashDenyTests(unittest.TestCase):
+    def test_build_options_wires_pretooluse_hooks(self):
+        opts = sdk.build_agent_options(cwd="/tmp/out", model="sonnet", step_id="implement")
+        self.assertTrue(hasattr(opts, "hooks"))
+        self.assertIn("PreToolUse", opts.hooks)
+        self.assertTrue(opts.hooks["PreToolUse"])
+        guard = getattr(opts, "_arc_thrash_guard", None)
+        self.assertIsNotNone(guard)
+        self.assertEqual(guard.step_id, "implement")
+
+    def test_identical_mcp_read_denied_at_hard_limit(self):
+        import asyncio
+
+        guard = sdk.McpThrashGuard(soft_limit=2, hard_limit=3, step_id="spec")
+        hooks = sdk.build_thrash_pretool_hooks(guard)
+        matcher = hooks["PreToolUse"][0]
+        cb = matcher.hooks[0]
+        inp = {"path": "SPEC/arcbench/REQ-1.html"}
+
+        async def call(n):
+            return await cb(
+                {
+                    "hook_event_name": "PreToolUse",
+                    "tool_name": "mcp__arch__spec_read",
+                    "tool_input": inp,
+                },
+                None,
+                None,
+            )
+
+        async def run():
+            outs = []
+            for _ in range(4):
+                outs.append(await call(_))
+            return outs
+
+        outs = asyncio.run(run())
+        # First two under hard_limit: allow (empty / no deny)
+        for o in outs[:2]:
+            decision = (o.get("hookSpecificOutput") or {}).get("permissionDecision")
+            self.assertNotEqual(decision, "deny")
+        # 3rd reaches hard_limit → deny
+        self.assertEqual(outs[2]["hookSpecificOutput"]["permissionDecision"], "deny")
+        self.assertIn("identical", outs[2]["hookSpecificOutput"]["permissionDecisionReason"].lower())
+        # 4th also deny
+        self.assertEqual(outs[3]["hookSpecificOutput"]["permissionDecision"], "deny")
+        self.assertTrue(guard.deny_events)
+        # Soft/hard log events still recorded
+        levels = [e.get("level") for e in guard.events]
+        self.assertIn("soft", levels)
+        self.assertIn("hard", levels)
+
+    def test_read_streak_deny_on_implement(self):
+        import asyncio
+
+        guard = sdk.McpThrashGuard(
+            soft_limit=2, hard_limit=3, read_streak_limit=3, step_id="implement"
+        )
+        hooks = sdk.build_thrash_pretool_hooks(guard)
+        cb = hooks["PreToolUse"][0].hooks[0]
+
+        async def read_once():
+            return await cb(
+                {"hook_event_name": "PreToolUse", "tool_name": "Read", "tool_input": {"file_path": "x"}},
+                None,
+                None,
+            )
+
+        async def run():
+            outs = []
+            for _ in range(3):
+                outs.append(await read_once())
+            return outs
+
+        outs = asyncio.run(run())
+        self.assertNotEqual((outs[0].get("hookSpecificOutput") or {}).get("permissionDecision"), "deny")
+        self.assertNotEqual((outs[1].get("hookSpecificOutput") or {}).get("permissionDecision"), "deny")
+        self.assertEqual(outs[2]["hookSpecificOutput"]["permissionDecision"], "deny")
+        self.assertIn("Write", outs[2]["hookSpecificOutput"]["permissionDecisionReason"])
 
 
 if __name__ == "__main__":

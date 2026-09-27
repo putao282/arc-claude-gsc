@@ -56,6 +56,10 @@ class ClaudeRunResult:
     tail: str
     skills_loaded: tuple[str, ...] = ()
     mcp_tools_used: tuple[str, ...] = ()
+    # v5x G1: in-STEP Write|Edit paths observed by SDK (business-path gate).
+    builtin_writes: tuple[str, ...] = ()
+    # Wall-clock epoch when this SDK/CLI attempt started (mtime ≥ step_start gate).
+    step_started_at: float | None = None
 
 
 @dataclass(frozen=True)
@@ -151,8 +155,15 @@ OFFICIAL_STEPS: tuple[StepDef, ...] = (
         step_id="implement",
         title="DEV implement (no mid-dev tests)",
         required_skills=("arcbench-checkpoint",),
-        goal="Implement remaining logic/API/UI wiring. Do NOT run tests continuously mid-development.",
-        exit_criteria="Implementation receipt + search_code MCP proof; no requirement to pass tests yet.",
+        goal=(
+            "Implement remaining logic/API/UI wiring with in-STEP Write/Edit progress "
+            "under frontend|backend|src. Do NOT run tests continuously mid-development."
+        ),
+        exit_criteria=(
+            "search_code MCP proof AND in-STEP write progress "
+            "(Write|Edit to frontend|backend|src ≥1, OR implement.json files_written "
+            "with mtime≥step_start). Leftover pages files + search_code alone do NOT pass."
+        ),
         forbid_mid_dev_tests=True,
     ),
     StepDef(
@@ -632,6 +643,85 @@ def gsc_mcp_allowed_tools() -> list[str]:
     return [t for t in tools if t not in GSC_MCP_NEVER_DEFAULT]
 
 
+# v5x G3: after rapid_refill, temporarily narrow implement MCP surface (MCP stays ON).
+IMPLEMENT_DEGRADED_MCP_ALLOW: tuple[str, ...] = (
+    "search_code",
+    "spec_read",
+    "state_read",
+    "artifact_read",
+    "artifact_grep",
+)
+
+DEGRADED_SYSTEM_APPEND = """
+DEGRADED MODE (rapid_refill self-heal — MCP stays ON; breaker still capped):
+- Immediately Write or Edit business code under frontend/ / backend/ / src/.
+- Do NOT re-call identical MCP reads (spec_read/state_read/artifact_read) with the same args.
+- Do NOT re-load the same Skill. At most one Skill invocation if needed, then Write.
+- Prefer: search_code once → Write skeleton → stop thrashing on reads.
+""".strip()
+
+
+def is_business_source_path(path: str | Path) -> bool:
+    """True when path targets app code under frontend|backend|src (not only pages leftover)."""
+    raw = str(path or "").replace("\\", "/")
+    parts = [p for p in raw.split("/") if p]
+    lowered = [p.lower() for p in parts]
+    for i, part in enumerate(lowered):
+        if part in {"frontend", "backend"} and i + 1 < len(lowered):
+            # frontend/src/... or backend/src/... or frontend/pages etc. — require src|pages|app|lib|components|api|server|routes
+            nxt = lowered[i + 1]
+            if nxt in {"src", "pages", "app", "lib", "components", "api", "server", "routes", "services"}:
+                return True
+            # also accept frontend/*.ts(x) top-level? Prefer src for gate.
+            if nxt.endswith((".ts", ".tsx", ".js", ".jsx", ".py")):
+                return True
+        if part == "src":
+            return True
+    return False
+
+
+def implement_write_progress(
+    output_dir: Path,
+    sdir: Path,
+    result: "ClaudeRunResult",
+) -> tuple[bool, str]:
+    """G1: in-STEP Write|Edit business paths OR implement.json files_written mtime≥step_start."""
+    for path in result.builtin_writes:
+        if is_business_source_path(path):
+            return True, f"in_session_write:{path}"
+    impl_receipt = sdir / "implement.json"
+    step_start = result.step_started_at
+    if impl_receipt.is_file() and impl_receipt.stat().st_size > 2:
+        try:
+            data = json.loads(impl_receipt.read_text(encoding="utf-8"))
+        except Exception:
+            data = {}
+        if isinstance(data, dict):
+            files = data.get("files_written") or data.get("written") or []
+            if isinstance(files, str):
+                files = [files]
+            if not isinstance(files, list):
+                files = []
+            for item in files:
+                rel = ""
+                if isinstance(item, str):
+                    rel = item
+                elif isinstance(item, dict):
+                    rel = str(item.get("path") or item.get("file") or "")
+                if not rel:
+                    continue
+                p = Path(rel)
+                if not p.is_absolute():
+                    p = output_dir / rel
+                if not is_business_source_path(str(p)):
+                    continue
+                if not p.is_file():
+                    continue
+                if step_start is None or p.stat().st_mtime >= float(step_start) - 1.0:
+                    return True, f"implement_json_mtime:{p}"
+    return False, "no_in_step_write_progress"
+
+
 def mcp_short_name(tool: str) -> str:
     """mcp__arch__prd -> prd; bare short names pass through."""
     if not tool:
@@ -644,13 +734,13 @@ def mcp_tools_matching(used: tuple[str, ...] | list[str], *shorts: str) -> list[
     return [t for t in used if mcp_short_name(t) in want]
 
 
-def gsc_mcp_disallowed_tool_names(*, prefixed: bool = True) -> list[str]:
+def gsc_mcp_disallowed_tool_names(*, prefixed: bool = True, allow_override: list[str] | tuple[str, ...] | None = None) -> list[str]:
     """Auto-generate disallowed = inventory − allowlist (plus never-default).
 
     Claude historically may still expose ~70 tools from plugin MCP even when
     allowedTools is set; --disallowedTools / SDK disallowed_tools strips schema.
     """
-    allowed = set(gsc_mcp_allowed_tools())
+    allowed = set(allow_override if allow_override is not None else gsc_mcp_allowed_tools())
     denied: list[str] = []
     for name in GSC_MCP_INVENTORY_SHORT_NAMES:
         if name in allowed and name not in GSC_MCP_NEVER_DEFAULT:
@@ -830,7 +920,11 @@ def classify_claude_failure(result: ClaudeRunResult) -> FailureClassification:
 
     for marker in RETRYABLE_MARKERS:
         if marker in text:
-            return FailureClassification(True, f"retryable:{marker}")
+            reason = f"retryable:{marker}"
+            # v5x G3: signal degrade restart on next attempt (breaker/cap unchanged).
+            if marker == "rapid_refill":
+                reason = "retryable:rapid_refill_needs_degrade"
+            return FailureClassification(True, reason)
 
     if result.terminal_reason.lower() == "api_error" and result.api_error_status is None:
         return FailureClassification(True, "retryable:api_error")
@@ -911,8 +1005,10 @@ def run_claude_via_sdk(
     max_budget_usd: str | float | None,
     max_turns: int | None = None,
     step_id: str | None = None,
+    degrade_mode: bool = False,
 ) -> ClaudeRunResult:
     """Primary contest driver: ClaudeSDKClient (+ anthropic-proxy when active)."""
+    step_started_at = time.time()
     plugins = sdk_driver.gsc_plugins(gsc_dir)
     mcp_servers = sdk_driver.gsc_mcp_servers(
         gsc_dir=gsc_dir, mcp_config=mcp_config, enable_mcp=enable_mcp
@@ -961,6 +1057,30 @@ def run_claude_via_sdk(
             if max_turns is not None
             else sdk_driver.max_turns_for_step(step_id)
         )
+        system_append = sdk_driver.contest_system_prompt_append(skills_dir)
+        allow_override = None
+        if degrade_mode:
+            system_append = system_append + "\n\n" + DEGRADED_SYSTEM_APPEND
+            if (step_id or "") == "implement":
+                allow_override = list(IMPLEMENT_DEGRADED_MCP_ALLOW)
+            print(
+                json.dumps(
+                    {
+                        "event": "rapid_refill_degrade_restart",
+                        "step_id": step_id,
+                        "mcp_allow_override": allow_override,
+                        "note": "narrower MCP allow + degraded system; breaker/MCP stay ON",
+                        "classification": "retryable:rapid_refill_needs_degrade",
+                    },
+                    ensure_ascii=False,
+                ),
+                flush=True,
+            )
+        extra_deny = None
+        if enable_mcp:
+            extra_deny = gsc_mcp_disallowed_tool_names(
+                prefixed=True, allow_override=allow_override
+            )
         options = sdk_driver.build_agent_options(
             cwd=output_dir,
             model=sdk_model,
@@ -968,11 +1088,12 @@ def run_claude_via_sdk(
             plugins=plugins,
             cli_path=claude_bin,
             env=sdk_env,
-            system_prompt_append=sdk_driver.contest_system_prompt_append(skills_dir),
+            system_prompt_append=system_append,
             max_turns=turns,
             max_budget_usd=budget,
             permission_mode="acceptEdits",
-            extra_disallowed_tools=gsc_mcp_disallowed_tool_names(prefixed=True) if enable_mcp else None,
+            extra_disallowed_tools=extra_deny,
+            step_id=step_id,
         )
         print(
             json.dumps(
@@ -1014,6 +1135,8 @@ def run_claude_via_sdk(
         tail=turn.tail,
         skills_loaded=turn.skills_loaded,
         mcp_tools_used=turn.mcp_tools_used,
+        builtin_writes=getattr(turn, "builtin_writes", ()) or (),
+        step_started_at=step_started_at,
     )
 
 
@@ -1174,6 +1297,8 @@ def run_claude_streaming(
         tail=combined_tail,
         skills_loaded=tuple(dict.fromkeys(skill_loads)),
         mcp_tools_used=tuple(sorted(mcp_tool_counts.keys())),
+        builtin_writes=(),
+        step_started_at=time.time(),
     )
 
 
@@ -1935,7 +2060,7 @@ def ensure_arc_spawn_gate_softener(output_dir: Path) -> None:
     """Soften GSC SPAWN-GATE without disabling MCP; encode Official STEP loop."""
     claude_md = output_dir / "CLAUDE.md"
     claude_md.write_text(
-        "# ARC-Bench project — MCP-first Official STEP loop (v5w hard audit = agent+tool chain)\n\n"
+        "# ARC-Bench project — MCP-first Official STEP loop (v5x Phase A write-gate + thrash deny)\n\n"
         "HARD: GSC MCP stays ON. Never disable WaitForMcpServers / never set "
         "ARC_ENABLE_MCP=0 / never ban MCP tools.\n\n"
         "## Harness STEP loop (fail-closed)\n"
@@ -1954,8 +2079,9 @@ def ensure_arc_spawn_gate_softener(output_dir: Path) -> None:
         "4. **test_dag** — non-empty api+ui in test_dag.json. Soft: `mcp__arch__trace`.\n"
         "5. **pages** — MUST call `mcp__arch__design_style` OR "
         "`mcp__arch__design_asset`. Soft: read_image / browser lifecycle.\n"
-        "6. **implement** — MUST call `mcp__arch__search_code`≥1; "
-        "write search_code.json. Soft: kb_query. No mid-dev continuous tests.\n"
+        "6. **implement** — MUST call `mcp__arch__search_code`≥1 AND in-STEP "
+        "Write|Edit to frontend|backend|src (or implement.json files_written mtime≥step_start). "
+        "Leftover pages files + search_code alone do NOT pass. Soft: kb_query. No mid-dev tests.\n"
         "7. **audit_refactor** (when enabled) — soft `mcp__arch__arch_insight` / "
         "`mcp__arch__commit_gate`.\n"
         "8. **batch_test** — harness validation. "
@@ -2070,7 +2196,8 @@ def evaluate_step_acceptance(
     P1 MCP hard gates (v5q full-landing; v5w hard-audit tighten):
       - govern: BOTH prd_govern AND spec_govern in-session tool use (receipt alone insufficient)
       - pages: design_style | design_asset
-      - implement: search_code ≥ 1
+      - implement: search_code ≥ 1 AND in-STEP write progress (Write|Edit business path or
+        implement.json files_written mtime≥step_start); leftover pages files alone fail
     Soft (never alone fail-closed): commit_gate_status on batch_test / audit_refactor.
     Existing fail-closed prd/spec/test_dag/pages-artifact/implement-artifact/batch harness kept.
     """
@@ -2430,8 +2557,23 @@ def evaluate_step_acceptance(
                 skills_seen=skills_seen,
                 artifacts=tuple(list(dict.fromkeys(found))[:12]),
             )
+        # v5x G1: forbid pass on pages leftover files + search_code alone.
+        write_ok, write_proof = implement_write_progress(output_dir, sdir, result)
+        if not write_ok:
+            return StepAcceptance(
+                ok=False,
+                reason=(
+                    "IMPLEMENT STEP requires in-STEP write progress: Write|Edit to "
+                    "frontend|backend|src ≥1, OR implement.json files_written with "
+                    "mtime≥step_start (leftover pages files + search_code alone do NOT pass)"
+                ),
+                skills_seen=skills_seen,
+                artifacts=tuple(list(dict.fromkeys(found + search_hits))[:12]),
+                soft_notes=tuple(soft_notes + [f"write_gate:{write_proof}"]),
+            )
+        soft_notes.append(f"write_progress:{write_proof}")
         mcp_optional.extend(mcp_tools_matching(used, "kb_query", "kb_inject", "refactor_code", "format_code", "solver"))
-        artifacts = list(dict.fromkeys(found + search_hits))[:16]
+        artifacts = list(dict.fromkeys(found + search_hits + [write_proof]))[:16]
         mcp_required = mcp_tools_matching(used, "search_code") or search_hits[:]
 
     elif step.step_id == "audit_refactor":
@@ -2647,8 +2789,12 @@ def step_prompt(
         mcp_extra = (
             "\nMCP REQUIRED this STEP (fail-closed):\n"
             f"- Call `mcp__arch__search_code` ≥1 → write `{base}/search_code.json` hit summary.\n"
+            "- WRITE PROGRESS HARD GATE: within ≤N tools after any Skill, you MUST Write|Edit "
+            "at least one business file under frontend/src, backend/src, or src/ "
+            f"(or list fresh paths in `{base}/implement.json` key `files_written` with mtime≥this STEP).\n"
+            "- Forbidden: pass on leftover pages-only files + search_code with no in-STEP write.\n"
             "- Soft: `mcp__arch__kb_query` (+ kb_inject on hit); optional refactor_code/format_code.\n"
-            "- Do NOT run continuous mid-dev tests.\n"
+            "- Do NOT re-call identical MCP reads; do NOT run continuous mid-dev tests.\n"
         )
     elif step.step_id == "audit_refactor":
         mcp_extra = (
@@ -2985,6 +3131,7 @@ def main() -> int:
                     "v5u_no_STEP_prompts_forcing_skill_load",
                     "v5v_spec_derive_from_prd_atomic",
                     "v5w_hard_audit_agent_plus_tool_chain",
+                    "v5x_phaseA_write_gate_thrash_deny_refill_degrade",
                 ],
             },
             ensure_ascii=False,
@@ -3104,14 +3251,42 @@ def main() -> int:
                     prior_failure: str | None = None
                     accepted = False
                     last_result: ClaudeRunResult | None = None
+                    # v5x G3: arm degrade on rapid_refill retry (breaker/cap unchanged; MCP ON).
+                    degrade_state = {"active": False}
                     # If repairing, inject harness failure log into implement/batch_test prompts.
                     repair_log = None
                     repair_note = step_dir(output_dir, module.node_id) / "repair_note.txt"
                     if validation_repair > 0 and step.step_id in ("implement", "batch_test") and repair_note.is_file():
                         repair_log = repair_note.read_text(encoding="utf-8", errors="replace")[-6000:]
 
+                    def on_step_retry(
+                        attempt: int,
+                        result: ClaudeRunResult,
+                        classification: FailureClassification,
+                        delay: int,
+                        _degrade=degrade_state,
+                    ) -> None:
+                        if "rapid_refill" in classification.reason:
+                            _degrade["active"] = True
+                            print(
+                                json.dumps(
+                                    {
+                                        "event": "rapid_refill_needs_degrade",
+                                        "req_id": module.node_id,
+                                        "step_id": step.step_id,
+                                        "attempt": attempt,
+                                        "next_attempt": attempt + 1,
+                                        "classification": classification.reason,
+                                        "note": "next attempt uses degraded system + narrower MCP allow",
+                                    },
+                                    ensure_ascii=False,
+                                ),
+                                flush=True,
+                            )
+                        on_retry(attempt, result, classification, delay)
+
                     for step_attempt in range(1, max_step_retries + 2):
-                        def run_attempt(attempt: int, _step=step, _prior_ref=lambda: prior_failure, _repair=repair_log, _vrep=validation_repair) -> ClaudeRunResult:
+                        def run_attempt(attempt: int, _step=step, _prior_ref=lambda: prior_failure, _repair=repair_log, _vrep=validation_repair, _degrade=degrade_state) -> ClaudeRunResult:
                             runtime.events.mark_implementation_started(
                                 module.node_id,
                                 f"STEP {_step.step_id} ({_step.title}) attempt {attempt} for {module.name}",
@@ -3180,6 +3355,7 @@ def main() -> int:
                                 max_budget_usd=max_budget_usd,
                                 max_turns=sdk_driver.max_turns_for_step(_step.step_id),
                                 step_id=_step.step_id,
+                                degrade_mode=bool(_degrade.get("active")),
                             )
 
                         result, api_attempts = execute_with_retry(
@@ -3187,7 +3363,7 @@ def main() -> int:
                             max_retries=max_retries,
                             base_seconds=retry_base_seconds,
                             max_seconds=retry_max_seconds,
-                            on_retry=on_retry,
+                            on_retry=on_step_retry,
                         )
                         last_result = result
                         classification = classify_claude_failure(result)
