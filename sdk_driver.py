@@ -234,13 +234,23 @@ def build_agent_options(
     max_turns: int = 60,
     max_budget_usd: float | None = None,
     permission_mode: str = "acceptEdits",
+    extra_disallowed_tools: list[str] | None = None,
 ) -> Any:
-    """ClaudeAgentOptions mirroring the official starter, plus MCP/GSC."""
+    """ClaudeAgentOptions mirroring the official starter, plus MCP/GSC.
+
+    extra_disallowed_tools: typically mcp__arch__* names = inventory − allowlist
+    so init schema surface shrinks even when plugin MCP advertises ~70 tools.
+    """
     ClaudeAgentOptions, *_ = _require_claude_sdk()
+    disallowed = list(DEFAULT_DISALLOWED_TOOLS)
+    if extra_disallowed_tools:
+        for name in extra_disallowed_tools:
+            if name and name not in disallowed:
+                disallowed.append(name)
     options_kwargs: dict[str, Any] = {
         "cwd": str(cwd),
         "allowed_tools": list(DEFAULT_ALLOWED_TOOLS),
-        "disallowed_tools": list(DEFAULT_DISALLOWED_TOOLS),
+        "disallowed_tools": disallowed,
         "permission_mode": permission_mode,
         "max_turns": max_turns,
         "strict_mcp_config": True,
@@ -281,7 +291,9 @@ def contest_system_prompt_append(skills_dir: Path | None) -> str:
         You implement an ARC-Bench application in the current working directory.
         The directory already contains an initialized starter application. Preserve existing work.
 
-        Prefer GSC MCP tools (mcp__arch__*) for PRD/SPEC/state when available.
+        Prefer GSC MCP tools (mcp__arch__*) for PRD/SPEC/state/design/search when available.
+        Never invent tool names; never call mcp__arch__account_manage or mcp__arch__debug_binary.
+        Do not use spec_migrate/grok_md_migrate as the main SPEC path (HTML spec_write).
         ARC-Bench skills live under {skills_txt}. Force-load required skills each STEP
         (Skill tool when present; otherwise Read/Bash the skill's SKILL.md).
         Do not start a long-running server. Finish each STEP with a short summary.

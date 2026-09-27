@@ -88,7 +88,21 @@ class McpRestoreTests(unittest.TestCase):
             self.assertIn("allowedTools", server)
             self.assertIn("spec_read", server["allowedTools"])
             self.assertIn("spec_write", server["allowedTools"])
-            self.assertLessEqual(len(server["allowedTools"]), 20)
+            self.assertIn("prd", server["allowedTools"])
+            self.assertIn("prd_govern", server["allowedTools"])
+            self.assertIn("search_code", server["allowedTools"])
+            self.assertIn("design_style", server["allowedTools"])
+            self.assertNotIn("account_manage", server["allowedTools"])
+            self.assertNotIn("debug_binary", server["allowedTools"])
+            # §5.1-A+B ≈ 38 tools; leave headroom but stay well under full 70.
+            self.assertGreaterEqual(len(server["allowedTools"]), 30)
+            self.assertLessEqual(len(server["allowedTools"]), 45)
+            meta = (root / "mcp" / "gsc-mcp-allowlist.json")
+            self.assertTrue(meta.is_file())
+            meta_payload = json.loads(meta.read_text(encoding="utf-8"))
+            self.assertEqual(meta_payload["n_inventory"], 70)
+            self.assertIn("account_manage", meta_payload["disallowed_short"])
+            self.assertIn("debug_binary", meta_payload["disallowed_short"])
 
     def test_claude_mcp_cli_args_default_enables_gsc(self):
         cfg = Path("/tmp/gsc-mcp.json")
@@ -129,6 +143,79 @@ class McpRestoreTests(unittest.TestCase):
         self.assertNotIn("NEVER use MCP", prompt)
         self.assertNotIn("NEVER call WaitForMcpServers", prompt)
         self.assertNotIn("ANTI-THRASH", prompt)
+
+
+    def test_default_allowlist_is_a_plus_b_without_never_default(self):
+        old = mod.os.environ.pop("ARC_MCP_ALLOWED_TOOLS", None)
+        old_p2 = mod.os.environ.pop("ARC_MCP_P2_TOOLS", None)
+        try:
+            tools = mod.gsc_mcp_allowed_tools()
+            self.assertIn("prd_govern", tools)
+            self.assertIn("search_code", tools)
+            self.assertIn("design_asset", tools)
+            self.assertIn("kb_query", tools)
+            self.assertIn("navigate", tools)
+            self.assertNotIn("account_manage", tools)
+            self.assertNotIn("debug_binary", tools)
+            self.assertEqual(len(mod.GSC_MCP_INVENTORY_SHORT_NAMES), 70)
+            denied = mod.gsc_mcp_disallowed_tool_names(prefixed=True)
+            self.assertTrue(all(t.startswith("mcp__arch__") for t in denied))
+            self.assertIn("mcp__arch__account_manage", denied)
+            self.assertIn("mcp__arch__debug_binary", denied)
+            # allow + deny covers inventory (never-default may appear only in deny)
+            short_denied = mod.gsc_mcp_disallowed_tool_names(prefixed=False)
+            self.assertEqual(set(tools) | set(short_denied), set(mod.GSC_MCP_INVENTORY_SHORT_NAMES))
+            self.assertFalse(set(tools) & set(short_denied))
+            csv = mod.claude_disallowed_tools_csv()
+            self.assertIn("Agent", csv)
+            self.assertIn("mcp__arch__pipeline", csv)
+        finally:
+            if old is None:
+                mod.os.environ.pop("ARC_MCP_ALLOWED_TOOLS", None)
+            else:
+                mod.os.environ["ARC_MCP_ALLOWED_TOOLS"] = old
+            if old_p2 is None:
+                mod.os.environ.pop("ARC_MCP_P2_TOOLS", None)
+            else:
+                mod.os.environ["ARC_MCP_P2_TOOLS"] = old_p2
+
+    def test_audit_steps_default_on_and_order(self):
+        old = mod.os.environ.pop("ARC_ENABLE_MCP_AUDIT_STEPS", None)
+        try:
+            self.assertTrue(mod.mcp_audit_steps_enabled())
+            ids = [s.step_id for s in mod.official_steps()]
+            self.assertEqual(
+                ids,
+                ["prd", "spec", "govern", "test_dag", "pages", "implement", "audit_refactor", "batch_test"],
+            )
+            mod.os.environ["ARC_ENABLE_MCP_AUDIT_STEPS"] = "0"
+            self.assertFalse(mod.mcp_audit_steps_enabled())
+            self.assertEqual(
+                [s.step_id for s in mod.official_steps()],
+                ["prd", "spec", "test_dag", "pages", "implement", "batch_test"],
+            )
+        finally:
+            if old is None:
+                mod.os.environ.pop("ARC_ENABLE_MCP_AUDIT_STEPS", None)
+            else:
+                mod.os.environ["ARC_ENABLE_MCP_AUDIT_STEPS"] = old
+
+    def test_step_prompt_names_required_mcp_tools(self):
+        module = mod.RequirementModule(1, 1, "REQ-1", "Demo", {"id": "REQ-1", "name": "Demo"})
+        for step in mod.official_steps():
+            prompt = mod.step_prompt(module, Path("/tmp/reqs"), None, [], "web", step)
+            self.assertIn("mcp__arch__", prompt)
+            self.assertNotIn("NEVER use MCP", prompt)
+            if step.step_id == "implement":
+                self.assertIn("search_code", prompt)
+            if step.step_id == "pages":
+                self.assertIn("design_style", prompt)
+            if step.step_id == "govern":
+                self.assertIn("prd_govern", prompt)
+                self.assertIn("spec_govern", prompt)
+            if step.step_id == "spec":
+                self.assertIn("migrate", prompt.lower())
+
 
 
 if __name__ == "__main__":

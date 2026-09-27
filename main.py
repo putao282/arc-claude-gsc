@@ -94,6 +94,10 @@ class StepAcceptance:
     skills_seen: tuple[str, ...] = ()
     missing_skills: tuple[str, ...] = ()
     artifacts: tuple[str, ...] = ()
+    mcp_required: tuple[str, ...] = ()
+    mcp_optional_seen: tuple[str, ...] = ()
+    commit_gate_status: str | None = None  # ok|fail|missing|skipped — soft; never alone fail-closed
+    soft_notes: tuple[str, ...] = ()
 
 
 # Official STEP loop (fail-closed). Advance only when skill proof + artifacts pass.
@@ -150,6 +154,45 @@ OFFICIAL_STEPS: tuple[StepDef, ...] = (
         require_batch_test_run=True,
     ),
 )
+
+# Optional P1 audit STEPs (ARC_ENABLE_MCP_AUDIT_STEPS; default ON for v5q full-landing).
+GOVERN_STEP = StepDef(
+    step_id="govern",
+    title="PRD/SPEC govern audit",
+    required_skills=("architect",),
+    goal=(
+        "Run mcp__arch__prd_govern and mcp__arch__spec_govern (≥1 each). "
+        "Write `.arc/steps/<id>/prd_govern.json` and `spec_govern.json` summaries. "
+        "Optional soft: mcp__arch__trace."
+    ),
+    exit_criteria="prd_govern + spec_govern MCP proof (and/or receipt JSONs); architect skill proof.",
+)
+
+AUDIT_REFACTOR_STEP = StepDef(
+    step_id="audit_refactor",
+    title="Audit / refactor soft gate",
+    required_skills=("arcbench-checkpoint",),
+    goal=(
+        "Soft: mcp__arch__arch_insight and/or mcp__arch__commit_gate; "
+        "optional refactor_code/format_code. Write soft receipts under `.arc/steps/<id>/`."
+    ),
+    exit_criteria="checkpoint skill proof; commit_gate/arch_insight soft (missing does not fail-closed).",
+)
+
+
+def official_steps() -> list[StepDef]:
+    """6 core STEPs + optional govern (after spec) + audit_refactor (after implement)."""
+    steps = list(OFFICIAL_STEPS)
+    if not mcp_audit_steps_enabled():
+        return steps
+    out: list[StepDef] = []
+    for step in steps:
+        out.append(step)
+        if step.step_id == "spec":
+            out.append(GOVERN_STEP)
+        elif step.step_id == "implement":
+            out.append(AUDIT_REFACTOR_STEP)
+    return out
 
 
 RETRYABLE_MARKERS = (
@@ -383,44 +426,257 @@ def mcp_enabled() -> bool:
 
 
 # GSC MCP exposes ~70 tools (~63k schema tokens). Autocompact then re-injects
-# them and trips rapid_refill_breaker. Keep MCP ON but advertise only SPEC/state
-# essentials via Claude mcp-config allowedTools (server stays connected).
-DEFAULT_GSC_MCP_ALLOWED_TOOLS = (
+# them and trips rapid_refill_breaker. Keep MCP ON; advertise P0+P1 surface via
+# allowedTools, and strip the rest with --disallowedTools (inventory − allowlist).
+# Canonical inventory: MCP_TOOLS_INVENTORY.md / MCP_FULL_UPGRADE_PLAN.md §10.
+
+GSC_MCP_INVENTORY_SHORT_NAMES: tuple[str, ...] = (
+    # PRD/SPEC (10)
+    "prd",
+    "prd_govern",
     "spec_read",
     "spec_write",
+    "spec_govern",
+    "spec_exchange",
+    "spec_migrate",
+    "spec_similarity",
+    "grok_md_migrate",
+    "trace",
+    # State/gates (8)
     "state_read",
     "state_update",
+    "commit_gate",
+    "workflow_guard",
+    "worktree_guard",
+    "artifact_read",
+    "artifact_grep",
+    "cache_stats",
+    # Arch/code (11)
+    "architect",
+    "discoverer",
+    "solver",
+    "arch_insight",
+    "search_code",
+    "refactor_code",
+    "format_code",
+    "trace_failure",
+    "debug_process",
+    "debug_binary",
+    "read_image",
+    # KB (5)
+    "kb_query",
+    "kb_inject",
+    "kb_index_check",
+    "kb_submit",
+    "kb_build",
+    # Account (1)
+    "account_manage",
+    # Design (5)
+    "design_asset",
+    "design_capture",
+    "design_compose",
+    "design_style",
+    "design_audit",
+    # Pipeline (1)
+    "pipeline",
+    # Sessions (3)
+    "session_list",
+    "session_read",
+    "session_search",
+    # Browser (26)
     "lifecycle",
+    "navigate",
+    "go_back",
+    "go_forward",
+    "reload",
+    "close",
+    "tabs",
+    "click",
+    "hover",
+    "type",
+    "press_key",
+    "select_option",
+    "fill_form",
+    "drag",
+    "drop",
+    "file_upload",
+    "handle_dialog",
+    "snapshot",
+    "take_screenshot",
+    "wait_for",
+    "evaluate",
+    "console_messages",
+    "network_requests",
+    "network_request",
+    "resize",
     "query",
+)
+
+# Never in default allowlist (Tao explicit opt-in via ARC_MCP_ALLOWED_TOOLS only).
+GSC_MCP_NEVER_DEFAULT: frozenset[str] = frozenset({"account_manage", "debug_binary"})
+
+# Optional P2 tools (env ARC_MCP_P2_TOOLS=1 or comma list). Not in default Official.
+GSC_MCP_P2_OPTIONAL_TOOLS: tuple[str, ...] = (
+    "pipeline",
+    "session_list",
+    "session_read",
+    "session_search",
+    "kb_submit",
+    "kb_build",
+    "spec_exchange",
+    "spec_migrate",
+    "grok_md_migrate",
+    "worktree_guard",
+    "cache_stats",
+    "debug_process",
+    "click",
+    "type",
+    "fill_form",
+    "evaluate",
+    "network_requests",
+    "resize",
+    "tabs",
+    "reload",
+)
+
+# v5q full-landing = plan §5.1-A + §5.1-B. Never include account_manage / debug_binary.
+DEFAULT_GSC_MCP_ALLOWED_TOOLS = (
+    # §5.1-A (P0)
+    "prd",
+    "prd_govern",
+    "spec_read",
+    "spec_write",
+    "spec_govern",
+    "state_read",
+    "state_update",
     "artifact_read",
     "artifact_grep",
     "commit_gate",
     "workflow_guard",
-    "prd",
+    "architect",
+    "discoverer",
+    "search_code",
+    "read_image",
+    "design_style",
+    "design_asset",
+    "lifecycle",
+    "query",
+    # §5.1-B (P1)
+    "trace",
+    "spec_similarity",
+    "arch_insight",
+    "kb_query",
+    "kb_inject",
+    "kb_index_check",
+    "refactor_code",
+    "format_code",
+    "trace_failure",
+    "solver",
+    "design_audit",
+    "design_capture",
+    "design_compose",
+    "navigate",
+    "snapshot",
+    "take_screenshot",
+    "wait_for",
+    "console_messages",
 )
 
 
+def mcp_audit_steps_enabled() -> bool:
+    """Optional govern + audit_refactor STEPs. Default ON for v5q full-landing pack."""
+    return env_bool("ARC_ENABLE_MCP_AUDIT_STEPS", True)
+
+
 def gsc_mcp_allowed_tools() -> list[str]:
-    """MCP tool allowlist (short names). Override with ARC_MCP_ALLOWED_TOOLS=a,b,c."""
+    """MCP tool allowlist (short names). Override with ARC_MCP_ALLOWED_TOOLS=a,b,c.
+
+    Default = §5.1-A+B. ARC_MCP_P2_TOOLS=1 adds P2 optional set (still excludes
+    account_manage/debug_binary unless explicitly listed in ARC_MCP_ALLOWED_TOOLS).
+    """
     raw = os.environ.get("ARC_MCP_ALLOWED_TOOLS", "").strip()
     if raw:
         tools = [part.strip() for part in raw.replace(";", ",").split(",") if part.strip()]
         if tools:
             return tools
-    return list(DEFAULT_GSC_MCP_ALLOWED_TOOLS)
+    tools = list(DEFAULT_GSC_MCP_ALLOWED_TOOLS)
+    p2_raw = os.environ.get("ARC_MCP_P2_TOOLS", "").strip()
+    if p2_raw and p2_raw.lower() not in {"0", "false", "no", "off"}:
+        if p2_raw.lower() in {"1", "true", "yes", "on"}:
+            extra = list(GSC_MCP_P2_OPTIONAL_TOOLS)
+        else:
+            extra = [part.strip() for part in p2_raw.replace(";", ",").split(",") if part.strip()]
+        for name in extra:
+            if name in GSC_MCP_NEVER_DEFAULT:
+                continue
+            if name not in tools and name in GSC_MCP_INVENTORY_SHORT_NAMES:
+                tools.append(name)
+    # Belt-and-suspenders: never leak never-default into the generated default list.
+    return [t for t in tools if t not in GSC_MCP_NEVER_DEFAULT]
+
+
+def mcp_short_name(tool: str) -> str:
+    """mcp__arch__prd -> prd; bare short names pass through."""
+    if not tool:
+        return ""
+    return tool.split("__")[-1]
+
+
+def mcp_tools_matching(used: tuple[str, ...] | list[str], *shorts: str) -> list[str]:
+    want = set(shorts)
+    return [t for t in used if mcp_short_name(t) in want]
+
+
+def gsc_mcp_disallowed_tool_names(*, prefixed: bool = True) -> list[str]:
+    """Auto-generate disallowed = inventory − allowlist (plus never-default).
+
+    Claude historically may still expose ~70 tools from plugin MCP even when
+    allowedTools is set; --disallowedTools / SDK disallowed_tools strips schema.
+    """
+    allowed = set(gsc_mcp_allowed_tools())
+    denied: list[str] = []
+    for name in GSC_MCP_INVENTORY_SHORT_NAMES:
+        if name in allowed and name not in GSC_MCP_NEVER_DEFAULT:
+            continue
+        denied.append(name)
+    # Ensure never-default always denied even if somehow allowlisted by bug path.
+    for name in sorted(GSC_MCP_NEVER_DEFAULT):
+        if name not in denied:
+            denied.append(name)
+    if prefixed:
+        return [f"mcp__arch__{n}" for n in denied]
+    return denied
+
+
+def builtin_disallowed_tools_csv() -> str:
+    """Non-MCP Claude builtins we always ban (Agent/Task/...); MCP deny list appended separately."""
+    return (
+        "Agent,Task,WebSearch,WebFetch,"
+        "CronCreate,CronDelete,CronList,NotebookEdit,"
+        "EnterWorktree,ExitWorktree,ListAgents,"
+        "ScheduleWakeup,SendMessage,Workflow,DesignSync,ReportFindings"
+    )
+
+
+def claude_disallowed_tools_csv() -> str:
+    """Builtin bans + auto MCP disallowed (inventory − allowlist)."""
+    mcp_deny = gsc_mcp_disallowed_tool_names(prefixed=True)
+    return builtin_disallowed_tools_csv() + ("," + ",".join(mcp_deny) if mcp_deny else "")
 
 
 def write_gsc_mcp_config(gsc_dir: Path, dest_dir: Path) -> Path:
     """Write a Claude --mcp-config that points at the packaged GSC bootstrap.
 
-    Includes allowedTools so Claude loads SPEC/state schemas only — MCP stays
-    connected (WaitForMcpServers still allowed) without the full ~70-tool surface.
+    Includes allowedTools (§5.1-A+B by default). Pair with claude_disallowed_tools_csv()
+    so init n_mcp shrinks even when plugin MCP still advertises ~70 tools.
+    MCP stays connected (WaitForMcpServers still allowed).
     """
     dest_dir.mkdir(parents=True, exist_ok=True)
     bootstrap = gsc_dir / "mcp" / "src" / "bootstrap.mjs"
     require_file(bootstrap, "GSC MCP bootstrap")
     config_path = dest_dir / "gsc-mcp.json"
     allowed = gsc_mcp_allowed_tools()
+    denied = gsc_mcp_disallowed_tool_names(prefixed=False)
     payload = {
         "mcpServers": {
             "arch": {
@@ -436,8 +692,39 @@ def write_gsc_mcp_config(gsc_dir: Path, dest_dir: Path) -> Path:
         }
     }
     config_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    meta_path = dest_dir / "gsc-mcp-allowlist.json"
+    meta_path.write_text(
+        json.dumps(
+            {
+                "allowed_tools": allowed,
+                "disallowed_short": denied,
+                "disallowed_prefixed": [f"mcp__arch__{n}" for n in denied],
+                "n_allowed": len(allowed),
+                "n_disallowed": len(denied),
+                "n_inventory": len(GSC_MCP_INVENTORY_SHORT_NAMES),
+                "never_default": sorted(GSC_MCP_NEVER_DEFAULT),
+                "audit_steps": mcp_audit_steps_enabled(),
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    print(
+        json.dumps(
+            {
+                "event": "gsc_mcp_config_written",
+                "path": str(config_path),
+                "n_allowed": len(allowed),
+                "n_disallowed": len(denied),
+                "audit_steps": mcp_audit_steps_enabled(),
+            },
+            ensure_ascii=False,
+        ),
+        flush=True,
+    )
     return config_path
-
 
 def claude_mcp_cli_args(*, enabled: bool, mcp_config: Path | None) -> list[str]:
     """Less-destructive MCP thrash mitigation vs v4's total ban.
@@ -660,6 +947,7 @@ def run_claude_via_sdk(
             system_prompt_append=sdk_driver.contest_system_prompt_append(skills_dir),
             max_budget_usd=budget,
             permission_mode="acceptEdits",
+            extra_disallowed_tools=gsc_mcp_disallowed_tool_names(prefixed=True) if enable_mcp else None,
         )
         print(
             json.dumps(
@@ -1567,7 +1855,7 @@ def ensure_arc_spawn_gate_softener(output_dir: Path) -> None:
     """Soften GSC SPAWN-GATE without disabling MCP; encode Official STEP loop."""
     claude_md = output_dir / "CLAUDE.md"
     claude_md.write_text(
-        "# ARC-Bench project — MCP-first Official STEP loop\n\n"
+        "# ARC-Bench project — MCP-first Official STEP loop (v5q full MCP landing)\n\n"
         "HARD: GSC MCP stays ON. Never disable WaitForMcpServers / never set "
         "ARC_ENABLE_MCP=0 / never ban MCP tools.\n\n"
         "## Harness STEP loop (fail-closed)\n"
@@ -1575,26 +1863,36 @@ def ensure_arc_spawn_gate_softener(output_dir: Path) -> None:
         "Do not advance yourself — the harness advances only after acceptance passes.\n"
         "Receipts live under `.arc/steps/<module-id>/`.\n\n"
         "STEPs in order:\n"
-        "1. **prd** — FORCE-LOAD Skill `architect`, build PRD via MCP.\n"
-        "2. **spec** — FORCE-LOAD Skill `architect`, write HTML SPEC via MCP.\n"
-        "3. **test_dag** — FORCE-LOAD Skill `arcbench-traceability`, author API+UI test DAG "
-        "(do not run full suite yet).\n"
-        "4. **pages** — FORCE-LOAD Skill `designer` (UX-UI) BEFORE any page/UI work.\n"
-        "5. **implement** — FORCE-LOAD Skill `arcbench-checkpoint`; implement WITHOUT "
-        "mid-dev continuous tests.\n"
-        "6. **batch_test** — FORCE-LOAD Skill `arcbench-runtime-signals`; run batch tests "
-        "once after code is done.\n\n"
+        "1. **prd** — Skill `architect` (SKILL.md Read/Bash if Skill tool missing); "
+        "`mcp__arch__state_read` then `mcp__arch__prd`. Soft: architect|discoverer.\n"
+        "2. **spec** — Skill `architect`; `mcp__arch__spec_read` + `mcp__arch__spec_write` "
+        "HTML 2.0 under SPEC/arcbench. FORBIDDEN as main path: spec_migrate / grok_md_migrate.\n"
+        "3. **govern** (when enabled) — `mcp__arch__prd_govern` + `mcp__arch__spec_govern`; "
+        "write `.arc/steps/<id>/prd_govern.json` + `spec_govern.json`.\n"
+        "4. **test_dag** — Skill `arcbench-traceability`; non-empty api+ui in test_dag.json. "
+        "Soft: `mcp__arch__trace`.\n"
+        "5. **pages** — Skill `designer`; MUST call `mcp__arch__design_style` OR "
+        "`mcp__arch__design_asset`. Soft: read_image / browser lifecycle.\n"
+        "6. **implement** — Skill `arcbench-checkpoint`; MUST call `mcp__arch__search_code`≥1; "
+        "write search_code.json. Soft: kb_query. No mid-dev continuous tests.\n"
+        "7. **audit_refactor** (when enabled) — soft `mcp__arch__arch_insight` / "
+        "`mcp__arch__commit_gate`.\n"
+        "8. **batch_test** — Skill `arcbench-runtime-signals`; harness validation. "
+        "Soft: `mcp__arch__commit_gate` → commit_gate.json (failure does not alone kill STEP).\n\n"
         "## Per-STEP rules\n"
         "- FIRST tool action in each STEP: FORCE-LOAD that STEP's required skill(s).\n"
         "- Prefer Skill tool when present; if Skill tool is missing, Read/Bash-cat "
         "`.claude/skills/<name>/SKILL.md` (or `skills/<name>/SKILL.md`) as force-load proof.\n"
         "- No Skill tool load AND no SKILL.md read proof => STEP acceptance FAILS "
         "(fail-closed); harness will not advance.\n"
-        "- Write receipt JSON to the path given in the STEP prompt when exit criteria are met.\n"
-        "- Prefer visible GSC MCP calls (prd/spec_*/state_*) for planning.\n"
+        "- Name required tools as `mcp__arch__<short>` from the allowlist; do NOT invent tool names.\n"
+        "- NEVER call `mcp__arch__account_manage` or `mcp__arch__debug_binary`.\n"
+        "- Do NOT use migrate tools as the main SPEC path (HTML 2.0 via spec_write).\n"
+        "- Write receipt JSON under `.arc/steps/<id>/` when exit criteria are met.\n"
         "- Prefer main session; do not spawn Agent/Task.\n"
         "- If WaitForMcpServers appears, wait once then continue; keep outputs small.\n"
-        "- Harness local tests grant final green — MCP alone does not.\n",
+        "- Harness local tests grant final green — MCP alone does not.\n"
+,
         encoding="utf-8",
     )
     off = output_dir / ".claude" / "spawn-gate-off"
@@ -1653,6 +1951,10 @@ def write_step_receipt(
         "missing_skills": list(acceptance.missing_skills),
         "artifacts": list(acceptance.artifacts),
         "mcp_tools_used": list(claude.mcp_tools_used) if claude else [],
+        "mcp_required": list(acceptance.mcp_required),
+        "mcp_optional_seen": list(acceptance.mcp_optional_seen),
+        "commit_gate_status": acceptance.commit_gate_status,
+        "soft_notes": list(acceptance.soft_notes),
     }
     step_receipt_json_path(output_dir, node_id, step.step_id).write_text(
         json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
@@ -1679,7 +1981,15 @@ def evaluate_step_acceptance(
     step: StepDef,
     result: ClaudeRunResult,
 ) -> StepAcceptance:
-    """Fail-closed STEP gate: required Skill loads + step artifacts (+ batch tests)."""
+    """Fail-closed STEP gate: required Skill loads + step artifacts (+ batch tests).
+
+    P1 MCP hard gates (v5q full-landing):
+      - govern: prd_govern + spec_govern
+      - pages: design_style | design_asset
+      - implement: search_code ≥ 1
+    Soft (never alone fail-closed): commit_gate_status on batch_test / audit_refactor.
+    Existing fail-closed prd/spec/test_dag/pages-artifact/implement-artifact/batch harness kept.
+    """
     skills_seen = tuple(result.skills_loaded)
     missing = tuple(s for s in step.required_skills if s not in skills_seen)
     if missing:
@@ -1693,6 +2003,19 @@ def evaluate_step_acceptance(
     sid = safe_node_id(module.node_id)
     sdir = step_dir(output_dir, module.node_id)
     artifacts: list[str] = []
+    mcp_required: list[str] = []
+    mcp_optional: list[str] = []
+    soft_notes: list[str] = []
+    commit_gate_status: str | None = None
+    used = tuple(result.mcp_tools_used)
+
+    def _receipt_or_tool(filename: str, *tool_shorts: str) -> list[str]:
+        found: list[str] = []
+        path = sdir / filename
+        if path.is_file() and path.stat().st_size > 2:
+            found.append(str(path))
+        found.extend(mcp_tools_matching(used, *tool_shorts))
+        return found
 
     if step.step_id == "prd":
         candidates = [
@@ -1709,23 +2032,31 @@ def evaluate_step_acceptance(
             found.append(str(prd_root))
         found.extend(_existing_paths(candidates[1:]))
         found = list(dict.fromkeys(found))
-        mcp_prd = [t for t in result.mcp_tools_used if t.endswith("__prd") or "prd" in t.split("__")[-1]]
+        mcp_prd = mcp_tools_matching(used, "prd")
+        # Soft: state_read / architect|discoverer
+        mcp_optional.extend(mcp_tools_matching(used, "state_read", "architect", "discoverer", "prd_govern"))
+        if not mcp_tools_matching(used, "state_read"):
+            soft_notes.append("soft_missing:state_read")
         if not found and not mcp_prd:
             return StepAcceptance(
                 ok=False,
                 reason="PRD artifact missing under PRD/ or .arc/steps/<id>/prd* (and no MCP prd tool proof)",
                 skills_seen=skills_seen,
                 artifacts=tuple(found),
+                mcp_optional_seen=tuple(mcp_optional),
+                soft_notes=tuple(soft_notes),
             )
         if not found and mcp_prd:
-            # MCP prd used but no file yet — still fail-closed on artifact
             return StepAcceptance(
                 ok=False,
                 reason="MCP prd used but PRD artifact file/dir still missing",
                 skills_seen=skills_seen,
                 artifacts=tuple(mcp_prd),
+                mcp_optional_seen=tuple(mcp_optional),
+                soft_notes=tuple(soft_notes),
             )
         artifacts = found + mcp_prd
+        mcp_required = list(mcp_prd)
 
     elif step.step_id == "spec":
         spec_html = output_dir / "SPEC" / "arcbench" / f"{sid}.html"
@@ -1736,12 +2067,17 @@ def evaluate_step_acceptance(
         elif spec_dir.is_dir():
             htmls = [p for p in spec_dir.glob("*.html") if p.is_file() and p.stat().st_size > 50]
             found.extend(str(p) for p in htmls[:5])
-        mcp_spec = [t for t in result.mcp_tools_used if "spec_" in t or t.endswith("__prd") or "spec_write" in t or "spec_read" in t]
+        mcp_spec = mcp_tools_matching(used, "spec_read", "spec_write", "prd")
+        # Also accept broader spec_* evidence for soft logging
+        mcp_optional.extend(mcp_tools_matching(used, "state_read", "spec_govern", "spec_similarity"))
+        if not mcp_tools_matching(used, "state_read"):
+            soft_notes.append("soft_missing:state_read")
         if not found:
             return StepAcceptance(
                 ok=False,
                 reason="SPEC HTML missing/too small under SPEC/arcbench/",
                 skills_seen=skills_seen,
+                soft_notes=tuple(soft_notes),
             )
         if not mcp_spec:
             return StepAcceptance(
@@ -1749,8 +2085,32 @@ def evaluate_step_acceptance(
                 reason="SPEC STEP requires GSC MCP spec_read/spec_write (or prd) tool use proof",
                 skills_seen=skills_seen,
                 artifacts=tuple(found),
+                soft_notes=tuple(soft_notes),
             )
         artifacts = found + mcp_spec
+        mcp_required = list(mcp_spec)
+
+    elif step.step_id == "govern":
+        prd_g = _receipt_or_tool("prd_govern.json", "prd_govern")
+        spec_g = _receipt_or_tool("spec_govern.json", "spec_govern")
+        mcp_optional.extend(mcp_tools_matching(used, "trace", "state_read"))
+        if not prd_g:
+            return StepAcceptance(
+                ok=False,
+                reason="govern STEP requires mcp__arch__prd_govern (≥1) and/or .arc/steps/<id>/prd_govern.json",
+                skills_seen=skills_seen,
+                mcp_optional_seen=tuple(mcp_optional),
+            )
+        if not spec_g:
+            return StepAcceptance(
+                ok=False,
+                reason="govern STEP requires mcp__arch__spec_govern (≥1) and/or .arc/steps/<id>/spec_govern.json",
+                skills_seen=skills_seen,
+                artifacts=tuple(prd_g),
+                mcp_optional_seen=tuple(mcp_optional),
+            )
+        artifacts = list(dict.fromkeys(prd_g + spec_g))
+        mcp_required = mcp_tools_matching(used, "prd_govern", "spec_govern") or artifacts[:]
 
     elif step.step_id == "test_dag":
         dag = sdir / "test_dag.json"
@@ -1839,6 +2199,7 @@ def evaluate_step_acceptance(
         if ui_files:
             has_ui = True
 
+        mcp_optional.extend(mcp_tools_matching(used, "trace", "state_read"))
         if not (has_api and has_ui):
             return StepAcceptance(
                 ok=False,
@@ -1848,6 +2209,7 @@ def evaluate_step_acceptance(
                 ),
                 skills_seen=skills_seen,
                 artifacts=tuple(found[:8]) if found else (),
+                mcp_optional_seen=tuple(mcp_optional),
             )
         if not found:
             return StepAcceptance(
@@ -1886,7 +2248,26 @@ def evaluate_step_acceptance(
                 reason="PAGES artifacts missing under frontend/src (or pages.json receipt)",
                 skills_seen=skills_seen,
             )
-        artifacts = found[:12]
+        design_mcp = mcp_tools_matching(used, "design_style", "design_asset")
+        # Also accept design evidence written into pages.json
+        if pages_receipt.is_file():
+            try:
+                pages_payload = json.loads(pages_receipt.read_text(encoding="utf-8"))
+                design_field = pages_payload.get("design_mcp") if isinstance(pages_payload, dict) else None
+                if design_field:
+                    design_mcp = design_mcp or ["pages.json:design_mcp"]
+            except Exception:
+                pass
+        if not design_mcp:
+            return StepAcceptance(
+                ok=False,
+                reason="PAGES STEP requires mcp__arch__design_style OR mcp__arch__design_asset (≥1)",
+                skills_seen=skills_seen,
+                artifacts=tuple(found[:12]),
+            )
+        mcp_optional.extend(mcp_tools_matching(used, "read_image", "design_audit", "lifecycle", "query", "navigate", "snapshot", "take_screenshot"))
+        artifacts = found[:12] + design_mcp
+        mcp_required = list(design_mcp)
 
     elif step.step_id == "implement":
         impl_receipt = sdir / "implement.json"
@@ -1910,17 +2291,56 @@ def evaluate_step_acceptance(
                 reason="IMPLEMENT artifacts missing (implement.json and/or source files)",
                 skills_seen=skills_seen,
             )
-        artifacts = list(dict.fromkeys(found))[:12]
+        search_hits = _receipt_or_tool("search_code.json", "search_code")
+        if not search_hits:
+            return StepAcceptance(
+                ok=False,
+                reason="IMPLEMENT STEP requires mcp__arch__search_code ≥1 (and/or .arc/steps/<id>/search_code.json)",
+                skills_seen=skills_seen,
+                artifacts=tuple(list(dict.fromkeys(found))[:12]),
+            )
+        mcp_optional.extend(mcp_tools_matching(used, "kb_query", "kb_inject", "refactor_code", "format_code", "solver"))
+        artifacts = list(dict.fromkeys(found + search_hits))[:16]
+        mcp_required = mcp_tools_matching(used, "search_code") or search_hits[:]
+
+    elif step.step_id == "audit_refactor":
+        # Soft STEP: skill already checked; never fail-closed on missing MCP.
+        insight = _receipt_or_tool("arch_insight.json", "arch_insight")
+        gate = _receipt_or_tool("commit_gate.json", "commit_gate")
+        mcp_optional.extend(insight + gate)
+        mcp_optional.extend(mcp_tools_matching(used, "refactor_code", "format_code"))
+        if gate:
+            commit_gate_status = "ok"
+        elif mcp_tools_matching(used, "commit_gate"):
+            commit_gate_status = "ok"
+        else:
+            commit_gate_status = "missing"
+            soft_notes.append("soft_missing:commit_gate")
+        if not insight and not mcp_tools_matching(used, "arch_insight"):
+            soft_notes.append("soft_missing:arch_insight")
+        artifacts = list(dict.fromkeys(insight + gate)) or ["audit_refactor:soft"]
 
     elif step.step_id == "batch_test":
         validation = run_module_validation(output_dir, module)
         artifacts = [f"validation:{validation.reason}", f"cmd:{' '.join(validation.cmd)}"]
+        # Soft commit_gate: record status; never fail STEP for commit_gate alone.
+        gate_files = _receipt_or_tool("commit_gate.json", "commit_gate")
+        if gate_files:
+            commit_gate_status = "ok"
+            artifacts.extend(gate_files)
+        else:
+            commit_gate_status = "missing"
+            soft_notes.append("soft_missing:commit_gate")
+        mcp_optional.extend(mcp_tools_matching(used, "trace_failure", "lifecycle", "console_messages"))
         if not validation.ok:
             return StepAcceptance(
                 ok=False,
                 reason=f"batch_test harness validation failed: {validation.reason}",
                 skills_seen=skills_seen,
                 artifacts=tuple(artifacts),
+                mcp_optional_seen=tuple(mcp_optional),
+                commit_gate_status=commit_gate_status,
+                soft_notes=tuple(soft_notes),
             )
         sdir.mkdir(parents=True, exist_ok=True)
         (sdir / "batch_validation.json").write_text(
@@ -1932,6 +2352,7 @@ def evaluate_step_acceptance(
                     "reason": validation.reason,
                     "project_dir": validation.project_dir,
                     "log_tail": validation.log_tail[-4000:],
+                    "commit_gate_status": commit_gate_status,
                 },
                 ensure_ascii=False,
                 indent=2,
@@ -1948,7 +2369,12 @@ def evaluate_step_acceptance(
         reason=f"step {step.step_id} acceptance passed",
         skills_seen=skills_seen,
         artifacts=tuple(artifacts),
+        mcp_required=tuple(mcp_required),
+        mcp_optional_seen=tuple(mcp_optional),
+        commit_gate_status=commit_gate_status,
+        soft_notes=tuple(soft_notes),
     )
+
 
 
 def step_prompt(
@@ -2020,6 +2446,71 @@ def step_prompt(
             "```\n"
             "Also create the referenced test files when practical. Acceptance fails without both api and ui.\n"
         )
+
+    mcp_extra = ""
+    sid = safe_node_id(module.node_id)
+    base = f".arc/steps/{sid}"
+    if step.step_id == "prd":
+        mcp_extra = (
+            "\nMCP REQUIRED this STEP:\n"
+            "- Call `mcp__arch__prd` (CRUD) and produce PRD artifact under PRD/ or "
+            f"`{base}/prd*`.\n"
+            "- Soft-required: `mcp__arch__state_read` at start; prefer `mcp__arch__architect` "
+            "or `mcp__arch__discoverer` once (write architect_ctx.json if useful).\n"
+            "- Do NOT call account_manage / debug_binary. Do NOT use migrate as main path.\n"
+        )
+    elif step.step_id == "spec":
+        mcp_extra = (
+            "\nMCP REQUIRED this STEP:\n"
+            "- Call `mcp__arch__spec_read` then `mcp__arch__spec_write` for HTML SPEC under "
+            "SPEC/arcbench (HTML 2.0).\n"
+            "- FORBIDDEN as main path: `mcp__arch__spec_migrate` / `mcp__arch__grok_md_migrate`.\n"
+            "- Soft: `mcp__arch__state_read`; optional `mcp__arch__spec_govern` "
+            f"(write `{base}/spec_govern.json`).\n"
+        )
+    elif step.step_id == "govern":
+        mcp_extra = (
+            "\nMCP REQUIRED this STEP (fail-closed):\n"
+            f"- `mcp__arch__prd_govern` ≥1 → write `{base}/prd_govern.json` summary.\n"
+            f"- `mcp__arch__spec_govern` ≥1 → write `{base}/spec_govern.json` summary.\n"
+            "- Soft: `mcp__arch__trace`.\n"
+        )
+    elif step.step_id == "test_dag":
+        mcp_extra = (
+            "\nMCP soft this STEP: `mcp__arch__trace` / `mcp__arch__state_read` to list test points. "
+            "No MCP hard gate (harness checks api+ui schema).\n"
+        )
+    elif step.step_id == "pages":
+        mcp_extra = (
+            "\nMCP REQUIRED this STEP (fail-closed):\n"
+            "- Call `mcp__arch__design_style` OR `mcp__arch__design_asset` ≥1 "
+            f"(record under `{base}/pages.json` key `design_mcp` if useful).\n"
+            "- Soft: `mcp__arch__read_image`; browser `mcp__arch__lifecycle` + snapshot "
+            f"(optional `{base}/browser_smoke.json`).\n"
+        )
+    elif step.step_id == "implement":
+        mcp_extra = (
+            "\nMCP REQUIRED this STEP (fail-closed):\n"
+            f"- Call `mcp__arch__search_code` ≥1 → write `{base}/search_code.json` hit summary.\n"
+            "- Soft: `mcp__arch__kb_query` (+ kb_inject on hit); optional refactor_code/format_code.\n"
+            "- Do NOT run continuous mid-dev tests.\n"
+        )
+    elif step.step_id == "audit_refactor":
+        mcp_extra = (
+            "\nMCP soft this STEP (not fail-closed):\n"
+            f"- Prefer `mcp__arch__arch_insight` and/or `mcp__arch__commit_gate` "
+            f"(write `{base}/arch_insight.json` / `{base}/commit_gate.json`).\n"
+            "- Optional: refactor_code / format_code.\n"
+        )
+    elif step.step_id == "batch_test":
+        mcp_extra = (
+            "\nMCP soft this STEP:\n"
+            f"- Call `mcp__arch__commit_gate` once → write `{base}/commit_gate.json` "
+            "(status recorded; commit_gate failure alone does NOT fail this STEP).\n"
+            "- On test failure soft: `mcp__arch__trace_failure`.\n"
+            "- Harness local validation is the hard green gate.\n"
+        )
+
     return textwrap.dedent(f"""
         You are in an ARC-Bench Official harness STEP round (not a mega-prompt).
         GSC plugin + GSC MCP are loaded. MCP stays ON.
@@ -2048,8 +2539,10 @@ def step_prompt(
         Exit criteria: {step.exit_criteria}
         {mid_dev}{batch}
         {skills_text}
-        Also use GSC MCP (`prd` / `spec_read` / `spec_write` / `state_*`) where relevant so logs show MCP value.
-        {schema_extra}
+        Use only real `mcp__arch__*` tools from the allowlist (never invent names; never account_manage/debug_binary).
+        Forbid migrate (`spec_migrate`/`grok_md_migrate`) as the main SPEC path — use HTML spec_write.
+        Skill force-load: Skill tool if present, else Read/Bash `SKILL.md`.
+        {mcp_extra}{schema_extra}
         When exit criteria are met, write a short receipt JSON to `{receipt_hint}` with keys:
         step_id, skills_loaded, artifacts (list of paths), summary.
         The harness writes `{ok_hint}` only after its own acceptance gate passes (skill proof + artifacts).
@@ -2313,8 +2806,11 @@ def main() -> int:
                 "driver": "ClaudeSDKClient",
                 "permission_mode": "acceptEdits",
                 "mcp_allowed_tools": gsc_mcp_allowed_tools() if enable_mcp else [],
-                "step_loop": [s.step_id for s in OFFICIAL_STEPS],
-                "step_required_skills": {s.step_id: list(s.required_skills) for s in OFFICIAL_STEPS},
+                "step_loop": [s.step_id for s in official_steps()],
+                "step_required_skills": {s.step_id: list(s.required_skills) for s in official_steps()},
+                "mcp_audit_steps": mcp_audit_steps_enabled(),
+                "mcp_n_allowed": len(gsc_mcp_allowed_tools()),
+                "mcp_n_disallowed": len(gsc_mcp_disallowed_tool_names(prefixed=False)),
                 "thrash_mitigations": [
                     "ClaudeSDKClient_official_driver",
                     "anthropic_proxy_messages_to_chat_completions",
@@ -2404,12 +2900,7 @@ def main() -> int:
                     # Keep MCP ON; WaitForMcpServers NOT banned.
                     # Skill allowed so each STEP can FORCE-LOAD its required skills.
                     "--disallowedTools",
-                    (
-                        "Agent,Task,WebSearch,WebFetch,"
-                        "CronCreate,CronDelete,CronList,NotebookEdit,"
-                        "EnterWorktree,ExitWorktree,ListAgents,"
-                        "ScheduleWakeup,SendMessage,Workflow,DesignSync,ReportFindings"
-                    ),
+                    claude_disallowed_tools_csv(),
                     "--disable-slash-commands",
                     "--autocompact",
                     "200000",
@@ -2430,7 +2921,7 @@ def main() -> int:
                 return command, attempt_env
 
             # Fail-closed Official STEP loop: skill proof + artifacts before advance.
-            steps_to_run: list[StepDef] = list(OFFICIAL_STEPS)
+            steps_to_run: list[StepDef] = list(official_steps())
             while True:
                 step_failed = False
                 for step in steps_to_run:
@@ -2698,7 +3189,7 @@ def main() -> int:
                 # Repair: clear implement + batch_test receipts and re-run those STEPs only.
                 for sid in ("implement", "batch_test"):
                     clear_step_receipt(output_dir, module.node_id, sid)
-                steps_to_run = [s for s in OFFICIAL_STEPS if s.step_id in ("implement", "batch_test")]
+                steps_to_run = [s for s in official_steps() if s.step_id in ("implement", "audit_refactor", "batch_test")]
                 # Seed prior failure into batch_test via a repair note file
                 repair_note = step_dir(output_dir, module.node_id) / "repair_note.txt"
                 repair_note.parent.mkdir(parents=True, exist_ok=True)
