@@ -847,6 +847,27 @@ def mcp_tools_matching(used: tuple[str, ...] | list[str], *shorts: str) -> list[
     return [t for t in used if mcp_short_name(t) in want]
 
 
+
+def govern_accept_already_green(result: "ClaudeRunResult | object") -> bool:
+    """True when govern STEP acceptance is already satisfied (v5ae).
+
+    Sources (any one):
+    - deny_events reason == govern_accept_already_green (PreToolUse post-green)
+    - thrash_events level == govern_accept_green_deny
+    - both prd_govern AND spec_govern present in mcp_tools_used (≥1 each)
+    """
+    for e in getattr(result, "deny_events", ()) or ():
+        if isinstance(e, dict) and e.get("reason") == "govern_accept_already_green":
+            return True
+    for e in getattr(result, "thrash_events", ()) or ():
+        if isinstance(e, dict) and str(e.get("level") or "") == "govern_accept_green_deny":
+            return True
+    used = tuple(getattr(result, "mcp_tools_used", ()) or ())
+    return bool(mcp_tools_matching(used, "prd_govern")) and bool(
+        mcp_tools_matching(used, "spec_govern")
+    )
+
+
 def gsc_mcp_disallowed_tool_names(*, prefixed: bool = True, allow_override: list[str] | tuple[str, ...] | None = None) -> list[str]:
     """Auto-generate disallowed = inventory − allowlist (plus never-default).
 
@@ -4063,6 +4084,7 @@ def main() -> int:
                     "v5ac_soft_accept_requires_in_attempt_write",
                     "v5ac_batch_test_vitest_feed_implement_repair",
                     "v5ad_wave_central_one_shot_batch_test",
+                    "v5ae_govern_green_force_stop_no_supervisor_fail_closed",
                 ],
             },
             ensure_ascii=False,
@@ -4296,7 +4318,78 @@ def main() -> int:
                                 harness_supervisor.note_event(de)
                     skip_soft_stall = False
                     supervisor_nudge = ""
-                    if (
+                    # v5ae ONE root cure: when govern accept already green, FORCE STOP
+                    # the STEP successfully. Soft/hard thrash or post-green identical
+                    # denies must NOT ask supervisor fail_closed (Official v5ad github
+                    # 9fb20f0ad79f: prd_govern hard thrash×3 then govern_accept_already_green
+                    # already met, supervisor still fail_closed → main exit 1).
+                    gov_green = step.step_id == "govern" and govern_accept_already_green(result)
+                    if gov_green:
+                        print(
+                            json.dumps(
+                                {
+                                    "event": "govern_accept_already_green_force_stop",
+                                    "req_id": module.node_id,
+                                    "step_id": step.step_id,
+                                    "thrash_hit": bool(getattr(result, "thrash_hit", False)),
+                                    "deny_count": len(getattr(result, "deny_events", ()) or ()),
+                                    "mcp_tools_used": list(
+                                        getattr(result, "mcp_tools_used", ()) or ()
+                                    ),
+                                    "wave": wave_ctx.get("wave_index"),
+                                    "domain": wave_ctx.get("domain_id"),
+                                    "note": (
+                                        "skip supervisor fail_closed; evaluate acceptance "
+                                        "and STOP STEP"
+                                    ),
+                                },
+                                ensure_ascii=False,
+                            ),
+                            flush=True,
+                        )
+                        force_acc = evaluate_step_acceptance(work_dir, module, step, result)
+                        if force_acc.ok:
+                            force_acc = StepAcceptance(
+                                ok=True,
+                                reason=(
+                                    f"{force_acc.reason} "
+                                    "(v5ae force-stop after govern_accept_already_green)"
+                                ),
+                                skills_seen=force_acc.skills_seen,
+                                missing_skills=force_acc.missing_skills,
+                                artifacts=force_acc.artifacts,
+                                mcp_required=force_acc.mcp_required,
+                                mcp_optional_seen=force_acc.mcp_optional_seen,
+                                commit_gate_status=force_acc.commit_gate_status,
+                                soft_notes=tuple(
+                                    list(force_acc.soft_notes)
+                                    + ["v5ae_govern_green_force_stop"]
+                                ),
+                            )
+                            write_step_receipt(
+                                work_dir, module.node_id, step, force_acc, claude=result
+                            )
+                            print(
+                                json.dumps(
+                                    {
+                                        "event": "step_acceptance",
+                                        "req_id": module.node_id,
+                                        "step_id": step.step_id,
+                                        "ok": True,
+                                        "reason": force_acc.reason,
+                                        "govern_green_force_stop": True,
+                                        "wave": wave_ctx.get("wave_index"),
+                                        "domain": wave_ctx.get("domain_id"),
+                                    },
+                                    ensure_ascii=False,
+                                ),
+                                flush=True,
+                            )
+                            accepted = True
+                            break
+                        # Green signal present but acceptance gate somehow failed —
+                        # fall through without supervisor fail_closed.
+                    elif (
                         harness_supervisor.supervisor_enabled()
                         and step.step_id == "govern"
                         and (
@@ -4312,6 +4405,7 @@ def main() -> int:
                                 levels.append(str(ev.get("level")))
                         level = "hard"
                         for cand in (
+                            "govern_accept_green_deny",
                             "govern_accept_deny",
                             "read_streak_deny",
                             "hard_repeat",
@@ -4333,11 +4427,7 @@ def main() -> int:
                                 "level": level,
                                 "thrash_hit": bool(getattr(result, "thrash_hit", False)),
                                 "thrash_counts": dict(getattr(result, "thrash_counts", ()) or ()),
-                                "govern_accept_met": any(
-                                    isinstance(e, dict)
-                                    and e.get("event") == "mcp_thrash_pretool_deny"
-                                    for e in getattr(result, "deny_events", ())
-                                ),
+                                "govern_accept_met": govern_accept_already_green(result),
                                 "deny_count": len(getattr(result, "deny_events", ()) or ()),
                                 "deny_events_tail": list(getattr(result, "deny_events", ()))[-5:],
                             },
@@ -4356,10 +4446,26 @@ def main() -> int:
                         elif d_gt.action == harness_supervisor.ACTION_SKIP_SOFT_STALL_WAIT:
                             skip_soft_stall = True
                         elif d_gt.action == harness_supervisor.ACTION_FAIL_CLOSED:
-                            runtime.events.mark_run_failed(
-                                f"Module {module.node_id} govern_thrash fail_closed: {d_gt.reason}"
-                            )
-                            return 1
+                            # Belt: never fail_closed once green (should be unreachable
+                            # after gov_green early-exit; keep guard for race/mis-detect).
+                            if govern_accept_already_green(result):
+                                print(
+                                    json.dumps(
+                                        {
+                                            "event": "govern_green_override_supervisor_fail_closed",
+                                            "req_id": module.node_id,
+                                            "step_id": step.step_id,
+                                            "supervisor_reason": (d_gt.reason or "")[:400],
+                                        },
+                                        ensure_ascii=False,
+                                    ),
+                                    flush=True,
+                                )
+                            else:
+                                runtime.events.mark_run_failed(
+                                    f"Module {module.node_id} govern_thrash fail_closed: {d_gt.reason}"
+                                )
+                                return 1
                     if skip_soft_stall:
                         print(
                             json.dumps(

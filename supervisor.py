@@ -1,4 +1,4 @@
-"""Harness soft-strategy supervisor (v5ab).
+"""Harness soft-strategy supervisor (v5ab; v5ae green-silence).
 
 Hard gates stay in main.py / sdk_driver.py. This module only chooses among a
 finite safe-retry action enum when ARC_HARNESS_SUPERVISOR=1 (or pack sentinel).
@@ -20,7 +20,7 @@ from typing import Any
 from urllib.parse import urlparse
 
 
-SCHEMA_VERSION = "v5ab.1"
+SCHEMA_VERSION = "v5ae.1"
 
 # Finite action enum — executor must re-validate against hook allowlists.
 ACTION_NUDGE_STEP_PROMPT = "nudge_step_prompt"
@@ -322,13 +322,25 @@ def should_call_hook(hook: str, extras: dict[str, Any] | None = None) -> bool:
     """Cost-control silence rules from the plan (even when flag ON)."""
     ex = extras or {}
     if hook == "govern_thrash":
+        # v5ae: once govern accept is already green, NEVER call the model —
+        # soft/hard thrash after green must not become fail_closed.
+        if ex.get("govern_accept_met"):
+            return False
         level = str(ex.get("level") or "")
         if level == "soft":
             return False
-        if level in {"hard", "hard_repeat", "read_streak_deny", "govern_accept_deny"}:
-            return True
-        # Post-accept deny streak or hard thrash flag
-        if ex.get("thrash_hit") or ex.get("govern_accept_met") and ex.get("deny_count", 0) >= 1:
+        if level in {
+            "hard",
+            "hard_repeat",
+            "read_streak_deny",
+            "govern_accept_deny",
+            "govern_accept_green_deny",
+        }:
+            # govern_accept_green_deny alone means green; silent (covered above).
+            # Keep hard/etc. callable only when NOT green.
+            return level != "govern_accept_green_deny"
+        # Post-accept deny streak or hard thrash flag (green already filtered)
+        if ex.get("thrash_hit"):
             return True
         return bool(ex.get("deny_count", 0) >= 1)
     if hook == "implement_soft_stall":
