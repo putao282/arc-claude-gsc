@@ -2809,7 +2809,8 @@ def ensure_arc_spawn_gate_softener(output_dir: Path) -> None:
         "3. Inside a DOMAIN worktree: run DEV STEPs (prd→…→implement→audit). "
         "Same-DOMAIN REQs share the worktree and one IMPLEMENT batch mindset.\n"
         "4. Per-DOMAIN accept (DEV receipts) → merge DOMAIN worktrees to mainline.\n"
-        "5. ONLY AFTER WAVE merge: centralized **batch_test** / wave acceptance.\n"
+        "5. ONLY AFTER WAVE merge: **ONE-SHOT** centralized **batch_test** for the "
+        "entire WAVE (v5ad); stamp all REQs from that one green — never serial per-REQ.\n"
         "FORBIDDEN: per-REQ serial PRD→…→BATCH_TEST loops; FORBIDDEN testing one REQ "
         "while sibling same-DOMAIN / same-WAVE DOMAIN work remains unmerged.\n"
         "Next WAVE starts only after current WAVE acceptance.\n\n"
@@ -2898,6 +2899,92 @@ def clear_domain_implement_receipts(work_dir: Path, req_ids: list[str]) -> list[
                 cleared.append(f"{rid}/{sid}")
     return cleared
 
+
+
+
+def stamp_wave_batch_siblings(
+    *,
+    runtime: "AgentRuntime",
+    output_dir: Path,
+    primary: "RequirementModule",
+    siblings: list["RequirementModule"],
+    wave_index: int,
+    completed: list[str],
+) -> None:
+    """After ONE-SHOT WAVE BATCH_TEST green on primary, stamp remaining WAVE modules.
+
+    v5ad root cure: FORBIDDEN serial per-REQ agent batch_test after merge (v5aa live bug).
+    Harness vitest is project-level; primary green applies to the whole WAVE.
+    Never marks green without a primary validation receipt.
+    """
+    if not siblings:
+        return
+    # Prefer primary harness receipt; fall back to a fresh project-level run once.
+    primary_receipt = validation_receipt_json_path(output_dir, primary.node_id)
+    validation: ValidationResult | None = None
+    if primary_receipt.is_file():
+        try:
+            payload = json.loads(primary_receipt.read_text(encoding="utf-8"))
+            if payload.get("ok"):
+                validation = ValidationResult(
+                    ok=True,
+                    exit_code=int(payload.get("exit_code") or 0),
+                    cmd=list(payload.get("cmd") or []),
+                    log_tail=str(payload.get("log_tail") or ""),
+                    reason=str(payload.get("reason") or "harness local validation passed"),
+                    project_dir=str(payload.get("project_dir") or ""),
+                )
+        except Exception:
+            validation = None
+    if validation is None:
+        validation = run_module_validation(output_dir, primary)
+    if not validation.ok:
+        raise RuntimeError(
+            f"WAVE{wave_index} central BATCH primary {primary.node_id} has no green "
+            f"validation receipt to stamp siblings: {validation.reason}"
+        )
+
+    batch_step = next(s for s in official_steps() if s.step_id == "batch_test")
+    acceptance = StepAcceptance(
+        ok=True,
+        reason=(
+            f"WAVE-central one-shot BATCH_TEST stamped from primary {primary.node_id} "
+            f"(v5ad; no serial per-REQ batch_test)"
+        ),
+        artifacts=(
+            f"validation:{validation.reason}",
+            f"cmd:{' '.join(validation.cmd)}" if validation.cmd else "cmd:",
+            f"stamped_from:{primary.node_id}",
+        ),
+        soft_notes=("v5ad_wave_central_one_shot_stamp",),
+    )
+    for module in siblings:
+        write_validation_receipt(output_dir, module.node_id, validation)
+        write_step_receipt(output_dir, module.node_id, batch_step, acceptance)
+        runtime.events.mark_implementation_done(
+            module.node_id,
+            f"WAVE BATCH_TEST stamped for {module.name} from primary {primary.node_id}",
+        )
+        runtime.events.mark_test_passed(
+            module.node_id,
+            "Harness local validation passed after WAVE-central one-shot BATCH_TEST",
+        )
+        runtime.git.commit(f"{module.node_id}: {module.name} (wave-batch stamp)")
+        if module.node_id not in completed:
+            completed.append(module.node_id)
+        print(
+            json.dumps(
+                {
+                    "event": "wave_batch_test_stamped_sibling",
+                    "wave_index": wave_index,
+                    "primary_req": primary.node_id,
+                    "req_id": module.node_id,
+                    "note": "ONE-SHOT central BATCH — no serial per-REQ agent batch_test",
+                },
+                ensure_ascii=False,
+            ),
+            flush=True,
+        )
 
 def supervisor_nudge_path(work_dir: Path, req_id: str) -> Path:
     return step_dir(work_dir, req_id) / "repair_note.txt"
@@ -3494,10 +3581,12 @@ def step_prompt(
     batch = ""
     if step.require_batch_test_run:
         batch = (
-            "REQUIRED this STEP (WAVE-central, post-merge ONLY): all DOMAIN worktrees "
-            "for this WAVE are already accepted+merged. Run centralized batch tests once "
-            "on mainline (prefer frontend `npx vitest run` / `npm test`). "
-            "Do NOT treat this as a per-REQ loop — fix wave-level failures here.\n"
+            "REQUIRED this STEP (WAVE-central ONE-SHOT, post-merge ONLY — v5ad): all "
+            "DOMAIN worktrees for this WAVE are already accepted+merged. Run "
+            "centralized batch tests ONCE on mainline for the ENTIRE WAVE "
+            "(prefer frontend `npx vitest run` / `npm test`). "
+            "FORBIDDEN: serial per-REQ BATCH_TEST (REQ-1 PASS then REQ-2 then REQ-3…). "
+            "Fix wave-level failures here; harness stamps all WAVE REQs from this one green.\n"
         )
 
     skill_lines = ", ".join(f"`{s}`" for s in step.required_skills)
@@ -3612,7 +3701,9 @@ def step_prompt(
         )
     elif step.step_id == "batch_test":
         mcp_extra = (
-            "\nBATCH_TEST / vitest (v5ac root cure):\n"
+            "\nBATCH_TEST / vitest (v5ac+v5ad root cure — ONE-SHOT for whole WAVE):\n"
+            "- This is the ONLY agent batch_test for the WAVE. Sibling REQs are stamped from this green.\n"
+            "- FORBIDDEN: expect/run another per-REQ batch_test after this STEP.\n"
             "- Harness owns green: it runs `npx vitest run` / npm test. Your job is to FIX failures.\n"
             "- If VITEST OUTPUT / repair_note is present: IMMEDIATELY Write|Edit business code to fix\n"
             "  failing assertions. Do NOT only call commit_gate.\n"
@@ -3633,7 +3724,8 @@ def step_prompt(
             f"{wave_ctx.get('sibling_reqs', [])}\n"
             f"WAVE plan: {wave_ctx.get('plan_summary', '')}\n"
             "ORCHESTRATION: DOMAIN worktree DEV first → per-DOMAIN accept → merge all "
-            "DOMAIN worktrees → centralized BATCH_TEST. Never per-REQ BATCH_TEST.\n"
+            "DOMAIN worktrees → ONE-SHOT WAVE BATCH_TEST (v5ad). "
+            "Never serial per-REQ BATCH_TEST after merge.\n"
         )
 
     return textwrap.dedent(f"""
@@ -3653,7 +3745,7 @@ def step_prompt(
         - Harness acceptance is fail-closed: only the harness marks green after artifact/MCP gates.
         - This round is ONLY for STEP `{step.step_id}`. Do not perform later STEPs.
         - WAVE/DOMAIN DAG: work inside the DOMAIN worktree; same-DOMAIN REQs share implement.
-        - FORBIDDEN: per-REQ serial BATCH_TEST. BATCH_TEST only after WAVE DOMAIN merge.
+        - FORBIDDEN: per-REQ serial BATCH_TEST after merge (REQ-1 PASS→REQ-2→REQ-3…). ONE-SHOT WAVE BATCH_TEST only after all DOMAIN merges (v5ad).
         - Prefer main session; do NOT spawn Agent/Task for DOMAIN parallelism (harness owns worktrees).
         - Keep tool outputs small (no huge lockfiles/schemas).
         - Do NOT Read/Bash/cat SKILL.md. Skills (if any) are model-invoked via the Skill tool.
@@ -3970,6 +4062,7 @@ def main() -> int:
                     "v5ac_root_cure_write_skeleton_batch_repair",
                     "v5ac_soft_accept_requires_in_attempt_write",
                     "v5ac_batch_test_vitest_feed_implement_repair",
+                    "v5ad_wave_central_one_shot_batch_test",
                 ],
             },
             ensure_ascii=False,
@@ -5141,34 +5234,48 @@ def main() -> int:
             # Refresh mainline softener after merges
             ensure_arc_spawn_gate_softener(output_dir)
 
-            # --- Centralized BATCH_TEST after WAVE merge ---
+            # --- ONE-SHOT centralized BATCH_TEST after WAVE merge (v5ad) ---
+            # FORBIDDEN: serial per-REQ agent batch_test after merge (exactly what live
+            # v5aa sheet did: REQ-1 batch PASS → REQ-2 → REQ-3…). One agent session +
+            # one harness vitest for the whole WAVE; stamp siblings from primary green.
+            pending_batch = [
+                m
+                for m in wave_modules
+                if not module_already_passed(runtime, m.node_id, output_dir)
+            ]
             print(
                 json.dumps(
                     {
                         "event": "wave_batch_test_started",
                         "wave_index": wave.wave_index,
                         "req_ids": [m.node_id for m in wave_modules],
-                        "note": "central BATCH_TEST on mainline after all DOMAIN merges",
+                        "pending_req_ids": [m.node_id for m in pending_batch],
+                        "primary_req": pending_batch[0].node_id if pending_batch else None,
+                        "note": (
+                            "ONE-SHOT central BATCH_TEST on mainline after all DOMAIN "
+                            "merges (v5ad; NOT serial per-REQ)"
+                        ),
                     },
                     ensure_ascii=False,
                 ),
                 flush=True,
             )
-            for module in wave_modules:
-                if module_already_passed(runtime, module.node_id, output_dir):
-                    continue
+            if pending_batch:
+                primary = pending_batch[0]
                 wave_ctx_batch = {
                     "wave_index": wave.wave_index,
                     "wave_total": len(waves),
                     "wave_domains": [g.domain_id for g in wave.domains],
-                    "domain_id": module_domain_id(module),
+                    "domain_id": module_domain_id(primary),
                     "worktree": str(output_dir),
                     "sibling_reqs": [m.node_id for m in wave_modules],
+                    "wave_req_ids": [m.node_id for m in wave_modules],
                     "plan_summary": wave_plan_summary(waves),
                     "phase": "wave_batch_test",
+                    "centralized_once": True,
                 }
                 rc = execute_steps_for_module(
-                    module=module,
+                    module=primary,
                     steps_to_run=list(wave_batch_steps()),
                     work_dir=output_dir,
                     wave_ctx=wave_ctx_batch,
@@ -5176,6 +5283,29 @@ def main() -> int:
                 )
                 if rc != 0:
                     return rc
+                siblings = pending_batch[1:]
+                if siblings:
+                    stamp_wave_batch_siblings(
+                        runtime=runtime,
+                        output_dir=output_dir,
+                        primary=primary,
+                        siblings=siblings,
+                        wave_index=wave.wave_index,
+                        completed=completed,
+                    )
+                print(
+                    json.dumps(
+                        {
+                            "event": "wave_batch_test_completed",
+                            "wave_index": wave.wave_index,
+                            "primary_req": primary.node_id,
+                            "stamped_siblings": [m.node_id for m in siblings],
+                            "note": "ONE-SHOT WAVE BATCH done; siblings stamped without serial agent batch",
+                        },
+                        ensure_ascii=False,
+                    ),
+                    flush=True,
+                )
 
             print(
                 json.dumps(
