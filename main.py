@@ -699,6 +699,17 @@ DEGRADED MODE (rapid_refill self-heal — MCP stays ON; breaker still capped):
 """.strip()
 
 
+# v5ac: force early Write skeleton on IMPLEMENT (business path) before thrash.
+IMPLEMENT_EARLY_WRITE_APPEND = """
+EARLY WRITE SKELETON (v5ac — required before more MCP/Read thrash):
+1. At most one mcp__arch__search_code (if needed), then IMMEDIATELY Write|Edit a business
+   skeleton under frontend/src, backend/src, or src/ (module entry / route / service stub).
+2. Do NOT thrash Read / spec_read / state_read / artifact_read. Write progress is a HARD gate.
+3. Skills only via official Skill tool (setting_sources/skills=all) — never Read SKILL.md.
+4. Leftover pages files alone do NOT count as this STEP's write progress.
+""".strip()
+
+
 def is_business_source_path(path: str | Path) -> bool:
     """True when path targets app code under frontend|backend|src (not only pages leftover)."""
     raw = str(path or "").replace("\\", "/")
@@ -759,6 +770,70 @@ def implement_write_progress(
                     return True, f"implement_json_mtime:{p}"
     return False, "no_in_step_write_progress"
 
+
+
+def pages_write_progress(
+    output_dir: Path,
+    sdir: Path,
+    result: "ClaudeRunResult",
+) -> tuple[bool, str]:
+    """v5ac: in-attempt Write|Edit under UI paths OR pages.json mtime≥step_start."""
+    for path in result.builtin_writes:
+        raw = str(path or "").replace("\\", "/")
+        low = raw.lower()
+        if any(
+            seg in low
+            for seg in (
+                "/frontend/src/",
+                "/frontend/pages/",
+                "/src/pages/",
+                "/src/components/",
+                "/pages/",
+            )
+        ) or low.endswith((".tsx", ".jsx", ".vue", ".html", ".css")):
+            if "node_modules" not in low:
+                return True, f"in_session_write:{path}"
+    pages_receipt = sdir / "pages.json"
+    step_start = result.step_started_at
+    if pages_receipt.is_file() and pages_receipt.stat().st_size > 2:
+        if step_start is None or pages_receipt.stat().st_mtime >= float(step_start) - 1.0:
+            return True, f"pages_json_mtime:{pages_receipt}"
+    return False, "no_in_attempt_pages_write"
+
+
+def in_attempt_write_progress(
+    step_id: str,
+    output_dir: Path,
+    sdir: Path,
+    result: "ClaudeRunResult",
+) -> tuple[bool, str]:
+    """v5ac soft-accept helper: require fresh write this attempt (no stale lift)."""
+    sid = (step_id or "").strip()
+    if sid == "implement":
+        return implement_write_progress(output_dir, sdir, result)
+    if sid == "pages":
+        return pages_write_progress(output_dir, sdir, result)
+    # Generic: any Write|Edit this session, or step receipt mtime≥step_start.
+    if result.builtin_writes:
+        return True, f"in_session_write:{result.builtin_writes[0]}"
+    receipt = sdir / f"{sid}.json"
+    step_start = result.step_started_at
+    if receipt.is_file() and receipt.stat().st_size > 2:
+        if step_start is None or receipt.stat().st_mtime >= float(step_start) - 1.0:
+            return True, f"receipt_mtime:{receipt}"
+    # SPEC often uses MCP spec_write without filesystem Write — count MCP write tools.
+    used = list(getattr(result, "mcp_tools_used", ()) or ())
+    write_shorts = {
+        "prd": {"prd"},
+        "spec": {"spec_write"},
+        "test_dag": set(),
+        "govern": set(),
+    }.get(sid, set())
+    for t in used:
+        short = t.split("__")[-1] if isinstance(t, str) else ""
+        if short in write_shorts:
+            return True, f"mcp_write:{t}"
+    return False, f"no_in_attempt_write_progress:{sid}"
 
 def mcp_short_name(tool: str) -> str:
     """mcp__arch__prd -> prd; bare short names pass through."""
@@ -1097,6 +1172,9 @@ def run_claude_via_sdk(
         )
         system_append = sdk_driver.contest_system_prompt_append(skills_dir)
         allow_override = None
+        # v5ac: always push early Write skeleton on IMPLEMENT (independent of degrade).
+        if (step_id or "") == "implement":
+            system_append = system_append + "\n\n" + IMPLEMENT_EARLY_WRITE_APPEND
         if degrade_mode:
             system_append = system_append + "\n\n" + DEGRADED_SYSTEM_APPEND
             if (step_id or "") == "implement":
@@ -2375,9 +2453,38 @@ def merge_domain_worktree(
 
     last_err = ""
     merged_ok = False
+    print(
+        json.dumps(
+            {
+                "event": "domain_merge_attempt",
+                "domain_id": domain_id,
+                "strategy": strat,
+                "branch": branch,
+                "candidates": candidates[:4],
+                "worktree": str(wt),
+            },
+            ensure_ascii=False,
+        ),
+        flush=True,
+    )
     for i, ref in enumerate(candidates):
         # Before ANY merge attempt (including the first retry after conflict): abort.
+        had_dirty = bool(_git_unmerged_paths(output_dir)) or (output_dir / ".git" / "MERGE_HEAD").exists()
         _abort_merge_and_clean_index(output_dir)
+        if had_dirty:
+            print(
+                json.dumps(
+                    {
+                        "event": "domain_merge_abort_before_retry",
+                        "domain_id": domain_id,
+                        "attempt_index": i,
+                        "ref": ref,
+                        "strategy": strat,
+                    },
+                    ensure_ascii=False,
+                ),
+                flush=True,
+            )
         if _git_unmerged_paths(output_dir):
             raise RuntimeError(
                 f"merge domain {domain_id} failed: mainline index still unmerged after abort: "
@@ -2409,6 +2516,19 @@ def merge_domain_worktree(
                 else _resolve_merge_conflicts_theirs
             )
             if resolver(output_dir, domain_id):
+                print(
+                    json.dumps(
+                        {
+                            "event": "domain_merge_conflict_resolved",
+                            "domain_id": domain_id,
+                            "strategy": strat,
+                            "ref": ref,
+                            "attempt_index": i,
+                        },
+                        ensure_ascii=False,
+                    ),
+                    flush=True,
+                )
                 merged_ok = True
                 break
         last_err = (merge.stderr or merge.stdout or "").strip()
@@ -2422,8 +2542,33 @@ def merge_domain_worktree(
         detail = last_err[:400]
         if conflicts:
             detail = (detail + " | conflicts: " + ",".join(conflicts[:40])).strip(" |")
+        print(
+            json.dumps(
+                {
+                    "event": "domain_merge_failed_detail",
+                    "domain_id": domain_id,
+                    "strategy": strat,
+                    "conflicts": conflicts[:40],
+                    "detail": detail[:800],
+                },
+                ensure_ascii=False,
+            ),
+            flush=True,
+        )
         raise RuntimeError(f"merge domain {domain_id} failed: {detail}")
 
+    print(
+        json.dumps(
+            {
+                "event": "domain_merge_ok",
+                "domain_id": domain_id,
+                "strategy": strat,
+                "branch": branch,
+            },
+            ensure_ascii=False,
+        ),
+        flush=True,
+    )
     # Best-effort cleanup
     subprocess.run(
         ["git", "worktree", "remove", "--force", str(wt)],
@@ -3144,8 +3289,23 @@ def evaluate_step_acceptance(
                 skills_seen=skills_seen,
                 artifacts=tuple(found[:12]),
             )
+        # v5ac: pages must show in-attempt write (no leftover-only soft/hard green).
+        pages_wr_ok, pages_wr_proof = pages_write_progress(output_dir, sdir, result)
+        if not pages_wr_ok:
+            return StepAcceptance(
+                ok=False,
+                reason=(
+                    "PAGES STEP requires in-attempt write progress: Write|Edit UI under "
+                    "frontend/src (or pages.json mtime≥step_start); leftover files + design_mcp "
+                    "alone do NOT pass"
+                ),
+                skills_seen=skills_seen,
+                artifacts=tuple(found[:12] + design_mcp),
+                soft_notes=tuple(soft_notes + [f"pages_write_gate:{pages_wr_proof}"]),
+            )
+        soft_notes.append(f"pages_write_progress:{pages_wr_proof}")
         mcp_optional.extend(mcp_tools_matching(used, "read_image", "design_audit", "lifecycle", "query", "navigate", "snapshot", "take_screenshot"))
-        artifacts = found[:12] + design_mcp
+        artifacts = found[:12] + design_mcp + [pages_wr_proof]
         mcp_required = list(design_mcp)
 
     elif step.step_id == "implement":
@@ -3226,16 +3386,7 @@ def evaluate_step_acceptance(
             commit_gate_status = "missing"
             soft_notes.append("soft_missing:commit_gate")
         mcp_optional.extend(mcp_tools_matching(used, "trace_failure", "lifecycle", "console_messages"))
-        if not validation.ok:
-            return StepAcceptance(
-                ok=False,
-                reason=f"batch_test harness validation failed: {validation.reason}",
-                skills_seen=skills_seen,
-                artifacts=tuple(artifacts),
-                mcp_optional_seen=tuple(mcp_optional),
-                commit_gate_status=commit_gate_status,
-                soft_notes=tuple(soft_notes),
-            )
+        # Always persist validation receipt (pass or fail) so repair sees vitest output.
         sdir.mkdir(parents=True, exist_ok=True)
         (sdir / "batch_validation.json").write_text(
             json.dumps(
@@ -3245,7 +3396,7 @@ def evaluate_step_acceptance(
                     "cmd": validation.cmd,
                     "reason": validation.reason,
                     "project_dir": validation.project_dir,
-                    "log_tail": validation.log_tail[-4000:],
+                    "log_tail": validation.log_tail[-6000:],
                     "commit_gate_status": commit_gate_status,
                 },
                 ensure_ascii=False,
@@ -3255,6 +3406,29 @@ def evaluate_step_acceptance(
             encoding="utf-8",
         )
         artifacts.append(str(sdir / "batch_validation.json"))
+        if not validation.ok:
+            log_snip = (validation.log_tail or "")[-4000:]
+            soft_notes.append(f"vitest_log:{log_snip}")
+            # Also write a dedicated repair feed the implement STEP will load.
+            repair_feed = sdir / "repair_note.txt"
+            repair_feed.write_text(
+                (
+                    f"batch_test harness validation failed: {validation.reason}\n"
+                    f"cmd: {' '.join(validation.cmd)}\n"
+                    f"project_dir: {validation.project_dir}\n"
+                    f"VITEST OUTPUT:\n{log_snip}\n"
+                ),
+                encoding="utf-8",
+            )
+            return StepAcceptance(
+                ok=False,
+                reason=f"batch_test harness validation failed: {validation.reason}",
+                skills_seen=skills_seen,
+                artifacts=tuple(artifacts),
+                mcp_optional_seen=tuple(mcp_optional),
+                commit_gate_status=commit_gate_status,
+                soft_notes=tuple(soft_notes),
+            )
     else:
         return StepAcceptance(ok=False, reason=f"unknown step {step.step_id}", skills_seen=skills_seen)
 
@@ -3411,17 +3585,23 @@ def step_prompt(
             f"(record under `{base}/pages.json` key `design_mcp` if useful).\n"
             "- Soft: `mcp__arch__read_image`; browser `mcp__arch__lifecycle` + snapshot "
             f"(optional `{base}/browser_smoke.json`).\n"
+            "- PAGES in-attempt write (v5ac): Write|Edit ≥1 UI file under frontend/src (or refresh pages.json this STEP); leftover files alone do NOT pass.\n"
         )
     elif step.step_id == "implement":
         mcp_extra = (
             "\nMCP REQUIRED this STEP (fail-closed):\n"
             f"- Call `mcp__arch__search_code` ≥1 → write `{base}/search_code.json` hit summary.\n"
-            "- WRITE PROGRESS HARD GATE: within ≤N tools after any Skill, you MUST Write|Edit "
-            "at least one business file under frontend/src, backend/src, or src/ "
+            "- EARLY WRITE SKELETON (v5ac): AFTER search_code (or immediately if search already done), "
+            "FIRST Write|Edit a business skeleton under frontend/src, backend/src, or src/ "
+            "(module entry / route / service stub). Do this BEFORE more Read/MCP thrash.\n"
+            "- WRITE PROGRESS HARD GATE: you MUST Write|Edit ≥1 business file under "
+            "frontend/src, backend/src, or src/ "
             f"(or list fresh paths in `{base}/implement.json` key `files_written` with mtime≥this STEP).\n"
             "- Forbidden: pass on leftover pages-only files + search_code with no in-STEP write.\n"
             "- Soft: `mcp__arch__kb_query` (+ kb_inject on hit); optional refactor_code/format_code.\n"
             "- Do NOT re-call identical MCP reads; do NOT run continuous mid-dev tests.\n"
+            "- On VALIDATION REPAIR: read repair_note / VITEST OUTPUT and Write|Edit until tests would pass; "
+            "do NOT only call commit_gate.\n"
         )
     elif step.step_id == "audit_refactor":
         mcp_extra = (
@@ -3432,11 +3612,14 @@ def step_prompt(
         )
     elif step.step_id == "batch_test":
         mcp_extra = (
-            "\nMCP soft this STEP:\n"
-            f"- Call `mcp__arch__commit_gate` once → write `{base}/commit_gate.json` "
-            "(status recorded; commit_gate failure alone does NOT fail this STEP).\n"
-            "- On test failure soft: `mcp__arch__trace_failure`.\n"
-            "- Harness local validation is the hard green gate.\n"
+            "\nBATCH_TEST / vitest (v5ac root cure):\n"
+            "- Harness owns green: it runs `npx vitest run` / npm test. Your job is to FIX failures.\n"
+            "- If VITEST OUTPUT / repair_note is present: IMMEDIATELY Write|Edit business code to fix\n"
+            "  failing assertions. Do NOT only call commit_gate.\n"
+            "- FORBIDDEN: commit_gate-only thrash with no Write/Edit when tests failed.\n"
+            f"- Soft once: `mcp__arch__commit_gate` → `{base}/commit_gate.json` "
+            "(commit_gate alone does NOT green this STEP).\n"
+            "- On failure soft: `mcp__arch__trace_failure` then Write/Edit again.\n"
         )
 
     wave_ctx = wave_ctx or {}
@@ -3695,8 +3878,8 @@ def main() -> int:
     retry_base_seconds = env_int("ARC_RETRY_BASE_SECONDS", 5, minimum=1, maximum=300)
     retry_max_seconds = env_int("ARC_RETRY_MAX_SECONDS", 60, minimum=1, maximum=600)
     # Max repair Claude sessions AFTER the first harness validation failure.
-    # Total validation attempts = 1 + ARC_VALIDATION_MAX_REPAIRS (default 1+2=3).
-    max_validation_repairs = env_int("ARC_VALIDATION_MAX_REPAIRS", 2, minimum=0, maximum=10)
+    # Total validation attempts = 1 + ARC_VALIDATION_MAX_REPAIRS (default 1+4=5, v5ac).
+    max_validation_repairs = env_int("ARC_VALIDATION_MAX_REPAIRS", 4, minimum=0, maximum=10)  # v5ac: more room to fix vitest
     max_budget_usd = os.environ.get("ARC_MAX_BUDGET_USD", "150").strip()
     base_urls = configured_base_urls(base_url)
     host = upstream_host(base_urls[0])
@@ -3784,6 +3967,9 @@ def main() -> int:
                     "v5z_wave_domain_worktree_dag_central_batch_test",
                     "v5aa_merge_domain_worktree_abort_theirs",
                     "v5ab_harness_supervisor_soft_strategy",
+                    "v5ac_root_cure_write_skeleton_batch_repair",
+                    "v5ac_soft_accept_requires_in_attempt_write",
+                    "v5ac_batch_test_vitest_feed_implement_repair",
                 ],
             },
             ensure_ascii=False,
@@ -3862,6 +4048,7 @@ def main() -> int:
             )
 
         while True:
+            force_repair_restart = False
             for step in steps_to_run:
                 if has_step_receipt(work_dir, module.node_id, step.step_id):
                     print(
@@ -4097,6 +4284,51 @@ def main() -> int:
                         max_turns_hit = "max_turns" in term_reason or term_reason.endswith("max_turns")
                         if max_turns_hit:
                             soft_acc = evaluate_step_acceptance(work_dir, module, step, result)
+                            # v5ac: soft-accept@max_turns requires in-attempt write progress
+                            # (no lifting stale pages/spec/prd leftovers without a fresh write).
+                            if soft_acc.ok:
+                                sdir_sa = step_dir(work_dir, module.node_id)
+                                wr_ok, wr_proof = in_attempt_write_progress(
+                                    step.step_id, work_dir, sdir_sa, result
+                                )
+                                if not wr_ok and step.step_id in (
+                                    "pages",
+                                    "implement",
+                                    "spec",
+                                    "prd",
+                                    "test_dag",
+                                ):
+                                    soft_acc = StepAcceptance(
+                                        ok=False,
+                                        reason=(
+                                            f"soft-accept@max_turns denied: no in-attempt write progress "
+                                            f"({wr_proof}); refusing to lift stale artifacts"
+                                        ),
+                                        skills_seen=soft_acc.skills_seen,
+                                        missing_skills=soft_acc.missing_skills,
+                                        artifacts=soft_acc.artifacts,
+                                        mcp_required=soft_acc.mcp_required,
+                                        mcp_optional_seen=soft_acc.mcp_optional_seen,
+                                        commit_gate_status=soft_acc.commit_gate_status,
+                                        soft_notes=tuple(
+                                            list(soft_acc.soft_notes)
+                                            + [f"soft_accept_denied:{wr_proof}"]
+                                        ),
+                                    )
+                                    print(
+                                        json.dumps(
+                                            {
+                                                "event": "soft_accept_denied_no_write",
+                                                "req_id": module.node_id,
+                                                "step_id": step.step_id,
+                                                "proof": wr_proof,
+                                                "wave": wave_ctx.get("wave_index"),
+                                                "domain": wave_ctx.get("domain_id"),
+                                            },
+                                            ensure_ascii=False,
+                                        ),
+                                        flush=True,
+                                    )
                             if soft_acc.ok:
                                 soft_acc = StepAcceptance(
                                     ok=True,
@@ -4107,7 +4339,9 @@ def main() -> int:
                                     mcp_required=soft_acc.mcp_required,
                                     mcp_optional_seen=soft_acc.mcp_optional_seen,
                                     commit_gate_status=soft_acc.commit_gate_status,
-                                    soft_notes=tuple(list(soft_acc.soft_notes) + ["soft_accept:max_turns"]),
+                                    soft_notes=tuple(
+                                        list(soft_acc.soft_notes) + ["soft_accept:max_turns"]
+                                    ),
                                 )
                                 write_step_receipt(work_dir, module.node_id, step, soft_acc, claude=result)
                                 print(
@@ -4231,6 +4465,59 @@ def main() -> int:
                         accepted = True
                         break
                     prior_failure = acceptance.reason
+                    # v5ac: attach vitest log to prior_failure so next attempt / repair sees it.
+                    for _note in acceptance.soft_notes:
+                        if isinstance(_note, str) and _note.startswith("vitest_log:"):
+                            prior_failure = (
+                                (prior_failure or "")
+                                + "\nVITEST OUTPUT:\n"
+                                + _note[len("vitest_log:") :]
+                            )
+                            break
+                    # v5ac root cure: batch_test commit_gate thrash → escalate to implement repair
+                    # with vitest output instead of burning step retries on commit_gate-only turns.
+                    if (
+                        step.step_id == "batch_test"
+                        and "harness validation failed" in (acceptance.reason or "")
+                        and local_repair < max_validation_repairs
+                    ):
+                        print(
+                            json.dumps(
+                                {
+                                    "event": "batch_test_harness_fail_escalate_repair",
+                                    "req_id": module.node_id,
+                                    "step_attempt": step_attempt,
+                                    "validation_repair": local_repair,
+                                    "max_validation_repairs": max_validation_repairs,
+                                    "reason": acceptance.reason,
+                                    "wave": wave_ctx.get("wave_index"),
+                                },
+                                ensure_ascii=False,
+                            ),
+                            flush=True,
+                        )
+                        # Ensure repair_note has vitest feed (evaluate_step_acceptance may have written it).
+                        rn = step_dir(work_dir, module.node_id) / "repair_note.txt"
+                        if not rn.is_file() or rn.stat().st_size < 20:
+                            rn.parent.mkdir(parents=True, exist_ok=True)
+                            rn.write_text((prior_failure or "")[-6000:], encoding="utf-8")
+                        clear_step_receipt(work_dir, module.node_id, "implement")
+                        clear_step_receipt(work_dir, module.node_id, "batch_test")
+                        clear_step_receipt(work_dir, module.node_id, "audit_refactor")
+                        local_repair += 1
+                        steps_to_run = [
+                            s
+                            for s in official_steps()
+                            if s.step_id in ("implement", "audit_refactor", "batch_test")
+                        ]
+                        runtime.events.mark_run_resumed(
+                            f"WAVE batch_test→implement repair {local_repair}/{max_validation_repairs} "
+                            f"for {module.node_id}; vitest failure fed to repair_note"
+                        )
+                        accepted = False
+                        # Break out of step_attempt + step loops to restart with repair steps.
+                        force_repair_restart = True
+                        break
                     # v5ab: implement_soft_stall when acceptance fail with no Write, or max_turns stall.
                     if (
                         harness_supervisor.supervisor_enabled()
@@ -4291,6 +4578,9 @@ def main() -> int:
                     clear_step_receipt(work_dir, module.node_id, step.step_id)
                     write_step_receipt(work_dir, module.node_id, step, acceptance, claude=result)
 
+                if force_repair_restart:
+                    # v5ac: restart outer while with implement+batch_test repair steps.
+                    break
                 if not accepted:
                     runtime.events.mark_implementation_failed(
                         module.node_id,
@@ -4319,6 +4609,8 @@ def main() -> int:
                     )
                     return 1
 
+            if force_repair_restart:
+                continue
             if not do_post_validation:
                 # DOMAIN DEV path: STEPs accepted; NO per-REQ BATCH_TEST / mark_test_passed.
                 runtime.events.mark_implementation_done(

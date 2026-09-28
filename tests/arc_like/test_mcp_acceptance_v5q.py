@@ -86,12 +86,23 @@ class McpAcceptanceV5qTests(unittest.TestCase):
             )
             self.assertFalse(acc.ok)
             self.assertIn("design_style", acc.reason)
+            # v5ac: design_mcp alone + leftover pages is not enough — need in-attempt write.
             acc2 = mod.evaluate_step_acceptance(
                 root, _module(), _step("pages"),
                 _result(skills=("designer",), mcp=("mcp__arch__design_style",)),
             )
-            self.assertTrue(acc2.ok)
-            self.assertTrue(any("design_style" in a for a in acc2.mcp_required + acc2.artifacts))
+            self.assertFalse(acc2.ok)
+            self.assertIn("in-attempt write", acc2.reason.lower())
+            acc3 = mod.evaluate_step_acceptance(
+                root, _module(), _step("pages"),
+                _result(
+                    skills=("designer",),
+                    mcp=("mcp__arch__design_style",),
+                    writes=("frontend/src/pages/Home.tsx",),
+                ),
+            )
+            self.assertTrue(acc3.ok, acc3.reason)
+            self.assertTrue(any("design_style" in a for a in acc3.mcp_required + acc3.artifacts))
 
     def test_implement_requires_search_code(self):
         with tempfile.TemporaryDirectory() as tmp:

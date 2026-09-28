@@ -79,7 +79,7 @@ MCP_THRASH_WATCH_SUFFIXES = (
 MCP_THRASH_SOFT_LIMIT = 2  # identical fingerprint
 MCP_THRASH_HARD_LIMIT = 3
 # Optional: consecutive builtin Read with no Write/Edit on implement/spec → deny further Read.
-READ_ONLY_STREAK_LIMIT = 8
+READ_ONLY_STREAK_LIMIT = 5  # v5ac: force Write skeleton earlier on implement/spec
 READ_STREAK_STEPS = frozenset({"implement", "spec"})
 # After BOTH prd_govern + spec_govern ≥1 in govern STEP, deny further *_govern re-audits.
 GOVERN_ACCEPT_GREEN_TOOLS = frozenset({"prd_govern", "spec_govern"})
@@ -89,7 +89,8 @@ THRASH_DENY_ADVICE = (
 )
 READ_STREAK_DENY_ADVICE = (
     "Read-only streak on this STEP — stop re-reading. "
-    "You MUST Write or Edit business paths under frontend|backend|src now."
+    "You MUST Write or Edit a BUSINESS SKELETON under frontend/src|backend/src|src NOW "
+    "(v5ac early-write). Do not call more MCP reads until Write lands."
 )
 GOVERN_ACCEPT_GREEN_ADVICE = (
     "Govern accept criteria already met (prd_govern + spec_govern ≥1). "
