@@ -28,6 +28,7 @@ import claude_agent_sdk
 from arcbench_agent_runtime import AgentRuntime
 
 import sdk_driver
+import supervisor as harness_supervisor
 
 
 SUBMISSION_DIR = Path(os.environ.get("ARCBENCH_SUBMISSION_DIR", Path(__file__).resolve().parent))
@@ -76,6 +77,11 @@ class ClaudeRunResult:
     builtin_writes: tuple[str, ...] = ()
     # Wall-clock epoch when this SDK/CLI attempt started (mtime ≥ step_start gate).
     step_started_at: float | None = None
+    # v5ab: thrash telemetry for soft supervisor (never marks green).
+    thrash_hit: bool = False
+    thrash_events: tuple[dict, ...] = ()
+    deny_events: tuple[dict, ...] = ()
+    thrash_counts: tuple[tuple[str, int], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -1169,6 +1175,10 @@ def run_claude_via_sdk(
         mcp_tools_used=turn.mcp_tools_used,
         builtin_writes=getattr(turn, "builtin_writes", ()) or (),
         step_started_at=step_started_at,
+        thrash_hit=bool(getattr(turn, "thrash_hit", False)),
+        thrash_events=tuple(getattr(turn, "thrash_events", ()) or ()),
+        deny_events=tuple(getattr(turn, "deny_events", ()) or ()),
+        thrash_counts=tuple(getattr(turn, "thrash_counts", ()) or ()),
     )
 
 
@@ -2272,14 +2282,80 @@ def _resolve_merge_conflicts_theirs(output_dir: Path, domain_id: str) -> bool:
     return not _git_unmerged_paths(output_dir) and not (output_dir / ".git" / "MERGE_HEAD").exists()
 
 
-def merge_domain_worktree(output_dir: Path, domain_id: str, wt: Path) -> None:
+def _resolve_merge_conflicts_ours(output_dir: Path, domain_id: str) -> bool:
+    """Resolve conflicted paths with mainline (--ours). Used only by supervisor retry_merge_ours."""
+    conflicts = _git_unmerged_paths(output_dir)
+    if not conflicts:
+        return False
+    checkout = subprocess.run(
+        ["git", "checkout", "--ours", "--", *conflicts],
+        cwd=str(output_dir),
+        capture_output=True,
+        text=True,
+    )
+    if checkout.returncode != 0:
+        for pth in conflicts:
+            subprocess.run(
+                ["git", "checkout", "--ours", "--", pth],
+                cwd=str(output_dir),
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+    subprocess.run(
+        ["git", "add", "-A"],
+        cwd=str(output_dir),
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    still = _git_unmerged_paths(output_dir)
+    if still:
+        return False
+    status = subprocess.run(
+        ["git", "status", "--porcelain"],
+        cwd=str(output_dir),
+        capture_output=True,
+        text=True,
+    )
+    merge_head = (output_dir / ".git" / "MERGE_HEAD").exists()
+    if merge_head or (status.stdout or "").strip():
+        commit = subprocess.run(
+            [
+                "git",
+                "commit",
+                "--no-edit",
+                "-m",
+                f"wave-merge domain {domain_id} (ours)",
+            ],
+            cwd=str(output_dir),
+            capture_output=True,
+            text=True,
+        )
+        if commit.returncode != 0 and merge_head:
+            return False
+    return not _git_unmerged_paths(output_dir) and not (output_dir / ".git" / "MERGE_HEAD").exists()
+
+
+def merge_domain_worktree(
+    output_dir: Path,
+    domain_id: str,
+    wt: Path,
+    *,
+    strategy: str = "theirs",
+) -> None:
     """Merge DOMAIN branch into mainline; remove worktree after successful merge.
 
-    Hardened (v5aa): always abort dirty merges before retry; prefer
+    Hardened (v5aa): always abort dirty merges before retry; default
     ``git merge --no-ff -X theirs`` so domain tip wins overlapping paths;
     on conflict, checkout --theirs + add + commit; fail-closed with conflict
     file list if still dirty. Never runs ``git merge HEAD`` inside the worktree.
+
+    strategy: "theirs" (default/v5aa) or "ours" (supervisor-only alternate).
     """
+    strat = (strategy or "theirs").strip().lower()
+    if strat not in {"theirs", "ours"}:
+        strat = "theirs"
     branch = f"arc-domain-{safe_node_id(domain_id)}"
     # Commit any leftover WIP in worktree
     commit_domain_worktree(wt, domain_id, f"{domain_id}: domain accept pre-merge")
@@ -2291,7 +2367,7 @@ def merge_domain_worktree(output_dir: Path, domain_id: str, wt: Path) -> None:
         text=True,
     )
     sha = (rev.stdout or "").strip()
-    merge_msg = f"wave-merge domain {domain_id}"
+    merge_msg = f"wave-merge domain {domain_id}" + ("" if strat == "theirs" else f" ({strat})")
     # Prefer named branch; fall back to worktree tip SHA.
     candidates: list[str] = [branch]
     if sha and sha not in candidates:
@@ -2313,7 +2389,7 @@ def merge_domain_worktree(output_dir: Path, domain_id: str, wt: Path) -> None:
                 "merge",
                 "--no-ff",
                 "-X",
-                "theirs",
+                strat,
                 "-m",
                 merge_msg,
                 ref,
@@ -2325,9 +2401,14 @@ def merge_domain_worktree(output_dir: Path, domain_id: str, wt: Path) -> None:
         if merge.returncode == 0 and not _git_unmerged_paths(output_dir):
             merged_ok = True
             break
-        # Conflict or soft failure: try to resolve with domain version.
+        # Conflict or soft failure: try to resolve with chosen strategy.
         if _git_unmerged_paths(output_dir) or (output_dir / ".git" / "MERGE_HEAD").exists():
-            if _resolve_merge_conflicts_theirs(output_dir, domain_id):
+            resolver = (
+                _resolve_merge_conflicts_ours
+                if strat == "ours"
+                else _resolve_merge_conflicts_theirs
+            )
+            if resolver(output_dir, domain_id):
                 merged_ok = True
                 break
         last_err = (merge.stderr or merge.stdout or "").strip()
@@ -2659,6 +2740,22 @@ def clear_step_receipt(output_dir: Path, node_id: str, step_id: str) -> None:
     ):
         if path.exists():
             path.unlink()
+
+
+def clear_domain_implement_receipts(work_dir: Path, req_ids: list[str]) -> list[str]:
+    """Clear implement(+batch_test) receipts so DOMAIN can re-implement. Never marks green."""
+    cleared: list[str] = []
+    for rid in req_ids:
+        for sid in ("implement", "audit_refactor", "batch_test"):
+            before = has_step_receipt(work_dir, rid, sid)
+            clear_step_receipt(work_dir, rid, sid)
+            if before:
+                cleared.append(f"{rid}/{sid}")
+    return cleared
+
+
+def supervisor_nudge_path(work_dir: Path, req_id: str) -> Path:
+    return step_dir(work_dir, req_id) / "repair_note.txt"
 
 
 def write_step_receipt(
@@ -3370,6 +3467,7 @@ def step_prompt(
         {wave_lines}
         HARD RULES:
         - GSC MCP stays ON. Never disable WaitForMcpServers / never ARC_ENABLE_MCP=0 / never ban MCP.
+        - Harness acceptance is fail-closed: only the harness marks green after artifact/MCP gates.
         - This round is ONLY for STEP `{step.step_id}`. Do not perform later STEPs.
         - WAVE/DOMAIN DAG: work inside the DOMAIN worktree; same-DOMAIN REQs share implement.
         - FORBIDDEN: per-REQ serial BATCH_TEST. BATCH_TEST only after WAVE DOMAIN merge.
@@ -3685,6 +3783,7 @@ def main() -> int:
                     "v5y_govern_stop_thrash_accept_green_deny",
                     "v5z_wave_domain_worktree_dag_central_batch_test",
                     "v5aa_merge_domain_worktree_abort_theirs",
+                    "v5ab_harness_supervisor_soft_strategy",
                 ],
             },
             ensure_ascii=False,
@@ -3907,6 +4006,92 @@ def main() -> int:
                         on_retry=on_step_retry,
                     )
                     classification = classify_claude_failure(result)
+                    # v5ab: record thrash telemetry; optional govern_thrash soft recovery.
+                    if getattr(result, "thrash_events", None):
+                        for te in result.thrash_events[-8:]:
+                            harness_supervisor.note_event(te if isinstance(te, dict) else {"event": "mcp_thrash_guard"})
+                    if getattr(result, "deny_events", None):
+                        for de in result.deny_events[-8:]:
+                            if isinstance(de, dict):
+                                harness_supervisor.note_event(de)
+                    skip_soft_stall = False
+                    supervisor_nudge = ""
+                    if (
+                        harness_supervisor.supervisor_enabled()
+                        and step.step_id == "govern"
+                        and (
+                            bool(getattr(result, "thrash_hit", False))
+                            or bool(getattr(result, "deny_events", ()))
+                        )
+                    ):
+                        levels = []
+                        for ev in list(getattr(result, "thrash_events", ())) + list(
+                            getattr(result, "deny_events", ())
+                        ):
+                            if isinstance(ev, dict) and ev.get("level"):
+                                levels.append(str(ev.get("level")))
+                        level = "hard"
+                        for cand in (
+                            "govern_accept_deny",
+                            "read_streak_deny",
+                            "hard_repeat",
+                            "hard",
+                            "soft",
+                        ):
+                            if cand in levels:
+                                level = cand
+                                break
+                        obs_gt = harness_supervisor.build_observation(
+                            hook="govern_thrash",
+                            wave_index=wave_ctx.get("wave_index"),
+                            domain_id=wave_ctx.get("domain_id"),
+                            req_id=module.node_id,
+                            step_id=step.step_id,
+                            attempt=step_attempt,
+                            error_snippet=(result.tail or "")[:2000],
+                            extras={
+                                "level": level,
+                                "thrash_hit": bool(getattr(result, "thrash_hit", False)),
+                                "thrash_counts": dict(getattr(result, "thrash_counts", ()) or ()),
+                                "govern_accept_met": any(
+                                    isinstance(e, dict)
+                                    and e.get("event") == "mcp_thrash_pretool_deny"
+                                    for e in getattr(result, "deny_events", ())
+                                ),
+                                "deny_count": len(getattr(result, "deny_events", ()) or ()),
+                                "deny_events_tail": list(getattr(result, "deny_events", ()))[-5:],
+                            },
+                        )
+                        d_gt = harness_supervisor.ask_supervisor(obs_gt)
+                        if d_gt.action == harness_supervisor.ACTION_NUDGE_STEP_PROMPT:
+                            supervisor_nudge = d_gt.nudge_text or d_gt.reason
+                            if supervisor_nudge:
+                                harness_supervisor.apply_nudge(
+                                    supervisor_nudge_path(work_dir, module.node_id),
+                                    supervisor_nudge,
+                                )
+                                prior_failure = (
+                                    (prior_failure or "") + f" | supervisor_nudge:{supervisor_nudge[:200]}"
+                                ).strip(" |")
+                        elif d_gt.action == harness_supervisor.ACTION_SKIP_SOFT_STALL_WAIT:
+                            skip_soft_stall = True
+                        elif d_gt.action == harness_supervisor.ACTION_FAIL_CLOSED:
+                            runtime.events.mark_run_failed(
+                                f"Module {module.node_id} govern_thrash fail_closed: {d_gt.reason}"
+                            )
+                            return 1
+                    if skip_soft_stall:
+                        print(
+                            json.dumps(
+                                {
+                                    "event": "harness_supervisor_skip_soft_stall",
+                                    "req_id": module.node_id,
+                                    "step_id": step.step_id,
+                                },
+                                ensure_ascii=False,
+                            ),
+                            flush=True,
+                        )
                     if result.returncode != 0 or result.is_error:
                         term_reason = (result.terminal_reason or "").lower()
                         max_turns_hit = "max_turns" in term_reason or term_reason.endswith("max_turns")
@@ -3943,6 +4128,57 @@ def main() -> int:
                                 )
                                 accepted = True
                                 break
+                            # v5ab: max_turns without soft-accept artifacts → implement_soft_stall.
+                            elif (
+                                harness_supervisor.supervisor_enabled()
+                                and step.step_id == "implement"
+                            ):
+                                extras_mt = {
+                                    "max_turns_hit": True,
+                                    "acceptance_failed": not soft_acc.ok,
+                                    "writes_this_step": len(getattr(result, "builtin_writes", ()) or ()),
+                                    "read_streak_deny": any(
+                                        isinstance(e, dict)
+                                        and e.get("level") == "read_streak_deny"
+                                        for e in getattr(result, "deny_events", ()) or ()
+                                    ),
+                                    "acceptance_reason": soft_acc.reason[:500],
+                                    "soft_notes": list(soft_acc.soft_notes)[:10],
+                                }
+                                if harness_supervisor.should_call_hook(
+                                    "implement_soft_stall", extras_mt
+                                ):
+                                    obs_mt = harness_supervisor.build_observation(
+                                        hook="implement_soft_stall",
+                                        wave_index=wave_ctx.get("wave_index"),
+                                        domain_id=wave_ctx.get("domain_id"),
+                                        req_id=module.node_id,
+                                        step_id=step.step_id,
+                                        attempt=step_attempt,
+                                        error_snippet=soft_acc.reason[:4000],
+                                        extras=extras_mt,
+                                    )
+                                    d_mt = harness_supervisor.ask_supervisor(obs_mt)
+                                    if d_mt.action == harness_supervisor.ACTION_NUDGE_STEP_PROMPT:
+                                        nt = d_mt.nudge_text or d_mt.reason
+                                        if nt:
+                                            harness_supervisor.apply_nudge(
+                                                supervisor_nudge_path(work_dir, module.node_id),
+                                                nt,
+                                            )
+                                            prior_failure = (
+                                                (prior_failure or classification.reason)
+                                                + f" | supervisor_nudge:{nt[:200]}"
+                                            )
+                                    elif d_mt.action == harness_supervisor.ACTION_SKIP_SOFT_STALL_WAIT:
+                                        skip_soft_stall = True
+                                    elif d_mt.action == harness_supervisor.ACTION_FAIL_CLOSED:
+                                        runtime.events.mark_run_failed(
+                                            f"Module {module.node_id} implement_soft_stall fail_closed: {d_mt.reason}"
+                                        )
+                                        return 1
+                                    elif d_mt.action == harness_supervisor.ACTION_RE_IMPLEMENT_DOMAIN:
+                                        clear_step_receipt(work_dir, module.node_id, "implement")
                         terminal = {
                             "event": "step_terminal_failure",
                             "req_id": module.node_id,
@@ -3995,6 +4231,63 @@ def main() -> int:
                         accepted = True
                         break
                     prior_failure = acceptance.reason
+                    # v5ab: implement_soft_stall when acceptance fail with no Write, or max_turns stall.
+                    if (
+                        harness_supervisor.supervisor_enabled()
+                        and step.step_id == "implement"
+                    ):
+                        writes = list(getattr(result, "builtin_writes", ()) or ())
+                        read_deny = any(
+                            isinstance(e, dict) and e.get("level") == "read_streak_deny"
+                            for e in getattr(result, "deny_events", ()) or ()
+                        )
+                        max_turns_hit_local = "max_turns" in (
+                            (result.terminal_reason or "").lower()
+                        )
+                        extras_iss = {
+                            "acceptance_failed": True,
+                            "writes_this_step": len(writes),
+                            "read_streak_deny": read_deny,
+                            "max_turns_hit": max_turns_hit_local,
+                            "acceptance_reason": acceptance.reason[:500],
+                            "soft_notes": list(acceptance.soft_notes)[:10],
+                        }
+                        if harness_supervisor.should_call_hook("implement_soft_stall", extras_iss):
+                            obs_iss = harness_supervisor.build_observation(
+                                hook="implement_soft_stall",
+                                wave_index=wave_ctx.get("wave_index"),
+                                domain_id=wave_ctx.get("domain_id"),
+                                req_id=module.node_id,
+                                step_id=step.step_id,
+                                attempt=step_attempt,
+                                error_snippet=acceptance.reason[:4000],
+                                extras=extras_iss,
+                            )
+                            d_iss = harness_supervisor.ask_supervisor(obs_iss)
+                            if d_iss.action == harness_supervisor.ACTION_NUDGE_STEP_PROMPT:
+                                nt = d_iss.nudge_text or d_iss.reason
+                                if nt:
+                                    harness_supervisor.apply_nudge(
+                                        supervisor_nudge_path(work_dir, module.node_id),
+                                        nt,
+                                    )
+                                    prior_failure = (
+                                        (prior_failure or "") + f" | supervisor_nudge:{nt[:200]}"
+                                    ).strip(" |")
+                            elif d_iss.action == harness_supervisor.ACTION_RE_IMPLEMENT_DOMAIN:
+                                clear_step_receipt(work_dir, module.node_id, "implement")
+                                clear_step_receipt(work_dir, module.node_id, "batch_test")
+                            elif d_iss.action == harness_supervisor.ACTION_SKIP_SOFT_STALL_WAIT:
+                                skip_soft_stall = True
+                            elif d_iss.action == harness_supervisor.ACTION_FAIL_CLOSED:
+                                runtime.events.mark_implementation_failed(
+                                    module.node_id,
+                                    f"implement_soft_stall fail_closed: {d_iss.reason}",
+                                )
+                                runtime.events.mark_run_failed(
+                                    f"Module {module.node_id} implement_soft_stall fail_closed: {d_iss.reason}"
+                                )
+                                return 1
                     clear_step_receipt(work_dir, module.node_id, step.step_id)
                     write_step_receipt(work_dir, module.node_id, step, acceptance, claude=result)
 
@@ -4111,6 +4404,59 @@ def main() -> int:
                 )
                 return validation.exit_code or 1
 
+            # v5ab: batch_test_fail supervisor before rewind (gate.action == repair).
+            if harness_supervisor.supervisor_enabled():
+                extras_bt = {
+                    "gate_action": "repair",
+                    "vitest_exit": validation.exit_code,
+                    "log_tail": (validation.log_tail or "")[-2000:],
+                    "cmd": list(validation.cmd)[:20],
+                    "validation_repair": local_repair,
+                    "max_validation_repairs": max_validation_repairs,
+                }
+                harness_supervisor.note_event(
+                    {
+                        "event": "module_validation",
+                        "req_id": module.node_id,
+                        "ok": False,
+                        "validation_repair": local_repair,
+                    }
+                )
+                obs_bt = harness_supervisor.build_observation(
+                    hook="batch_test_fail",
+                    wave_index=wave_ctx.get("wave_index"),
+                    domain_id=wave_ctx.get("domain_id"),
+                    req_id=module.node_id,
+                    step_id="batch_test",
+                    attempt=local_repair + 1,
+                    repair_index=local_repair,
+                    error_snippet=fail_msg[:4000],
+                    extras=extras_bt,
+                )
+                d_bt = harness_supervisor.ask_supervisor(obs_bt)
+                if d_bt.action == harness_supervisor.ACTION_FAIL_CLOSED:
+                    runtime.events.mark_implementation_failed(
+                        module.node_id,
+                        f"batch_test_fail fail_closed: {d_bt.reason}",
+                    )
+                    runtime.events.mark_run_failed(
+                        f"Module {module.node_id} batch_test_fail fail_closed: {d_bt.reason}"
+                    )
+                    return validation.exit_code or 1
+                if d_bt.action == harness_supervisor.ACTION_RE_IMPLEMENT_DOMAIN:
+                    # Clear more aggressively; continue into existing rewind.
+                    clear_domain_implement_receipts(work_dir, [module.node_id])
+                if d_bt.action == harness_supervisor.ACTION_NUDGE_STEP_PROMPT and d_bt.nudge_text:
+                    # Applied after writing fail_msg base below.
+                    pass
+                bt_nudge = (
+                    d_bt.nudge_text
+                    if d_bt.action == harness_supervisor.ACTION_NUDGE_STEP_PROMPT
+                    else ""
+                )
+            else:
+                bt_nudge = ""
+
             local_repair += 1
             for sid in ("implement", "batch_test"):
                 clear_step_receipt(work_dir, module.node_id, sid)
@@ -4120,6 +4466,8 @@ def main() -> int:
             repair_note = step_dir(work_dir, module.node_id) / "repair_note.txt"
             repair_note.parent.mkdir(parents=True, exist_ok=True)
             repair_note.write_text(fail_msg[-6000:], encoding="utf-8")
+            if bt_nudge:
+                harness_supervisor.apply_nudge(repair_note, bt_nudge)
             runtime.events.mark_run_resumed(
                 f"WAVE validation repair {local_repair}/{max_validation_repairs} for {module.node_id}; "
                 "re-running implement+batch_test STEPs"
@@ -4356,6 +4704,129 @@ def main() -> int:
                 try:
                     merge_domain_worktree(output_dir, group.domain_id, wt)
                 except Exception as merge_exc:
+                    # v5ab: soft supervisor chooses among safe retries. Flag OFF → fail-closed.
+                    # Never marks green; v5aa theirs path already exhausted before this hook.
+                    merge_retry_done = False
+                    re_implement_ids = [m.node_id for m in group.modules]
+                    if harness_supervisor.supervisor_enabled():
+                        conflicts = []
+                        try:
+                            conflicts = _git_unmerged_paths(output_dir)[:40]
+                        except Exception:
+                            conflicts = []
+                        harness_supervisor.note_event(
+                            {
+                                "event": "domain_merge_failed",
+                                "wave_index": wave.wave_index,
+                                "domain_id": group.domain_id,
+                                "ok": False,
+                            }
+                        )
+                        obs = harness_supervisor.build_observation(
+                            hook="merge_fail",
+                            wave_index=wave.wave_index,
+                            domain_id=group.domain_id,
+                            attempt=1,
+                            error_snippet=str(merge_exc)[:4000],
+                            extras={
+                                "merge_error": str(merge_exc)[:2000],
+                                "conflict_paths": conflicts,
+                                "last_strategy": "theirs",
+                                "candidates_tried": 2,
+                                "note": "v5aa default already exhausted before this hook",
+                            },
+                        )
+                        decision = harness_supervisor.ask_supervisor(obs)
+                        action = decision.action
+                        if action == harness_supervisor.ACTION_RETRY_MERGE_THEIRS:
+                            try:
+                                merge_domain_worktree(
+                                    output_dir, group.domain_id, wt, strategy="theirs"
+                                )
+                                merge_retry_done = True
+                            except Exception as retry_exc:
+                                merge_exc = retry_exc
+                        elif action == harness_supervisor.ACTION_RETRY_MERGE_OURS:
+                            try:
+                                merge_domain_worktree(
+                                    output_dir, group.domain_id, wt, strategy="ours"
+                                )
+                                merge_retry_done = True
+                            except Exception as retry_exc:
+                                merge_exc = retry_exc
+                        elif action == harness_supervisor.ACTION_RE_IMPLEMENT_DOMAIN:
+                            cleared = clear_domain_implement_receipts(wt, re_implement_ids)
+                            print(
+                                json.dumps(
+                                    {
+                                        "event": "domain_merge_supervisor_re_implement",
+                                        "wave_index": wave.wave_index,
+                                        "domain_id": group.domain_id,
+                                        "cleared": cleared,
+                                        "reason": decision.reason,
+                                    },
+                                    ensure_ascii=False,
+                                ),
+                                flush=True,
+                            )
+                            implement_batch = [
+                                s
+                                for s in domain_dev_steps()
+                                if s.step_id in ("implement", "audit_refactor")
+                            ]
+                            primary = group.modules[0]
+                            wave_ctx_ri = {
+                                "wave_index": wave.wave_index,
+                                "wave_total": len(waves),
+                                "wave_domains": [g.domain_id for g in wave.domains],
+                                "domain_id": group.domain_id,
+                                "worktree": str(wt),
+                                "sibling_reqs": [m.node_id for m in group.modules],
+                                "plan_summary": wave_plan_summary(waves),
+                                "phase": "supervisor_re_implement",
+                            }
+                            if decision.nudge_text:
+                                harness_supervisor.apply_nudge(
+                                    supervisor_nudge_path(wt, primary.node_id),
+                                    decision.nudge_text,
+                                )
+                            rc_ri = execute_steps_for_module(
+                                module=primary,
+                                steps_to_run=list(implement_batch),
+                                work_dir=wt,
+                                wave_ctx=wave_ctx_ri,
+                                do_post_validation=False,
+                            )
+                            if rc_ri != 0:
+                                merge_exc = RuntimeError(
+                                    f"re_implement_domain failed rc={rc_ri} after merge_fail"
+                                )
+                            else:
+                                try:
+                                    merge_domain_worktree(
+                                        output_dir, group.domain_id, wt, strategy="theirs"
+                                    )
+                                    merge_retry_done = True
+                                except Exception as retry_exc:
+                                    merge_exc = retry_exc
+                        elif action == harness_supervisor.ACTION_FAIL_CLOSED:
+                            pass
+                        print(
+                            json.dumps(
+                                {
+                                    "event": "domain_merge_supervisor_retry",
+                                    "wave_index": wave.wave_index,
+                                    "domain_id": group.domain_id,
+                                    "action": action,
+                                    "reason": decision.reason,
+                                    "ok": merge_retry_done,
+                                },
+                                ensure_ascii=False,
+                            ),
+                            flush=True,
+                        )
+                    if merge_retry_done:
+                        continue
                     runtime.events.mark_run_failed(
                         f"WAVE{wave.wave_index} merge DOMAIN {group.domain_id} failed: {merge_exc}"
                     )
@@ -4373,6 +4844,7 @@ def main() -> int:
                         flush=True,
                     )
                     return 1
+
 
             # Refresh mainline softener after merges
             ensure_arc_spawn_gate_softener(output_dir)

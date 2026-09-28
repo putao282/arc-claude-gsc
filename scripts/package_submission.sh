@@ -16,7 +16,13 @@ command -v python3 >/dev/null 2>&1 || { echo "missing required command: python3"
 
 rm -rf "$STAGE"
 mkdir -p "$STAGE"
-cp "$ROOT/main.py" "$ROOT/sdk_driver.py" "$ROOT/runtime.lock.json" "$ROOT/requirements.txt" "$STAGE/"
+cp "$ROOT/main.py" "$ROOT/sdk_driver.py" "$ROOT/supervisor.py" "$ROOT/runtime.lock.json" "$ROOT/requirements.txt" "$STAGE/"
+# Canary: pack-local sentinel enables ARC_HARNESS_SUPERVISOR when contest cannot inject env.
+# Set ARC_PACK_SUPERVISOR=0 to omit sentinel (code default remains OFF without env/sentinel).
+if [[ "${ARC_PACK_SUPERVISOR:-1}" == "1" ]]; then
+  echo "1" > "$STAGE/ARC_HARNESS_SUPERVISOR"
+  echo "  + ARC_HARNESS_SUPERVISOR sentinel (canary ON)"
+fi
 
 echo "[1/2] import current ARC-Bench Factory starter assets"
 python3 - "$STARTER_ZIP" "$STAGE" <<'PY'

@@ -350,6 +350,11 @@ class SdkTurnResult:
     mcp_tools_used: tuple[str, ...] = ()
     builtin_writes: tuple[str, ...] = ()
     driver: str = "ClaudeSDKClient"
+    # v5ab: thrash telemetry for soft supervisor hooks (never marks green).
+    thrash_hit: bool = False
+    thrash_events: tuple[dict, ...] = ()
+    deny_events: tuple[dict, ...] = ()
+    thrash_counts: tuple[tuple[str, int], ...] = ()
 
 
 
@@ -794,6 +799,16 @@ async def run_sdk_turn_async(
                         skills_loaded=tuple(dict.fromkeys(skill_loads)),
                         mcp_tools_used=tuple(sorted(mcp_tool_counts.keys())),
                         builtin_writes=tuple(dict.fromkeys(builtin_writes)),
+                        thrash_hit=bool(thrash_guard.thrash_hit),
+                        thrash_events=tuple(thrash_guard.events[-12:]),
+                        deny_events=tuple(thrash_guard.deny_events[-12:]),
+                        thrash_counts=tuple(
+                            sorted(
+                                ((k.rsplit("__", 1)[-1] if "__" in k else k), v)
+                                for k, v in thrash_guard._counts.items()
+                                if v >= thrash_guard.soft_limit
+                            )[:40]
+                        ),
                     )
 
     # No ResultMessage — treat as failure.
@@ -807,6 +822,16 @@ async def run_sdk_turn_async(
         skills_loaded=tuple(dict.fromkeys(skill_loads)),
         mcp_tools_used=tuple(sorted(mcp_tool_counts.keys())),
         builtin_writes=tuple(dict.fromkeys(builtin_writes)),
+        thrash_hit=bool(thrash_guard.thrash_hit),
+        thrash_events=tuple(thrash_guard.events[-12:]),
+        deny_events=tuple(thrash_guard.deny_events[-12:]),
+        thrash_counts=tuple(
+            sorted(
+                ((k.rsplit("__", 1)[-1] if "__" in k else k), v)
+                for k, v in thrash_guard._counts.items()
+                if v >= thrash_guard.soft_limit
+            )[:40]
+        ),
     )
 
 
