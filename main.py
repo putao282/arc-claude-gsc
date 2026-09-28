@@ -2163,47 +2163,186 @@ def commit_domain_worktree(wt: Path, domain_id: str, message: str) -> None:
     )
 
 
-def merge_domain_worktree(output_dir: Path, domain_id: str, wt: Path) -> None:
-    """Merge DOMAIN branch into mainline; remove worktree after successful merge."""
-    branch = f"arc-domain-{safe_node_id(domain_id)}"
-    # Commit any leftover WIP in worktree
-    commit_domain_worktree(wt, domain_id, f"{domain_id}: domain accept pre-merge")
-    merge = subprocess.run(
-        ["git", "merge", "--no-ff", "-m", f"wave-merge domain {domain_id}", branch],
+def _git_unmerged_paths(cwd: Path) -> list[str]:
+    """Return paths still unmerged in the index (empty when clean)."""
+    proc = subprocess.run(
+        ["git", "ls-files", "-u"],
+        cwd=str(cwd),
+        capture_output=True,
+        text=True,
+    )
+    if proc.returncode != 0:
+        return []
+    paths: list[str] = []
+    seen: set[str] = set()
+    for line in (proc.stdout or "").splitlines():
+        parts = line.split("\t", 1)
+        if len(parts) != 2:
+            continue
+        p = parts[1].strip()
+        if p and p not in seen:
+            seen.add(p)
+            paths.append(p)
+    return paths
+
+
+def _abort_merge_and_clean_index(output_dir: Path) -> None:
+    """Abort any in-progress merge and ensure mainline index is not left unmerged."""
+    subprocess.run(
+        ["git", "merge", "--abort"],
+        cwd=str(output_dir),
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    # If abort was a no-op but unmerged entries remain, drop them via reset.
+    if _git_unmerged_paths(output_dir):
+        subprocess.run(
+            ["git", "reset", "--merge"],
+            cwd=str(output_dir),
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    if _git_unmerged_paths(output_dir):
+        subprocess.run(
+            ["git", "read-tree", "--reset", "-u", "HEAD"],
+            cwd=str(output_dir),
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+
+
+def _resolve_merge_conflicts_theirs(output_dir: Path, domain_id: str) -> bool:
+    """Resolve conflicted paths with domain tip (--theirs). Return True if clean."""
+    conflicts = _git_unmerged_paths(output_dir)
+    if not conflicts:
+        # May still be a failed merge with no unmerged paths; treat as not resolved.
+        return False
+    checkout = subprocess.run(
+        ["git", "checkout", "--theirs", "--", *conflicts],
         cwd=str(output_dir),
         capture_output=True,
         text=True,
     )
-    if merge.returncode != 0:
-        # Try merge by worktree path ref
-        merge2 = subprocess.run(
-            ["git", "merge", "--no-ff", "-m", f"wave-merge domain {domain_id}", "HEAD"],
-            cwd=str(wt),
-            capture_output=True,
-            text=True,
-        )
-        # Cherry approach: fetch commit from worktree and merge into mainline
-        rev = subprocess.run(
-            ["git", "rev-parse", "HEAD"],
-            cwd=str(wt),
-            capture_output=True,
-            text=True,
-        )
-        sha = (rev.stdout or "").strip()
-        if sha:
-            merge3 = subprocess.run(
-                ["git", "merge", "--no-ff", "-m", f"wave-merge domain {domain_id}", sha],
+    if checkout.returncode != 0:
+        # Fallback path-by-path so one bad path does not block the rest.
+        for p in conflicts:
+            subprocess.run(
+                ["git", "checkout", "--theirs", "--", p],
                 cwd=str(output_dir),
+                check=False,
                 capture_output=True,
                 text=True,
             )
-            if merge3.returncode != 0:
-                raise RuntimeError(
-                    f"merge domain {domain_id} failed: "
-                    f"{(merge.stderr or '')[:400]} | {(merge3.stderr or '')[:400]}"
-                )
-        elif merge.returncode != 0:
-            raise RuntimeError(f"merge domain {domain_id} failed: {(merge.stderr or merge.stdout or '')[:600]}")
+    subprocess.run(
+        ["git", "add", "-A"],
+        cwd=str(output_dir),
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    still = _git_unmerged_paths(output_dir)
+    if still:
+        return False
+    # Finish the merge commit if we are mid-merge with a clean index.
+    status = subprocess.run(
+        ["git", "status", "--porcelain"],
+        cwd=str(output_dir),
+        capture_output=True,
+        text=True,
+    )
+    merge_head = (output_dir / ".git" / "MERGE_HEAD").exists()
+    if merge_head or (status.stdout or "").strip():
+        commit = subprocess.run(
+            [
+                "git",
+                "commit",
+                "--no-edit",
+                "-m",
+                f"wave-merge domain {domain_id}",
+            ],
+            cwd=str(output_dir),
+            capture_output=True,
+            text=True,
+        )
+        if commit.returncode != 0 and merge_head:
+            return False
+    return not _git_unmerged_paths(output_dir) and not (output_dir / ".git" / "MERGE_HEAD").exists()
+
+
+def merge_domain_worktree(output_dir: Path, domain_id: str, wt: Path) -> None:
+    """Merge DOMAIN branch into mainline; remove worktree after successful merge.
+
+    Hardened (v5aa): always abort dirty merges before retry; prefer
+    ``git merge --no-ff -X theirs`` so domain tip wins overlapping paths;
+    on conflict, checkout --theirs + add + commit; fail-closed with conflict
+    file list if still dirty. Never runs ``git merge HEAD`` inside the worktree.
+    """
+    branch = f"arc-domain-{safe_node_id(domain_id)}"
+    # Commit any leftover WIP in worktree
+    commit_domain_worktree(wt, domain_id, f"{domain_id}: domain accept pre-merge")
+
+    rev = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=str(wt),
+        capture_output=True,
+        text=True,
+    )
+    sha = (rev.stdout or "").strip()
+    merge_msg = f"wave-merge domain {domain_id}"
+    # Prefer named branch; fall back to worktree tip SHA.
+    candidates: list[str] = [branch]
+    if sha and sha not in candidates:
+        candidates.append(sha)
+
+    last_err = ""
+    merged_ok = False
+    for i, ref in enumerate(candidates):
+        # Before ANY merge attempt (including the first retry after conflict): abort.
+        _abort_merge_and_clean_index(output_dir)
+        if _git_unmerged_paths(output_dir):
+            raise RuntimeError(
+                f"merge domain {domain_id} failed: mainline index still unmerged after abort: "
+                + ",".join(_git_unmerged_paths(output_dir)[:40])
+            )
+        merge = subprocess.run(
+            [
+                "git",
+                "merge",
+                "--no-ff",
+                "-X",
+                "theirs",
+                "-m",
+                merge_msg,
+                ref,
+            ],
+            cwd=str(output_dir),
+            capture_output=True,
+            text=True,
+        )
+        if merge.returncode == 0 and not _git_unmerged_paths(output_dir):
+            merged_ok = True
+            break
+        # Conflict or soft failure: try to resolve with domain version.
+        if _git_unmerged_paths(output_dir) or (output_dir / ".git" / "MERGE_HEAD").exists():
+            if _resolve_merge_conflicts_theirs(output_dir, domain_id):
+                merged_ok = True
+                break
+        last_err = (merge.stderr or merge.stdout or "").strip()
+        # Leave dirty state only long enough for the next iteration's abort.
+        if i + 1 < len(candidates):
+            continue
+
+    if not merged_ok:
+        conflicts = _git_unmerged_paths(output_dir)
+        _abort_merge_and_clean_index(output_dir)
+        detail = last_err[:400]
+        if conflicts:
+            detail = (detail + " | conflicts: " + ",".join(conflicts[:40])).strip(" |")
+        raise RuntimeError(f"merge domain {domain_id} failed: {detail}")
+
     # Best-effort cleanup
     subprocess.run(
         ["git", "worktree", "remove", "--force", str(wt)],
@@ -3545,6 +3684,7 @@ def main() -> int:
                     "v5x_phaseA_write_gate_thrash_deny_refill_degrade",
                     "v5y_govern_stop_thrash_accept_green_deny",
                     "v5z_wave_domain_worktree_dag_central_batch_test",
+                    "v5aa_merge_domain_worktree_abort_theirs",
                 ],
             },
             ensure_ascii=False,
