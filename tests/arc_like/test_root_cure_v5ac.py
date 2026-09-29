@@ -102,23 +102,10 @@ class RootCureV5acTests(unittest.TestCase):
         self.assertFalse(hasattr(mod, "pages_write_progress"))
         self.assertNotIn("pages", [s.step_id for s in mod.official_steps()])
 
-    def test_in_attempt_write_progress_dispatch(self):
-        with tempfile.TemporaryDirectory() as td:
-            root = Path(td)
-            sdir = root / ".arc" / "steps" / "REQ-1"
-            sdir.mkdir(parents=True)
-            ok, _ = mod.in_attempt_write_progress(
-                "implement",
-                root,
-                sdir,
-                _result(builtin_writes=("src/lib/x.ts",)),
-            )
-            self.assertTrue(ok)
-            # pages STEP gone — generic path, no writes → False
-            ok2, proof = mod.in_attempt_write_progress(
-                "pages", root, sdir, _result(builtin_writes=())
-            )
-            self.assertFalse(ok2)
+    def test_in_attempt_write_progress_deleted_v5aj(self):
+        # soft-accept theater helper removed; implement_write_progress remains for thin gates
+        self.assertFalse(hasattr(mod, "in_attempt_write_progress"))
+        self.assertTrue(hasattr(mod, "implement_write_progress"))
 
     def test_batch_test_failure_writes_repair_note_with_vitest_log(self):
         with tempfile.TemporaryDirectory() as td:

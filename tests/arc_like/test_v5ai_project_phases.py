@@ -244,10 +244,14 @@ class V5aiProjectPhasesTests(unittest.TestCase):
             self.assertIn("No PAGES stage", body)
             self.assertNotIn("5. **pages**", body)
 
-    def test_soft_accept_skipped_for_implement_in_source(self):
+    def test_soft_accept_theater_gone_v5aj(self):
         src = (ROOT / "main.py").read_text(encoding="utf-8")
-        self.assertIn('if max_turns_hit and step.step_id != "implement":', src)
-        self.assertIn("no soft-accept@max_turns", src)
+        # v5aj: soft-accept@max_turns theater deleted entirely (not only skipped for implement).
+        self.assertNotIn("soft_accept:max_turns", src)
+        self.assertNotIn("soft_accept_denied_no_write", src)
+        self.assertNotIn("in_attempt_write_progress", src)
+        self.assertIn("v5aj_no_soft_accept_theater", src)
+        self.assertIn("NO soft-accept@max_turns theater", src)
 
 
 if __name__ == "__main__":

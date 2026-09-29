@@ -9,7 +9,10 @@ import importlib.metadata
 import json
 import re
 import os
-import pwd
+try:
+    import pwd  # Unix contest runtime
+except ImportError:  # Windows host/dev
+    pwd = None  # type: ignore
 import shutil
 import signal
 import subprocess
@@ -28,7 +31,6 @@ import claude_agent_sdk
 from arcbench_agent_runtime import AgentRuntime
 
 import sdk_driver
-import supervisor as harness_supervisor
 
 
 SUBMISSION_DIR = Path(os.environ.get("ARCBENCH_SUBMISSION_DIR", Path(__file__).resolve().parent))
@@ -792,39 +794,6 @@ def implement_write_progress(
 
 
 
-
-def in_attempt_write_progress(
-    step_id: str,
-    output_dir: Path,
-    sdir: Path,
-    result: "ClaudeRunResult",
-) -> tuple[bool, str]:
-    """v5ac soft-accept helper: require fresh write this attempt (no stale lift)."""
-    sid = (step_id or "").strip()
-    if sid == "implement":
-        return implement_write_progress(output_dir, sdir, result)
-    # Generic: any Write|Edit this session, or step receipt mtime≥step_start.
-    # (v5ag: pages STEP removed — no pages_write_progress path)
-    if result.builtin_writes:
-        return True, f"in_session_write:{result.builtin_writes[0]}"
-    receipt = sdir / f"{sid}.json"
-    step_start = result.step_started_at
-    if receipt.is_file() and receipt.stat().st_size > 2:
-        if step_start is None or receipt.stat().st_mtime >= float(step_start) - 1.0:
-            return True, f"receipt_mtime:{receipt}"
-    # SPEC often uses MCP spec_write without filesystem Write — count MCP write tools.
-    used = list(getattr(result, "mcp_tools_used", ()) or ())
-    write_shorts = {
-        "prd": {"prd"},
-        "spec": {"spec_write"},
-        "test_dag": set(),
-        "govern": set(),
-    }.get(sid, set())
-    for t in used:
-        short = t.split("__")[-1] if isinstance(t, str) else ""
-        if short in write_shorts:
-            return True, f"mcp_write:{t}"
-    return False, f"no_in_attempt_write_progress:{sid}"
 
 def mcp_short_name(tool: str) -> str:
     """mcp__arch__prd -> prd; bare short names pass through."""
@@ -1663,298 +1632,6 @@ def run_project_build(
         reason=f"npm run build failed: exit={exit_code} (v5af hard gate)",
         project_dir=str(project_dir),
     )
-
-
-_DEFAULT_IMPORT_FROM_PAGES_RE = re.compile(
-    r"""import\s+([A-Za-z_][\w]*)\s+from\s+['"]([^'"]+)['"]""",
-    re.MULTILINE,
-)
-_EXPORT_DEFAULT_RE = re.compile(r"""export\s+default\b""")
-
-
-def _resolve_import_path(importer: Path, spec: str) -> Path | None:
-    """Resolve a relative TS/JS import spec to an existing file (try extensions)."""
-    if not spec.startswith("."):
-        return None
-    base = (importer.parent / spec).resolve()
-    candidates: list[Path] = []
-    if base.suffix:
-        candidates.append(base)
-    else:
-        for ext in (".tsx", ".jsx", ".ts", ".js", ".mjs", ".cjs"):
-            candidates.append(Path(str(base) + ext))
-        candidates.append(base / "index.tsx")
-        candidates.append(base / "index.jsx")
-        candidates.append(base / "index.ts")
-        candidates.append(base / "index.js")
-    for c in candidates:
-        try:
-            if c.is_file():
-                return c
-        except OSError:
-            continue
-    return None
-
-
-def check_app_page_default_exports(output_dir: Path) -> tuple[bool, str, list[str]]:
-    """v5af: App/router default-imports of pages must have `export default`.
-
-    Static fail-closed gate matching Official `npm run build` (Vite) breakage when
-    `import HomePage from './pages/HomePage'` lacks default export.
-    """
-    app_candidates = [
-        output_dir / "frontend" / "src" / "App.tsx",
-        output_dir / "frontend" / "src" / "App.jsx",
-        output_dir / "frontend" / "src" / "App.ts",
-        output_dir / "frontend" / "src" / "App.js",
-        output_dir / "frontend" / "src" / "main.tsx",
-        output_dir / "frontend" / "src" / "main.jsx",
-        output_dir / "src" / "App.tsx",
-        output_dir / "src" / "App.jsx",
-        output_dir / "src" / "App.ts",
-        output_dir / "src" / "App.js",
-    ]
-    apps = [p for p in app_candidates if p.is_file()]
-    if not apps:
-        # No App yet — pages STEP may create pages before App wires them; soft skip.
-        return True, "no_app_router_yet", []
-    problems: list[str] = []
-    checked: list[str] = []
-    for app in apps:
-        try:
-            src = app.read_text(encoding="utf-8", errors="replace")
-        except OSError as exc:
-            problems.append(f"unreadable:{app}:{exc}")
-            continue
-        for m in _DEFAULT_IMPORT_FROM_PAGES_RE.finditer(src):
-            local_name, spec = m.group(1), m.group(2)
-            spec_norm = spec.replace("\\", "/")
-            # Only care about page-like imports (default import style).
-            if "/pages/" not in spec_norm and not spec_norm.rstrip("/").endswith("/pages") and "pages/" not in spec_norm:
-                # Also catch './pages/HomePage' and '../pages/X'
-                if "pages" not in spec_norm.split("/") and not re.search(r"(^|/)pages(/|$)", spec_norm):
-                    continue
-            target = _resolve_import_path(app, spec)
-            if target is None:
-                problems.append(f"missing_module:{app.name}:{local_name}<-{spec}")
-                continue
-            checked.append(str(target))
-            try:
-                body = target.read_text(encoding="utf-8", errors="replace")
-            except OSError as exc:
-                problems.append(f"unreadable_page:{target}:{exc}")
-                continue
-            if not _EXPORT_DEFAULT_RE.search(body):
-                problems.append(
-                    f"missing_default_export:{target.name} (imported as default by {app.name} from {spec})"
-                )
-    if problems:
-        return False, "; ".join(problems[:8]), checked
-    return True, f"default_exports_ok:{len(checked)}", checked
-
-
-def check_pages_not_stub(output_dir: Path, *, min_bytes: int = 120) -> tuple[bool, str, list[str]]:
-    """Reject empty/near-empty page components under frontend/src/pages (or src/pages)."""
-    roots = [
-        output_dir / "frontend" / "src" / "pages",
-        output_dir / "src" / "pages",
-    ]
-    pages: list[Path] = []
-    for root in roots:
-        if not root.is_dir():
-            continue
-        for pattern in ("**/*.tsx", "**/*.jsx"):
-            for p in root.glob(pattern):
-                if p.is_file() and "node_modules" not in p.parts:
-                    pages.append(p)
-    if not pages:
-        return False, "no_page_files_under_src/pages", []
-    thin: list[str] = []
-    ok_pages: list[str] = []
-    for p in pages:
-        try:
-            size = p.stat().st_size
-            body = p.read_text(encoding="utf-8", errors="replace")
-        except OSError:
-            thin.append(f"unreadable:{p.name}")
-            continue
-        has_default = bool(_EXPORT_DEFAULT_RE.search(body))
-        # Strip whitespace-only / nearly empty shells
-        stripped = re.sub(r"\s+", "", body)
-        if size < min_bytes or len(stripped) < max(40, min_bytes // 3):
-            thin.append(f"stub_too_small:{p.name}:{size}B")
-            continue
-        if not has_default:
-            thin.append(f"no_export_default:{p.name}")
-            continue
-        ok_pages.append(str(p))
-    if not ok_pages:
-        return False, "all_pages_stub_or_missing_default:" + ";".join(thin[:6]), thin
-    if thin and not ok_pages:
-        return False, ";".join(thin[:6]), thin
-    # Pass if ≥1 real page; note thin siblings.
-    note = f"real_pages={len(ok_pages)}"
-    if thin:
-        note += f";thin_skipped={len(thin)}"
-    return True, note, ok_pages
-
-
-def _load_test_dag_entries(sdir: Path) -> tuple[list, list]:
-    dag = sdir / "test_dag.json"
-    if not dag.is_file():
-        return [], []
-    try:
-        payload = json.loads(dag.read_text(encoding="utf-8"))
-    except Exception:
-        return [], []
-    if not isinstance(payload, dict):
-        return [], []
-    api = payload.get("api") or payload.get("api_tests") or []
-    ui = payload.get("ui") or payload.get("ui_tests") or []
-    tests_obj = payload.get("tests")
-    if isinstance(tests_obj, dict):
-        if not api:
-            api = tests_obj.get("api") or tests_obj.get("api_tests") or []
-        if not ui:
-            ui = tests_obj.get("ui") or tests_obj.get("ui_tests") or []
-    if not isinstance(api, list):
-        api = []
-    if not isinstance(ui, list):
-        ui = []
-    return api, ui
-
-
-def _entry_keywords(entry: object) -> list[str]:
-    keys: list[str] = []
-    if isinstance(entry, str):
-        keys.append(entry)
-        return [k for k in keys if len(k) >= 3]
-    if not isinstance(entry, dict):
-        return []
-    for k in (
-        "path", "route", "url", "endpoint", "api", "name", "id", "feature",
-        "handler", "method", "page", "component", "selector", "testId", "test_id",
-        "description", "title",
-    ):
-        v = entry.get(k)
-        if isinstance(v, str) and v.strip():
-            keys.append(v.strip())
-        elif isinstance(v, (list, tuple)):
-            for item in v:
-                if isinstance(item, str) and item.strip():
-                    keys.append(item.strip())
-    # Also flatten nested path-like
-    for v in entry.values():
-        if isinstance(v, str) and v.startswith("/") and len(v) >= 2:
-            keys.append(v)
-    # Dedup preserving order; drop ultra-short noise
-    out: list[str] = []
-    seen: set[str] = set()
-    for k in keys:
-        low = k.lower()
-        if low in seen:
-            continue
-        if len(k) < 2:
-            continue
-        seen.add(low)
-        out.append(k)
-    return out[:12]
-
-
-def check_test_dag_feature_wiring(
-    output_dir: Path,
-    sdir: Path,
-    *,
-    min_hit_ratio: float = 0.34,
-) -> tuple[bool, str]:
-    """v5af: require source wiring for TEST_DAG api+ui features (not vitest-stub-only).
-
-    Scans frontend/backend/src for keywords from test_dag entries. Fail closed when
-    DAG exists but almost no matching routes/handlers/pages appear in source —
-    prevents platform evaluate 0/N feature scores after harness vitest-greens.
-    """
-    api, ui = _load_test_dag_entries(sdir)
-    if not api and not ui:
-        return False, "test_dag_missing_or_empty_for_feature_wiring"
-    # Collect searchable source text (cap size)
-    roots = [
-        output_dir / "frontend" / "src",
-        output_dir / "backend" / "src",
-        output_dir / "src",
-        output_dir / "backend",
-    ]
-    blobs: list[str] = []
-    total_bytes = 0
-    for root in roots:
-        if not root.exists():
-            continue
-        for p in root.rglob("*"):
-            if not p.is_file():
-                continue
-            if p.suffix.lower() not in {".ts", ".tsx", ".js", ".jsx", ".py", ".vue"}:
-                continue
-            if "node_modules" in p.parts or "dist" in p.parts or ".git" in p.parts:
-                continue
-            try:
-                sz = p.stat().st_size
-            except OSError:
-                continue
-            if sz < 20 or sz > 400_000:
-                continue
-            try:
-                blobs.append(p.read_text(encoding="utf-8", errors="replace"))
-                total_bytes += sz
-            except OSError:
-                continue
-            if total_bytes > 2_000_000:
-                break
-        if total_bytes > 2_000_000:
-            break
-    corpus = "\n".join(blobs).lower()
-    if len(corpus) < 80:
-        return False, "no_source_corpus_for_feature_wiring"
-
-    def _hit(entry: object) -> bool:
-        kws = _entry_keywords(entry)
-        if not kws:
-            return False
-        for kw in kws:
-            token = kw.lower().strip()
-            # path fragments: try last segment
-            if token in corpus:
-                return True
-            if "/" in token:
-                seg = token.rstrip("/").split("/")[-1]
-                if len(seg) >= 3 and seg.lower() in corpus:
-                    return True
-            # camel/pascal variants of hyphen/underscore names
-            compact = re.sub(r"[^a-z0-9]", "", token)
-            if len(compact) >= 4 and compact in re.sub(r"[^a-z0-9]", "", corpus):
-                return True
-        return False
-
-    api_hits = sum(1 for e in api if _hit(e))
-    ui_hits = sum(1 for e in ui if _hit(e))
-    api_n = len(api) or 0
-    ui_n = len(ui) or 0
-    notes = [f"api_hits={api_hits}/{api_n}", f"ui_hits={ui_hits}/{ui_n}", f"corpus_bytes={total_bytes}"]
-    # Require both sides when present
-    ok = True
-    if api_n:
-        if api_hits / api_n < min_hit_ratio and api_hits < 1:
-            ok = False
-        elif api_hits < max(1, int(api_n * min_hit_ratio + 0.999)):
-            # need ceil(ratio*n) hits, at least 1
-            need = max(1, int(api_n * min_hit_ratio + 0.999))
-            if api_hits < need:
-                ok = False
-    if ui_n:
-        need = max(1, int(ui_n * min_hit_ratio + 0.999))
-        if ui_hits < need:
-            ok = False
-    if not ok:
-        return False, "feature_wiring_insufficient:" + ",".join(notes)
-    return True, "feature_wiring_ok:" + ",".join(notes)
 
 
 def find_test_files(project_dir: Path) -> list[Path]:
@@ -3569,10 +3246,6 @@ def stamp_wave_batch_siblings(
             flush=True,
         )
 
-def supervisor_nudge_path(work_dir: Path, req_id: str) -> Path:
-    return step_dir(work_dir, req_id) / "repair_note.txt"
-
-
 def write_step_receipt(
     output_dir: Path,
     node_id: str,
@@ -4366,7 +4039,7 @@ def chown_tree(path: Path, uid: int, gid: int) -> None:
 
 
 def choose_agent_identity(output_dir: Path, home_dir: Path, plugin_data: Path) -> tuple[int, int, str] | None:
-    if os.geteuid() != 0:
+    if pwd is None or not hasattr(os, "geteuid") or os.geteuid() != 0:
         return None
 
     template_stat = output_dir.stat()
@@ -4613,7 +4286,6 @@ def main() -> int:
                     "v5y_govern_stop_thrash_accept_green_deny",
                     "v5z_wave_domain_worktree_dag_central_batch_test",
                     "v5aa_merge_domain_worktree_abort_theirs",
-                    "v5ab_harness_supervisor_soft_strategy",
                     "v5ac_root_cure_write_skeleton_batch_repair",
                     "v5ac_soft_accept_requires_in_attempt_write",
                     "v5ac_batch_test_vitest_feed_implement_repair",
@@ -4633,6 +4305,12 @@ def main() -> int:
                     "v5ai_no_per_req_design_reentry",
                     "v5ai_no_pages_audit_default_off",
                     "v5ai_implement_no_soft_accept_max_turns",
+                    "v5aj_thin_cc_launcher_shell_only",
+                    "v5aj_no_harness_supervisor",
+                    "v5aj_no_soft_accept_theater",
+                    "v5aj_no_feature_wiring_fail_closed",
+                    "v5aj_three_phase_once",
+                    "v5aj_delete_agent_os_leftover",
                 ],
             },
             ensure_ascii=False,
@@ -4856,21 +4534,8 @@ def main() -> int:
                         on_retry=on_step_retry,
                     )
                     classification = classify_claude_failure(result)
-                    # v5ab: record thrash telemetry; optional govern_thrash soft recovery.
-                    if getattr(result, "thrash_events", None):
-                        for te in result.thrash_events[-8:]:
-                            harness_supervisor.note_event(te if isinstance(te, dict) else {"event": "mcp_thrash_guard"})
-                    if getattr(result, "deny_events", None):
-                        for de in result.deny_events[-8:]:
-                            if isinstance(de, dict):
-                                harness_supervisor.note_event(de)
-                    skip_soft_stall = False
-                    supervisor_nudge = ""
-                    # v5ae ONE root cure: when govern accept already green, FORCE STOP
-                    # the STEP successfully. Soft/hard thrash or post-green identical
-                    # denies must NOT ask supervisor fail_closed (Official v5ad github
-                    # 9fb20f0ad79f: prd_govern hard thrash×3 then govern_accept_already_green
-                    # already met, supervisor still fail_closed → main exit 1).
+                    # v5aj: thin CC launcher — no harness_supervisor soft brain, no soft-accept theater.
+                    # Optional govern (audit OFF by default): if accept already green, FORCE STOP STEP.
                     gov_green = step.step_id == "govern" and govern_accept_already_green(result)
                     if gov_green:
                         print(
@@ -4880,16 +4545,12 @@ def main() -> int:
                                     "req_id": module.node_id,
                                     "step_id": step.step_id,
                                     "thrash_hit": bool(getattr(result, "thrash_hit", False)),
-                                    "deny_count": len(getattr(result, "deny_events", ()) or ()),
                                     "mcp_tools_used": list(
                                         getattr(result, "mcp_tools_used", ()) or ()
                                     ),
                                     "wave": wave_ctx.get("wave_index"),
                                     "domain": wave_ctx.get("domain_id"),
-                                    "note": (
-                                        "skip supervisor fail_closed; evaluate acceptance "
-                                        "and STOP STEP"
-                                    ),
+                                    "note": "v5aj: evaluate acceptance and STOP STEP (no supervisor)",
                                 },
                                 ensure_ascii=False,
                             ),
@@ -4901,7 +4562,7 @@ def main() -> int:
                                 ok=True,
                                 reason=(
                                     f"{force_acc.reason} "
-                                    "(v5ae force-stop after govern_accept_already_green)"
+                                    "(v5aj force-stop after govern_accept_already_green)"
                                 ),
                                 skills_seen=force_acc.skills_seen,
                                 missing_skills=force_acc.missing_skills,
@@ -4911,7 +4572,7 @@ def main() -> int:
                                 commit_gate_status=force_acc.commit_gate_status,
                                 soft_notes=tuple(
                                     list(force_acc.soft_notes)
-                                    + ["v5ae_govern_green_force_stop"]
+                                    + ["v5aj_govern_green_force_stop"]
                                 ),
                             )
                             write_step_receipt(
@@ -4935,231 +4596,10 @@ def main() -> int:
                             )
                             accepted = True
                             break
-                        # Green signal present but acceptance gate somehow failed —
-                        # fall through without supervisor fail_closed.
-                    elif (
-                        harness_supervisor.supervisor_enabled()
-                        and step.step_id == "govern"
-                        and (
-                            bool(getattr(result, "thrash_hit", False))
-                            or bool(getattr(result, "deny_events", ()))
-                        )
-                    ):
-                        levels = []
-                        for ev in list(getattr(result, "thrash_events", ())) + list(
-                            getattr(result, "deny_events", ())
-                        ):
-                            if isinstance(ev, dict) and ev.get("level"):
-                                levels.append(str(ev.get("level")))
-                        level = "hard"
-                        for cand in (
-                            "govern_accept_green_deny",
-                            "govern_accept_deny",
-                            "read_streak_deny",
-                            "hard_repeat",
-                            "hard",
-                            "soft",
-                        ):
-                            if cand in levels:
-                                level = cand
-                                break
-                        obs_gt = harness_supervisor.build_observation(
-                            hook="govern_thrash",
-                            wave_index=wave_ctx.get("wave_index"),
-                            domain_id=wave_ctx.get("domain_id"),
-                            req_id=module.node_id,
-                            step_id=step.step_id,
-                            attempt=step_attempt,
-                            error_snippet=(result.tail or "")[:2000],
-                            extras={
-                                "level": level,
-                                "thrash_hit": bool(getattr(result, "thrash_hit", False)),
-                                "thrash_counts": dict(getattr(result, "thrash_counts", ()) or ()),
-                                "govern_accept_met": govern_accept_already_green(result),
-                                "deny_count": len(getattr(result, "deny_events", ()) or ()),
-                                "deny_events_tail": list(getattr(result, "deny_events", ()))[-5:],
-                            },
-                        )
-                        d_gt = harness_supervisor.ask_supervisor(obs_gt)
-                        if d_gt.action == harness_supervisor.ACTION_NUDGE_STEP_PROMPT:
-                            supervisor_nudge = d_gt.nudge_text or d_gt.reason
-                            if supervisor_nudge:
-                                harness_supervisor.apply_nudge(
-                                    supervisor_nudge_path(work_dir, module.node_id),
-                                    supervisor_nudge,
-                                )
-                                prior_failure = (
-                                    (prior_failure or "") + f" | supervisor_nudge:{supervisor_nudge[:200]}"
-                                ).strip(" |")
-                        elif d_gt.action == harness_supervisor.ACTION_SKIP_SOFT_STALL_WAIT:
-                            skip_soft_stall = True
-                        elif d_gt.action == harness_supervisor.ACTION_FAIL_CLOSED:
-                            # Belt: never fail_closed once green (should be unreachable
-                            # after gov_green early-exit; keep guard for race/mis-detect).
-                            if govern_accept_already_green(result):
-                                print(
-                                    json.dumps(
-                                        {
-                                            "event": "govern_green_override_supervisor_fail_closed",
-                                            "req_id": module.node_id,
-                                            "step_id": step.step_id,
-                                            "supervisor_reason": (d_gt.reason or "")[:400],
-                                        },
-                                        ensure_ascii=False,
-                                    ),
-                                    flush=True,
-                                )
-                            else:
-                                runtime.events.mark_run_failed(
-                                    f"Module {module.node_id} govern_thrash fail_closed: {d_gt.reason}"
-                                )
-                                return 1
-                    if skip_soft_stall:
-                        print(
-                            json.dumps(
-                                {
-                                    "event": "harness_supervisor_skip_soft_stall",
-                                    "req_id": module.node_id,
-                                    "step_id": step.step_id,
-                                },
-                                ensure_ascii=False,
-                            ),
-                            flush=True,
-                        )
                     if result.returncode != 0 or result.is_error:
                         term_reason = (result.terminal_reason or "").lower()
                         max_turns_hit = "max_turns" in term_reason or term_reason.endswith("max_turns")
-                        # v5ai: IMPLEMENT owns the coding+test loop — no soft-accept@max_turns
-                        # for implement (hard gates remain on BATCH_TEST build/vitest).
-                        if max_turns_hit and step.step_id != "implement":
-                            soft_acc = evaluate_step_acceptance(work_dir, module, step, result)
-                            # v5ac: soft-accept@max_turns requires in-attempt write progress
-                            # (no lifting stale pages/spec/prd leftovers without a fresh write).
-                            if soft_acc.ok:
-                                sdir_sa = step_dir(work_dir, module.node_id)
-                                wr_ok, wr_proof = in_attempt_write_progress(
-                                    step.step_id, work_dir, sdir_sa, result
-                                )
-                                if not wr_ok and step.step_id in (
-                                    "spec",
-                                    "prd",
-                                    "test_dag",
-                                ):
-                                    soft_acc = StepAcceptance(
-                                        ok=False,
-                                        reason=(
-                                            f"soft-accept@max_turns denied: no in-attempt write progress "
-                                            f"({wr_proof}); refusing to lift stale artifacts"
-                                        ),
-                                        skills_seen=soft_acc.skills_seen,
-                                        missing_skills=soft_acc.missing_skills,
-                                        artifacts=soft_acc.artifacts,
-                                        mcp_required=soft_acc.mcp_required,
-                                        mcp_optional_seen=soft_acc.mcp_optional_seen,
-                                        commit_gate_status=soft_acc.commit_gate_status,
-                                        soft_notes=tuple(
-                                            list(soft_acc.soft_notes)
-                                            + [f"soft_accept_denied:{wr_proof}"]
-                                        ),
-                                    )
-                                    print(
-                                        json.dumps(
-                                            {
-                                                "event": "soft_accept_denied_no_write",
-                                                "req_id": module.node_id,
-                                                "step_id": step.step_id,
-                                                "proof": wr_proof,
-                                                "wave": wave_ctx.get("wave_index"),
-                                                "domain": wave_ctx.get("domain_id"),
-                                            },
-                                            ensure_ascii=False,
-                                        ),
-                                        flush=True,
-                                    )
-                            if soft_acc.ok:
-                                soft_acc = StepAcceptance(
-                                    ok=True,
-                                    reason=f"{soft_acc.reason} (soft-accept after max_turns)",
-                                    skills_seen=soft_acc.skills_seen,
-                                    missing_skills=soft_acc.missing_skills,
-                                    artifacts=soft_acc.artifacts,
-                                    mcp_required=soft_acc.mcp_required,
-                                    mcp_optional_seen=soft_acc.mcp_optional_seen,
-                                    commit_gate_status=soft_acc.commit_gate_status,
-                                    soft_notes=tuple(
-                                        list(soft_acc.soft_notes) + ["soft_accept:max_turns"]
-                                    ),
-                                )
-                                write_step_receipt(work_dir, module.node_id, step, soft_acc, claude=result)
-                                print(
-                                    json.dumps(
-                                        {
-                                            "event": "step_acceptance",
-                                            "req_id": module.node_id,
-                                            "step_id": step.step_id,
-                                            "ok": True,
-                                            "reason": soft_acc.reason,
-                                            "soft_accept_max_turns": True,
-                                            "wave": wave_ctx.get("wave_index"),
-                                            "domain": wave_ctx.get("domain_id"),
-                                        },
-                                        ensure_ascii=False,
-                                    ),
-                                    flush=True,
-                                )
-                                accepted = True
-                                break
-                            # v5ab: max_turns without soft-accept artifacts → implement_soft_stall.
-                            elif (
-                                harness_supervisor.supervisor_enabled()
-                                and step.step_id == "implement"
-                            ):
-                                extras_mt = {
-                                    "max_turns_hit": True,
-                                    "acceptance_failed": not soft_acc.ok,
-                                    "writes_this_step": len(getattr(result, "builtin_writes", ()) or ()),
-                                    "read_streak_deny": any(
-                                        isinstance(e, dict)
-                                        and e.get("level") == "read_streak_deny"
-                                        for e in getattr(result, "deny_events", ()) or ()
-                                    ),
-                                    "acceptance_reason": soft_acc.reason[:500],
-                                    "soft_notes": list(soft_acc.soft_notes)[:10],
-                                }
-                                if harness_supervisor.should_call_hook(
-                                    "implement_soft_stall", extras_mt
-                                ):
-                                    obs_mt = harness_supervisor.build_observation(
-                                        hook="implement_soft_stall",
-                                        wave_index=wave_ctx.get("wave_index"),
-                                        domain_id=wave_ctx.get("domain_id"),
-                                        req_id=module.node_id,
-                                        step_id=step.step_id,
-                                        attempt=step_attempt,
-                                        error_snippet=soft_acc.reason[:4000],
-                                        extras=extras_mt,
-                                    )
-                                    d_mt = harness_supervisor.ask_supervisor(obs_mt)
-                                    if d_mt.action == harness_supervisor.ACTION_NUDGE_STEP_PROMPT:
-                                        nt = d_mt.nudge_text or d_mt.reason
-                                        if nt:
-                                            harness_supervisor.apply_nudge(
-                                                supervisor_nudge_path(work_dir, module.node_id),
-                                                nt,
-                                            )
-                                            prior_failure = (
-                                                (prior_failure or classification.reason)
-                                                + f" | supervisor_nudge:{nt[:200]}"
-                                            )
-                                    elif d_mt.action == harness_supervisor.ACTION_SKIP_SOFT_STALL_WAIT:
-                                        skip_soft_stall = True
-                                    elif d_mt.action == harness_supervisor.ACTION_FAIL_CLOSED:
-                                        runtime.events.mark_run_failed(
-                                            f"Module {module.node_id} implement_soft_stall fail_closed: {d_mt.reason}"
-                                        )
-                                        return 1
-                                    elif d_mt.action == harness_supervisor.ACTION_RE_IMPLEMENT_DOMAIN:
-                                        clear_step_receipt(work_dir, module.node_id, "implement")
+                        # v5aj: NO soft-accept@max_turns theater. CC owns the loop; fail → retry/exhaust.
                         terminal = {
                             "event": "step_terminal_failure",
                             "req_id": module.node_id,
@@ -5170,7 +4610,8 @@ def main() -> int:
                             "terminal_reason": result.terminal_reason or "unknown",
                             "returncode": result.returncode,
                             "skills_loaded": list(result.skills_loaded),
-                            "max_turns_soft_accept_attempted": max_turns_hit,
+                            "max_turns_hit": max_turns_hit,
+                            "soft_accept_max_turns": False,
                         }
                         print(json.dumps(terminal, ensure_ascii=False), file=sys.stderr, flush=True)
                         prior_failure = classification.reason
@@ -5265,63 +4706,6 @@ def main() -> int:
                         # Break out of step_attempt + step loops to restart with repair steps.
                         force_repair_restart = True
                         break
-                    # v5ab: implement_soft_stall when acceptance fail with no Write, or max_turns stall.
-                    if (
-                        harness_supervisor.supervisor_enabled()
-                        and step.step_id == "implement"
-                    ):
-                        writes = list(getattr(result, "builtin_writes", ()) or ())
-                        read_deny = any(
-                            isinstance(e, dict) and e.get("level") == "read_streak_deny"
-                            for e in getattr(result, "deny_events", ()) or ()
-                        )
-                        max_turns_hit_local = "max_turns" in (
-                            (result.terminal_reason or "").lower()
-                        )
-                        extras_iss = {
-                            "acceptance_failed": True,
-                            "writes_this_step": len(writes),
-                            "read_streak_deny": read_deny,
-                            "max_turns_hit": max_turns_hit_local,
-                            "acceptance_reason": acceptance.reason[:500],
-                            "soft_notes": list(acceptance.soft_notes)[:10],
-                        }
-                        if harness_supervisor.should_call_hook("implement_soft_stall", extras_iss):
-                            obs_iss = harness_supervisor.build_observation(
-                                hook="implement_soft_stall",
-                                wave_index=wave_ctx.get("wave_index"),
-                                domain_id=wave_ctx.get("domain_id"),
-                                req_id=module.node_id,
-                                step_id=step.step_id,
-                                attempt=step_attempt,
-                                error_snippet=acceptance.reason[:4000],
-                                extras=extras_iss,
-                            )
-                            d_iss = harness_supervisor.ask_supervisor(obs_iss)
-                            if d_iss.action == harness_supervisor.ACTION_NUDGE_STEP_PROMPT:
-                                nt = d_iss.nudge_text or d_iss.reason
-                                if nt:
-                                    harness_supervisor.apply_nudge(
-                                        supervisor_nudge_path(work_dir, module.node_id),
-                                        nt,
-                                    )
-                                    prior_failure = (
-                                        (prior_failure or "") + f" | supervisor_nudge:{nt[:200]}"
-                                    ).strip(" |")
-                            elif d_iss.action == harness_supervisor.ACTION_RE_IMPLEMENT_DOMAIN:
-                                clear_step_receipt(work_dir, module.node_id, "implement")
-                                clear_step_receipt(work_dir, module.node_id, "batch_test")
-                            elif d_iss.action == harness_supervisor.ACTION_SKIP_SOFT_STALL_WAIT:
-                                skip_soft_stall = True
-                            elif d_iss.action == harness_supervisor.ACTION_FAIL_CLOSED:
-                                runtime.events.mark_implementation_failed(
-                                    module.node_id,
-                                    f"implement_soft_stall fail_closed: {d_iss.reason}",
-                                )
-                                runtime.events.mark_run_failed(
-                                    f"Module {module.node_id} implement_soft_stall fail_closed: {d_iss.reason}"
-                                )
-                                return 1
                     clear_step_receipt(work_dir, module.node_id, step.step_id)
                     write_step_receipt(work_dir, module.node_id, step, acceptance, claude=result)
 
@@ -5443,58 +4827,7 @@ def main() -> int:
                 )
                 return validation.exit_code or 1
 
-            # v5ab: batch_test_fail supervisor before rewind (gate.action == repair).
-            if harness_supervisor.supervisor_enabled():
-                extras_bt = {
-                    "gate_action": "repair",
-                    "vitest_exit": validation.exit_code,
-                    "log_tail": (validation.log_tail or "")[-2000:],
-                    "cmd": list(validation.cmd)[:20],
-                    "validation_repair": local_repair,
-                    "max_validation_repairs": max_validation_repairs,
-                }
-                harness_supervisor.note_event(
-                    {
-                        "event": "module_validation",
-                        "req_id": module.node_id,
-                        "ok": False,
-                        "validation_repair": local_repair,
-                    }
-                )
-                obs_bt = harness_supervisor.build_observation(
-                    hook="batch_test_fail",
-                    wave_index=wave_ctx.get("wave_index"),
-                    domain_id=wave_ctx.get("domain_id"),
-                    req_id=module.node_id,
-                    step_id="batch_test",
-                    attempt=local_repair + 1,
-                    repair_index=local_repair,
-                    error_snippet=fail_msg[:4000],
-                    extras=extras_bt,
-                )
-                d_bt = harness_supervisor.ask_supervisor(obs_bt)
-                if d_bt.action == harness_supervisor.ACTION_FAIL_CLOSED:
-                    runtime.events.mark_implementation_failed(
-                        module.node_id,
-                        f"batch_test_fail fail_closed: {d_bt.reason}",
-                    )
-                    runtime.events.mark_run_failed(
-                        f"Module {module.node_id} batch_test_fail fail_closed: {d_bt.reason}"
-                    )
-                    return validation.exit_code or 1
-                if d_bt.action == harness_supervisor.ACTION_RE_IMPLEMENT_DOMAIN:
-                    # Clear more aggressively; continue into existing rewind.
-                    clear_domain_implement_receipts(work_dir, [module.node_id])
-                if d_bt.action == harness_supervisor.ACTION_NUDGE_STEP_PROMPT and d_bt.nudge_text:
-                    # Applied after writing fail_msg base below.
-                    pass
-                bt_nudge = (
-                    d_bt.nudge_text
-                    if d_bt.action == harness_supervisor.ACTION_NUDGE_STEP_PROMPT
-                    else ""
-                )
-            else:
-                bt_nudge = ""
+            # v5aj: no harness_supervisor on batch_test_fail — harness rewind only.
 
             local_repair += 1
             for sid in ("implement", "batch_test"):
@@ -5505,8 +4838,6 @@ def main() -> int:
             repair_note = step_dir(work_dir, module.node_id) / "repair_note.txt"
             repair_note.parent.mkdir(parents=True, exist_ok=True)
             repair_note.write_text(fail_msg[-6000:], encoding="utf-8")
-            if bt_nudge:
-                harness_supervisor.apply_nudge(repair_note, bt_nudge)
             runtime.events.mark_run_resumed(
                 f"WAVE validation repair {local_repair}/{max_validation_repairs} for {module.node_id}; "
                 "re-running implement+batch_test STEPs"
@@ -5845,121 +5176,6 @@ def main() -> int:
                 except Exception as merge_exc:
                     merge_retry_done = False
                     re_implement_ids = [m.node_id for m in group.modules]
-                    if harness_supervisor.supervisor_enabled():
-                        conflicts = []
-                        try:
-                            conflicts = _git_unmerged_paths(output_dir)[:40]
-                        except Exception:
-                            conflicts = []
-                        harness_supervisor.note_event(
-                            {
-                                "event": "domain_merge_failed",
-                                "wave_index": wave.wave_index,
-                                "domain_id": group.domain_id,
-                                "ok": False,
-                            }
-                        )
-                        obs = harness_supervisor.build_observation(
-                            hook="merge_fail",
-                            wave_index=wave.wave_index,
-                            domain_id=group.domain_id,
-                            attempt=1,
-                            error_snippet=str(merge_exc)[:4000],
-                            extras={
-                                "merge_error": str(merge_exc)[:2000],
-                                "conflict_paths": conflicts,
-                                "last_strategy": "theirs",
-                                "candidates_tried": 2,
-                                "note": "v5aa default already exhausted before this hook",
-                            },
-                        )
-                        decision = harness_supervisor.ask_supervisor(obs)
-                        action = decision.action
-                        if action == harness_supervisor.ACTION_RETRY_MERGE_THEIRS:
-                            try:
-                                merge_domain_worktree(
-                                    output_dir, group.domain_id, wt, strategy="theirs"
-                                )
-                                merge_retry_done = True
-                            except Exception as retry_exc:
-                                merge_exc = retry_exc
-                        elif action == harness_supervisor.ACTION_RETRY_MERGE_OURS:
-                            try:
-                                merge_domain_worktree(
-                                    output_dir, group.domain_id, wt, strategy="ours"
-                                )
-                                merge_retry_done = True
-                            except Exception as retry_exc:
-                                merge_exc = retry_exc
-                        elif action == harness_supervisor.ACTION_RE_IMPLEMENT_DOMAIN:
-                            cleared = clear_domain_implement_receipts(wt, re_implement_ids)
-                            print(
-                                json.dumps(
-                                    {
-                                        "event": "domain_merge_supervisor_re_implement",
-                                        "wave_index": wave.wave_index,
-                                        "domain_id": group.domain_id,
-                                        "cleared": cleared,
-                                        "reason": decision.reason,
-                                    },
-                                    ensure_ascii=False,
-                                ),
-                                flush=True,
-                            )
-                            implement_batch = list(domain_dev_steps())
-                            primary = group.modules[0]
-                            wave_ctx_ri = {
-                                "wave_index": wave.wave_index,
-                                "wave_total": len(waves),
-                                "wave_domains": [g.domain_id for g in wave.domains],
-                                "domain_id": group.domain_id,
-                                "worktree": str(wt),
-                                "sibling_reqs": [m.node_id for m in group.modules],
-                                "all_req_ids": all_req_ids,
-                                "plan_summary": wave_plan_summary(waves),
-                                "phase": "implement",
-                                "phase_label": "IMPLEMENT",
-                            }
-                            if decision.nudge_text:
-                                harness_supervisor.apply_nudge(
-                                    supervisor_nudge_path(wt, primary.node_id),
-                                    decision.nudge_text,
-                                )
-                            rc_ri = execute_steps_for_module(
-                                module=primary,
-                                steps_to_run=list(implement_batch),
-                                work_dir=wt,
-                                wave_ctx=wave_ctx_ri,
-                                do_post_validation=False,
-                            )
-                            if rc_ri != 0:
-                                merge_exc = RuntimeError(
-                                    f"re_implement_domain failed rc={rc_ri} after merge_fail"
-                                )
-                            else:
-                                try:
-                                    merge_domain_worktree(
-                                        output_dir, group.domain_id, wt, strategy="theirs"
-                                    )
-                                    merge_retry_done = True
-                                except Exception as retry_exc:
-                                    merge_exc = retry_exc
-                        elif action == harness_supervisor.ACTION_FAIL_CLOSED:
-                            pass
-                        print(
-                            json.dumps(
-                                {
-                                    "event": "domain_merge_supervisor_retry",
-                                    "wave_index": wave.wave_index,
-                                    "domain_id": group.domain_id,
-                                    "action": action,
-                                    "reason": decision.reason,
-                                    "ok": merge_retry_done,
-                                },
-                                ensure_ascii=False,
-                            ),
-                            flush=True,
-                        )
                     if merge_retry_done:
                         continue
                     runtime.events.mark_run_failed(
