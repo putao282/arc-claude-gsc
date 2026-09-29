@@ -50,7 +50,9 @@ class WaveDagV5zTests(unittest.TestCase):
         ids = [s.step_id for s in self.mod.domain_dev_steps()]
         self.assertNotIn("batch_test", ids)
         self.assertIn("implement", ids)
-        self.assertIn("prd", ids)
+        # v5ai: design STEPs are project-wide, not DOMAIN implement
+        self.assertNotIn("prd", ids)
+        self.assertEqual([s.step_id for s in self.mod.design_steps()], ["prd", "spec", "test_dag"])
         batch = [s.step_id for s in self.mod.wave_batch_steps()]
         self.assertEqual(batch, ["batch_test"])
         # Full catalog still includes batch_test for compatibility
@@ -109,13 +111,14 @@ class WaveDagV5zTests(unittest.TestCase):
             },
         )
         self.assertIn("FORBIDDEN: per-REQ serial BATCH_TEST", prompt)
-        self.assertIn("WAVE/DOMAIN DAG", prompt)
+        self.assertIn("THREE PHASES once", prompt)
         self.assertIn("DOMAIN worktree", prompt)
 
-    def test_batch_test_goal_mentions_wave_merge(self):
+    def test_batch_test_goal_mentions_project_phase(self):
         bt = next(s for s in self.mod.OFFICIAL_STEPS if s.step_id == "batch_test")
-        self.assertIn("DOMAIN worktrees", bt.goal)
-        self.assertIn("WAVE", bt.goal)
+        self.assertIn("PHASE BATCH_TEST", bt.goal)
+        self.assertIn("once", bt.goal.lower())
+        self.assertIn("IMPLEMENT", bt.goal)
 
 
 if __name__ == "__main__":

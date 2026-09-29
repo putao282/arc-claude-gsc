@@ -265,6 +265,7 @@ class V5afBuildExportFeatureGates(unittest.TestCase):
             "v5ag_implement_code_test_loop",
             "v5ae_govern_green_force_stop_no_supervisor_fail_closed",
             "v5ad_wave_central_one_shot_batch_test",
+            "v5ai_project_wide_design_implement_batch_phases",
             "v5aa_merge_domain_worktree_abort_theirs",
         ):
             self.assertIn(tag, src)

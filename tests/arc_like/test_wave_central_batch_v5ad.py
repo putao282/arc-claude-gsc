@@ -78,10 +78,10 @@ class WaveCentralBatchV5adTests(unittest.TestCase):
                 "phase": "wave_batch_test",
             },
         )
-        self.assertIn("ONE-SHOT", prompt)
+        self.assertIn("PHASE BATCH_TEST", prompt)
         self.assertIn("FORBIDDEN", prompt)
         self.assertIn("serial per-REQ", prompt.lower().replace("per-req", "per-REQ") or "serial")
-        self.assertIn("v5ad", prompt)
+        self.assertIn("v5ai", prompt)
         self.assertIn("REQ-1 PASS then REQ-2 then REQ-3", prompt)
 
     def test_stamp_wave_batch_siblings_writes_receipts_without_agent(self):
@@ -133,9 +133,11 @@ class WaveCentralBatchV5adTests(unittest.TestCase):
 
     def test_source_has_one_shot_not_serial_loop(self):
         src = (ROOT / "main.py").read_text(encoding="utf-8")
-        self.assertIn("ONE-SHOT centralized BATCH_TEST after WAVE merge (v5ad)", src)
+        # v5ai: project-wide BATCH_TEST once (extends v5ad one-shot stamp)
+        self.assertIn("phase_batch_test_started", src)
         self.assertIn("stamp_wave_batch_siblings", src)
         self.assertIn("v5ad_wave_central_one_shot_batch_test", src)
+        self.assertIn("v5ai_project_wide_design_implement_batch_phases", src)
         # The forbidden serial pattern must not remain as the live path
         self.assertNotIn(
             'for module in wave_modules:\n                if module_already_passed',

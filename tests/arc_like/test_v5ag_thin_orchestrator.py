@@ -44,9 +44,14 @@ SPEC.loader.exec_module(mod)
 
 class V5agThinOrchestratorTests(unittest.TestCase):
     def test_pages_not_in_domain_dev_steps(self):
+        # v5ai: DOMAIN worktrees are IMPLEMENT coding only (design is project-wide).
         ids = [s.step_id for s in mod.domain_dev_steps()]
         self.assertNotIn("pages", ids)
-        self.assertEqual(ids, ["prd", "spec", "test_dag", "implement"])
+        self.assertNotIn("prd", ids)
+        self.assertNotIn("spec", ids)
+        self.assertNotIn("test_dag", ids)
+        self.assertEqual(ids, ["implement"])
+        self.assertEqual([s.step_id for s in mod.design_steps()], ["prd", "spec", "test_dag"])
 
     def test_pages_not_in_official_steps(self):
         ids = [s.step_id for s in mod.official_steps()]

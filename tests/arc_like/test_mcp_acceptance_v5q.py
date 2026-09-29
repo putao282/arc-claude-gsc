@@ -390,6 +390,7 @@ class McpAcceptanceV5qTests(unittest.TestCase):
             self.assertTrue(any("soft:spec_write_missing" in n for n in acc.soft_notes))
 
     def test_spec_prompt_thin_init_v5ag(self):
+        # v5ai: PHASE DESIGN project-wide (replaces v5ag ONE-SHOT INIT wording)
         prompt = mod.step_prompt(
             _module(),
             Path("/tmp/req"),
@@ -399,8 +400,9 @@ class McpAcceptanceV5qTests(unittest.TestCase):
             _step("spec"),
         )
         self.assertIn("spec_write", prompt)
-        self.assertIn("INIT", prompt)
-        self.assertIn("one-shot", prompt.lower())
+        self.assertIn("PHASE DESIGN", prompt)
+        self.assertIn("project-wide", prompt.lower())
+        self.assertIn("once", prompt.lower())
 
 
     def test_no_skill_force_load_fail_closed_v5u(self):

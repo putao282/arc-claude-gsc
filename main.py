@@ -60,7 +60,7 @@ class DomainGroup:
 
 @dataclass(frozen=True)
 class WavePlan:
-    """One WAVE: non-conflicting DOMAINs developed (prompt-parallel), then merge+BATCH_TEST."""
+    """One WAVE: non-conflicting DOMAINs for parallel IMPLEMENT coding, then merge (BATCH is project-wide)."""
     wave_index: int
     domains: tuple[DomainGroup, ...]
 
@@ -131,16 +131,17 @@ class StepAcceptance:
 # Official STEP loop (fail-closed). Advance only when artifact/MCP gates pass.
 # Skills: official setting_sources+skills wiring only — NOT force-loaded / fail-closed.
 OFFICIAL_STEPS: tuple[StepDef, ...] = (
-    # v5ag thin orchestrator: one-shot INIT (prd→spec→test_dag) then implement (+ optional batch).
-    # NO pages STEP (MCP has no pages stage). govern/audit_refactor OFF by default.
+    # v5ai: project-wide THREE PHASES once — DESIGN → IMPLEMENT → BATCH_TEST.
+    # NOT per-REQ serial STEPs. NO pages STEP. govern/audit_refactor OFF by default.
     StepDef(
         step_id="prd",
-        title="PRD (init — demand split only)",
+        title="PRD (PHASE DESIGN — project-wide once)",
         required_skills=("architect",),
         goal=(
-            "ONE-SHOT INIT: split demand into PRD only when needed. Already-detailed leaf "
-            "requirements may skip PRD ceremony and go straight into SPEC. Use GSC MCP "
-            "`prd` / `state_*` as the Agent chooses. Do NOT invent features."
+            "PHASE DESIGN (project-wide, once for ALL REQs): split demand into PRD covering "
+            "the whole project when needed. Already-detailed leaf requirements may skip PRD "
+            "ceremony and go straight into SPEC. Use GSC MCP `prd` / `state_*` as the Agent "
+            "chooses. Do NOT invent features. Do NOT re-enter PRD after IMPLEMENT starts."
         ),
         exit_criteria=(
             "PRD artifact under PRD/ or .arc/steps/<id>/prd* OR agent-documented skip "
@@ -149,24 +150,25 @@ OFFICIAL_STEPS: tuple[StepDef, ...] = (
     ),
     StepDef(
         step_id="spec",
-        title="SPEC (init — HTML)",
+        title="SPEC (PHASE DESIGN — project-wide HTML)",
         required_skills=("architect",),
         goal=(
-            "ONE-SHOT INIT: write HTML SPEC under SPEC/arcbench from PRD and/or already-"
-            "detailed leaf requirements via GSC MCP `spec_write` (HTML path; no Markdown "
-            "migrate). One section per leaf (data-req). Do NOT invent features. Agent owns "
-            "tool choice within prompt guidance."
+            "PHASE DESIGN (project-wide, once): write HTML SPEC under SPEC/arcbench covering "
+            "ALL project REQs from PRD and/or already-detailed leaves via GSC MCP "
+            "`spec_write` (HTML path; no Markdown migrate). One section per leaf (data-req). "
+            "Do NOT invent features. Do NOT re-enter SPEC after IMPLEMENT starts."
         ),
         exit_criteria="SPEC/arcbench HTML exists (>50B). Prefer also seeing spec_write if used.",
     ),
     StepDef(
         step_id="test_dag",
-        title="TEST_DAG (init — api+ui)",
+        title="TEST_DAG (PHASE DESIGN — project-wide api+ui)",
         required_skills=("arcbench-traceability",),
         goal=(
-            "ONE-SHOT INIT: author API + UI test DAG. Write `.arc/steps/<id>/test_dag.json` "
-            "with NON-EMPTY top-level keys `api` and `ui`. Optionally create matching test "
-            "files. Coding+test loop happens in implement — not here."
+            "PHASE DESIGN (project-wide, once): author API + UI test DAG covering ALL REQs. "
+            "Write `.arc/steps/<id>/test_dag.json` with NON-EMPTY top-level keys `api` and "
+            "`ui`. Optionally create matching test files. Coding+test loop happens in "
+            "IMPLEMENT — not here. Do NOT re-enter TEST_DAG after IMPLEMENT starts."
         ),
         exit_criteria=(
             "`.arc/steps/<id>/test_dag.json` has non-empty `api` and `ui` arrays "
@@ -175,12 +177,14 @@ OFFICIAL_STEPS: tuple[StepDef, ...] = (
     ),
     StepDef(
         step_id="implement",
-        title="DEV implement (code + test loop)",
+        title="IMPLEMENT (PHASE — all modules coding)",
         required_skills=("arcbench-checkpoint",),
         goal=(
-            "CODING + TEST LOOP: write code, run tests, fix, repeat. CC Agent owns how. "
-            "Implement API/UI/business logic under frontend|backend|src. Soft-mention "
-            "design_* MCP tools if UI work needs them — there is NO separate pages STEP."
+            "PHASE IMPLEMENT (project-wide coding): write code, run tests, fix, repeat. "
+            "CC Agent owns the loop. Implement API/UI/business logic under "
+            "frontend|backend|src. DOMAIN worktrees OK for parallel coding ONLY — NEVER "
+            "re-run PRD/SPEC/TEST_DAG. Soft-mention design_* MCP if UI needs them — "
+            "NO separate pages STEP."
         ),
         exit_criteria=(
             "Business file Write|Edit under frontend|backend|src OR implement.json "
@@ -190,15 +194,14 @@ OFFICIAL_STEPS: tuple[StepDef, ...] = (
     ),
     StepDef(
         step_id="batch_test",
-        title="WAVE BATCH test (after DOMAIN merge)",
+        title="BATCH_TEST (PHASE — project-wide once)",
         required_skills=("arcbench-runtime-signals",),
         goal=(
-            "AFTER all DOMAIN worktrees in the current WAVE are accepted and merged "
-            "to mainline, run centralized batch/harness tests once (vitest/npm test + "
-            "cheap npm run build). Never run this after a single REQ while sibling "
-            "DOMAIN/WAVE work remains."
+            "PHASE BATCH_TEST (once, after ALL IMPLEMENT work is merged to mainline): run "
+            "one consolidated project harness test (vitest/npm test + cheap npm run build). "
+            "Never per-REQ serial batch. Never per-WAVE serial batch after a single DOMAIN."
         ),
-        exit_criteria="Harness local validation (+ build) passes on mainline after WAVE merge.",
+        exit_criteria="Harness local validation (+ build) passes on mainline after project IMPLEMENT merge.",
         require_batch_test_run=True,
     ),
 )
@@ -238,7 +241,7 @@ AUDIT_REFACTOR_STEP = StepDef(
 
 
 def official_steps() -> list[StepDef]:
-    """Full STEP catalog (includes batch_test). Prefer domain_dev_steps + wave batch."""
+    """Full STEP catalog (includes batch_test). Prefer design_steps + domain_dev + batch."""
     steps = list(OFFICIAL_STEPS)
     if not mcp_audit_steps_enabled():
         return steps
@@ -252,13 +255,27 @@ def official_steps() -> list[StepDef]:
     return out
 
 
+def design_steps() -> list[StepDef]:
+    """PHASE DESIGN once (project-wide): prd → spec → [govern] → test_dag.
+
+    Never run these inside DOMAIN implement worktrees. Never re-enter after IMPLEMENT starts.
+    """
+    return [
+        s
+        for s in official_steps()
+        if s.step_id not in ("implement", "audit_refactor", "batch_test")
+    ]
+
+
 def domain_dev_steps() -> list[StepDef]:
-    """DEV STEPs inside a DOMAIN worktree — NO batch_test (centralized after WAVE merge)."""
-    return [s for s in official_steps() if s.step_id != "batch_test"]
+    """PHASE IMPLEMENT inside DOMAIN worktrees — coding ONLY (no PRD/SPEC/TEST_DAG)."""
+    return [
+        s for s in official_steps() if s.step_id in ("implement", "audit_refactor")
+    ]
 
 
 def wave_batch_steps() -> list[StepDef]:
-    """Post-merge centralized BATCH_TEST STEPs only."""
+    """PHASE BATCH_TEST once (project-wide after all IMPLEMENT merges)."""
     return [s for s in official_steps() if s.step_id == "batch_test"]
 
 
@@ -704,7 +721,7 @@ DEGRADED MODE (rapid_refill self-heal — MCP stays ON + 满配; Skills stay all
 
 # v5ac: force early Write skeleton on IMPLEMENT (business path) before thrash.
 IMPLEMENT_EARLY_WRITE_APPEND = """
-IMPLEMENT LOOP (v5ag thin — Agent owns coding+test):
+IMPLEMENT LOOP (v5ai — Agent owns coding+test; design already finished):
 1. Write|Edit business code under frontend/src, backend/src, or src/.
 2. Run tests (vitest/npm test) as you go; fix failures; repeat. Mid-dev tests ARE allowed.
 3. Soft: design_* MCP tools if UI needs them (no separate pages STEP).
@@ -3021,7 +3038,7 @@ def domain_dev_complete(
     *,
     skip_req_ids: set[str] | None = None,
 ) -> tuple[bool, str]:
-    """Per-DOMAIN accept: all DEV step receipts present (no batch_test yet)."""
+    """Per-DOMAIN accept: IMPLEMENT step receipts present (design already project-wide)."""
     skip = skip_req_ids or set()
     missing: list[str] = []
     checked = 0
@@ -3249,6 +3266,7 @@ ARC_CONTEST_CLAUDE_FOOTER = """
 - MCP stays ON; WaitForMcpServers OK; never set ARC_ENABLE_MCP=0; never ban MCP tools.
 - Never invent tool names; never call mcp__arch__account_manage or mcp__arch__debug_binary.
 - Skills via official Skill tool only (setting_sources=["user","project"] + skills=all); never Read/Bash/cat SKILL.md.
+- Project phases (v5ai, NON-NEGOTIABLE): DESIGN once (ALL PRD+SPEC+TEST_DAG) → IMPLEMENT once (all coding; DOMAIN worktrees OK for parallel coding ONLY — never re-run PRD/SPEC/TEST_DAG) → BATCH_TEST once (one consolidated project test). No PAGES stage. Govern/audit OFF by default. No per-REQ design re-entry after IMPLEMENT starts.
 """.strip()
 
 
@@ -3403,6 +3421,70 @@ def clear_domain_implement_receipts(work_dir: Path, req_ids: list[str]) -> list[
 
 
 
+def stamp_project_design_siblings(
+    *,
+    output_dir: Path,
+    primary: "RequirementModule",
+    siblings: list["RequirementModule"],
+) -> None:
+    """After project-wide PHASE DESIGN green on primary, stamp design receipts to all REQs.
+
+    v5ai: DESIGN runs once for the whole project. Sibling REQs inherit prd/spec/test_dag
+    (+ govern if enabled) receipts — never re-enter design STEPs per REQ.
+    """
+    if not siblings:
+        return
+    for step in design_steps():
+        if not has_step_receipt(output_dir, primary.node_id, step.step_id):
+            continue
+        src_json = step_receipt_json_path(output_dir, primary.node_id, step.step_id)
+        src_ok = step_receipt_ok_path(output_dir, primary.node_id, step.step_id)
+        for module in siblings:
+            if has_step_receipt(output_dir, module.node_id, step.step_id):
+                continue
+            dest_dir = step_dir(output_dir, module.node_id)
+            dest_dir.mkdir(parents=True, exist_ok=True)
+            if src_json.is_file():
+                raw = src_json.read_text(encoding="utf-8")
+                try:
+                    payload = json.loads(raw)
+                except Exception:
+                    payload = {}
+                if isinstance(payload, dict):
+                    payload["req_id"] = module.node_id
+                    payload["shared_from"] = primary.node_id
+                    payload["project_design_phase"] = True
+                    soft = list(payload.get("soft_notes") or [])
+                    soft.append("v5ai_project_design_stamp")
+                    payload["soft_notes"] = soft
+                    step_receipt_json_path(output_dir, module.node_id, step.step_id).write_text(
+                        json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+                        encoding="utf-8",
+                    )
+                else:
+                    step_receipt_json_path(output_dir, module.node_id, step.step_id).write_text(
+                        raw, encoding="utf-8"
+                    )
+            if src_ok.is_file():
+                step_receipt_ok_path(output_dir, module.node_id, step.step_id).write_text(
+                    src_ok.read_text(encoding="utf-8"),
+                    encoding="utf-8",
+                )
+        print(
+            json.dumps(
+                {
+                    "event": "project_design_stamped",
+                    "step_id": step.step_id,
+                    "primary_req": primary.node_id,
+                    "stamped_siblings": [m.node_id for m in siblings],
+                    "note": "PHASE DESIGN once — no per-REQ design re-entry",
+                },
+                ensure_ascii=False,
+            ),
+            flush=True,
+        )
+
+
 def stamp_wave_batch_siblings(
     *,
     runtime: "AgentRuntime",
@@ -3412,10 +3494,10 @@ def stamp_wave_batch_siblings(
     wave_index: int,
     completed: list[str],
 ) -> None:
-    """After ONE-SHOT WAVE BATCH_TEST green on primary, stamp remaining WAVE modules.
+    """After PHASE BATCH_TEST green on primary, stamp remaining project modules.
 
-    v5ad root cure: FORBIDDEN serial per-REQ agent batch_test after merge (v5aa live bug).
-    Harness vitest is project-level; primary green applies to the whole WAVE.
+    v5ai/v5ad: FORBIDDEN serial per-REQ agent batch_test. Harness vitest is project-level;
+    primary green applies to the whole project (or WAVE siblings list passed in).
     Never marks green without a primary validation receipt.
     """
     if not siblings:
@@ -4057,19 +4139,19 @@ def step_prompt(
         )
     elif step.step_id == "implement":
         mid_dev = (
-            "CODING + TEST LOOP (v5ag): write code, run tests (vitest/npm test), fix, repeat. "
-            "CC Agent owns how. Mid-dev tests ARE allowed. Soft: design_* MCP if UI needs them "
-            "(no separate pages STEP).\n"
+            "CODING + TEST LOOP (v5ai PHASE IMPLEMENT): write code, run tests (vitest/npm test), "
+            "fix, repeat. CC Agent owns the loop. Mid-dev tests ARE allowed. Soft: design_* MCP "
+            "if UI needs them (no separate pages STEP). NEVER re-run PRD/SPEC/TEST_DAG.\n"
         )
     batch = ""
     if step.require_batch_test_run:
         batch = (
-            "REQUIRED this STEP (WAVE-central ONE-SHOT, post-merge ONLY — v5ad): all "
-            "DOMAIN worktrees for this WAVE are already accepted+merged. Run "
-            "centralized batch tests ONCE on mainline for the ENTIRE WAVE "
-            "(prefer frontend `npx vitest run` / `npm test`). "
+            "REQUIRED this STEP (PHASE BATCH_TEST — project-wide ONCE after ALL IMPLEMENT "
+            "merges — v5ai): run one consolidated project harness test on mainline "
+            "(prefer frontend `npx vitest run` / `npm test` + cheap `npm run build`). "
             "FORBIDDEN: serial per-REQ BATCH_TEST (REQ-1 PASS then REQ-2 then REQ-3…). "
-            "Fix wave-level failures here; harness stamps all WAVE REQs from this one green.\n"
+            "FORBIDDEN: per-WAVE serial batch while sibling DOMAIN/WAVE work remains. "
+            "Harness stamps all project REQs from this one green.\n"
         )
 
     skill_lines = ", ".join(f"`{s}`" for s in step.required_skills)
@@ -4095,24 +4177,26 @@ def step_prompt(
     base = f".arc/steps/{sid}"
     if step.step_id == "prd":
         mcp_extra = (
-            "\nINIT / PRD (v5ag thin — demand split only):\n"
+            "\nPHASE DESIGN / PRD (v5ai — project-wide once for ALL REQs):\n"
             "- Call `mcp__arch__prd` when demand needs splitting; produce PRD under PRD/ or "
-            f"`{base}/prd*`.\n"
+            f"`{base}/prd*` covering the whole project.\n"
             "- SKIP OK: if leaf requirements are already detailed for SPEC, write a short skip "
             f"note under `{base}/prd_skip.json` (reason=leaves_already_in_spec) and STOP.\n"
             "- Soft: `mcp__arch__state_read` at most once. ANTI-THRASH: no identical re-calls.\n"
             "- Do NOT invent features. Do NOT call account_manage / debug_binary.\n"
+            "- FORBIDDEN: per-REQ re-init of PRD after this PHASE DESIGN completes.\n"
         )
     elif step.step_id == "spec":
         mcp_extra = (
-            "\nINIT / SPEC (v5ag thin — one-shot HTML):\n"
-            "- Write HTML SPEC under SPEC/arcbench from PRD and/or already-detailed leaf "
-            "requirements. Prefer `mcp__arch__spec_write` once (HTML 2.0).\n"
+            "\nPHASE DESIGN / SPEC (v5ai — project-wide HTML once for ALL REQs):\n"
+            "- Write HTML SPEC under SPEC/arcbench covering ALL project REQs from PRD and/or "
+            "already-detailed leaves. Prefer `mcp__arch__spec_write` once (HTML 2.0).\n"
             "- Expand leaf sections with data-req; preserve accessible names/roles/seed/states.\n"
             "- FORBIDDEN: invent features; rename UI strings; Markdown migrate as main path.\n"
             "- Soft: `mcp__arch__spec_read` / `state_read` at most once each. ANTI-THRASH.\n"
             "- Acceptance: SPEC/arcbench HTML (>50B). Prefer also seeing spec_write if used.\n"
             "- Do NOT invent homemade coverage/trace ceremonies. govern is OFF by default.\n"
+            "- FORBIDDEN: per-REQ re-init of SPEC after this PHASE DESIGN completes.\n"
         )
     elif step.step_id == "govern":
         mcp_extra = (
@@ -4140,7 +4224,7 @@ def step_prompt(
         )
     elif step.step_id == "implement":
         mcp_extra = (
-            "\nIMPLEMENT (v5ag thin — CODING + TEST LOOP; Agent owns how):\n"
+            "\nPHASE IMPLEMENT (v5ai — CODING + TEST LOOP; Agent owns the loop):\n"
             "- Write|Edit business code under frontend/src, backend/src, or src/.\n"
             "- Run tests (vitest / npm test) as you develop; fix failures; repeat until green.\n"
             "- Soft: `mcp__arch__search_code` / `kb_query` / design_style|design_asset if UI needs them "
@@ -4149,6 +4233,7 @@ def step_prompt(
             "- On VALIDATION REPAIR: read repair_note / VITEST OUTPUT and Write|Edit until tests pass.\n"
             "- Do NOT invent features outside TEST_DAG / SPEC. Do NOT thrash identical MCP reads.\n"
             "- Prefer `export default` for App default-imports so `npm run build` stays green.\n"
+            "- FORBIDDEN: re-run PRD / SPEC / TEST_DAG during IMPLEMENT (design already finished).\n"
         )
     elif step.step_id == "audit_refactor":
         mcp_extra = (
@@ -4159,9 +4244,10 @@ def step_prompt(
         )
     elif step.step_id == "batch_test":
         mcp_extra = (
-            "\nBATCH_TEST (v5ag thin — ONE-SHOT WAVE after DOMAIN merge):\n"
+            "\nPHASE BATCH_TEST (v5ai — ONE consolidated project test after ALL IMPLEMENT merges):\n"
             "- Harness runs vitest / npm test then cheap `npm run build`. Fix failures here.\n"
-            "- FORBIDDEN: serial per-REQ BATCH_TEST; FORBIDDEN commit_gate-only thrash.\n"
+            "- FORBIDDEN: serial per-REQ BATCH_TEST; FORBIDDEN per-WAVE serial batch; "
+            "FORBIDDEN commit_gate-only thrash.\n"
             f"- Soft once: `mcp__arch__commit_gate` → `{base}/commit_gate.json`.\n"
             "- On failure soft: `mcp__arch__trace_failure` then Write/Edit again.\n"
         )
@@ -4169,17 +4255,29 @@ def step_prompt(
     wave_ctx = wave_ctx or {}
     wave_lines = ""
     if wave_ctx:
+        phase = str(wave_ctx.get("phase") or "")
+        all_reqs = wave_ctx.get("all_req_ids") or wave_ctx.get("wave_req_ids") or wave_ctx.get("sibling_reqs") or []
         wave_lines = (
+            f"PROJECT PHASE: {phase or wave_ctx.get('phase_label', 'unknown')}\n"
             f"WAVE {wave_ctx.get('wave_index', '?')}/{wave_ctx.get('wave_total', '?')}: "
             f"domains={wave_ctx.get('wave_domains', [])}\n"
             f"DOMAIN worktree: {wave_ctx.get('domain_id', '')} cwd={wave_ctx.get('worktree', '')}\n"
-            f"Sibling REQs in this DOMAIN (share implement batch / worktree): "
+            f"Sibling REQs (share worktree / stamps): "
             f"{wave_ctx.get('sibling_reqs', [])}\n"
+            f"ALL project REQs: {all_reqs}\n"
             f"WAVE plan: {wave_ctx.get('plan_summary', '')}\n"
-            "ORCHESTRATION: DOMAIN worktree DEV first → per-DOMAIN accept → merge all "
-            "DOMAIN worktrees → ONE-SHOT WAVE BATCH_TEST (v5ad). "
-            "Never serial per-REQ BATCH_TEST after merge.\n"
+            "ORCHESTRATION (v5ai): PHASE DESIGN once (prd→spec→test_dag for ALL REQs) → "
+            "PHASE IMPLEMENT once (DOMAIN worktrees for parallel coding ONLY; never re-run "
+            "PRD/SPEC/TEST_DAG) → PHASE BATCH_TEST once (one consolidated project test). "
+            "No PAGES. Never serial per-REQ design or batch.\n"
         )
+        if phase == "design" and wave_ctx.get("all_subtrees"):
+            wave_lines += (
+                "DESIGN SCOPE — cover ALL of these ROOT subtrees in this PHASE:\n"
+                "```json\n"
+                f"{json.dumps(wave_ctx.get('all_subtrees'), ensure_ascii=False, indent=2)}\n"
+                "```\n"
+            )
 
     return textwrap.dedent(f"""
         You are in an ARC-Bench Official harness STEP round (not a mega-prompt).
@@ -4197,8 +4295,9 @@ def step_prompt(
         - GSC MCP stays ON. Never disable WaitForMcpServers / never ARC_ENABLE_MCP=0 / never ban MCP.
         - Harness acceptance is fail-closed: only the harness marks green after artifact/MCP gates.
         - This round is ONLY for STEP `{step.step_id}`. Do not perform later STEPs.
-        - WAVE/DOMAIN DAG: work inside the DOMAIN worktree; same-DOMAIN REQs share implement.
-        - FORBIDDEN: per-REQ serial BATCH_TEST after merge (REQ-1 PASS→REQ-2→REQ-3…). ONE-SHOT WAVE BATCH_TEST only after all DOMAIN merges (v5ad).
+        - THREE PHASES once (v5ai): DESIGN (all PRD+SPEC+TEST_DAG) → IMPLEMENT (all coding) → BATCH_TEST (one project test).
+        - DOMAIN worktrees are for parallel IMPLEMENT coding ONLY — NEVER re-enter PRD/SPEC/TEST_DAG after DESIGN.
+        - FORBIDDEN: per-REQ serial design re-init (REQ-1 IMPLEMENT then REQ-2 PRD…). FORBIDDEN: per-REQ serial BATCH_TEST (REQ-1 PASS→REQ-2→REQ-3…).
         - Prefer main session; do NOT spawn Agent/Task for DOMAIN parallelism (harness owns worktrees).
         - Keep tool outputs small (no huge lockfiles/schemas).
         - Do NOT Read/Bash/cat SKILL.md. Skills (if any) are model-invoked via the Skill tool.
@@ -4478,9 +4577,10 @@ def main() -> int:
                 "permission_mode": "acceptEdits",
                 "mcp_allowed_tools": gsc_mcp_allowed_tools() if enable_mcp else [],
                 "step_loop": [s.step_id for s in official_steps()],
+                "design_steps": [s.step_id for s in design_steps()],
                 "domain_dev_steps": [s.step_id for s in domain_dev_steps()],
                 "wave_batch_steps": [s.step_id for s in wave_batch_steps()],
-                "orchestration": "wave_domain_worktree_dag",
+                "orchestration": "project_phases_design_implement_batch",
                 "step_required_skills": {s.step_id: list(s.required_skills) for s in official_steps()},
                 "mcp_audit_steps": mcp_audit_steps_enabled(),
                 "mcp_n_allowed": len(gsc_mcp_allowed_tools()),
@@ -4529,6 +4629,10 @@ def main() -> int:
                     "v5ah_contest_user_claude_md",
                     "v5ah_cc_full_config_fail_closed",
                     "v5ah_no_prepared_mcp_disallowed_leak",
+                    "v5ai_project_wide_design_implement_batch_phases",
+                    "v5ai_no_per_req_design_reentry",
+                    "v5ai_no_pages_audit_default_off",
+                    "v5ai_implement_no_soft_accept_max_turns",
                 ],
             },
             ensure_ascii=False,
@@ -4550,8 +4654,8 @@ def main() -> int:
                 "n_domains": len(domain_groups),
                 "n_modules": len(modules),
                 "note": (
-                    "DOMAIN worktrees develop in parallel tracks (sequential if "
-                    "single-threaded agent); BATCH_TEST only after WAVE merge"
+                    "v5ai: DESIGN once → IMPLEMENT via DOMAIN worktrees (coding only) "
+                    "→ BATCH_TEST once project-wide; never per-REQ design re-entry"
                 ),
             },
             ensure_ascii=False,
@@ -4925,7 +5029,9 @@ def main() -> int:
                     if result.returncode != 0 or result.is_error:
                         term_reason = (result.terminal_reason or "").lower()
                         max_turns_hit = "max_turns" in term_reason or term_reason.endswith("max_turns")
-                        if max_turns_hit:
+                        # v5ai: IMPLEMENT owns the coding+test loop — no soft-accept@max_turns
+                        # for implement (hard gates remain on BATCH_TEST build/vitest).
+                        if max_turns_hit and step.step_id != "implement":
                             soft_acc = evaluate_step_acceptance(work_dir, module, step, result)
                             # v5ac: soft-accept@max_turns requires in-attempt write progress
                             # (no lifting stale pages/spec/prd leftovers without a fresh write).
@@ -5420,6 +5526,105 @@ def main() -> int:
             )
 
     try:
+        all_req_ids = [m.node_id for m in modules]
+        all_subtrees = [m.subtree for m in modules]
+
+        # ========== PHASE DESIGN (project-wide, once) ==========
+        # Finish ALL PRD + SPEC + TEST_DAG for the whole project BEFORE any IMPLEMENT.
+        # Never per-REQ / per-DOMAIN re-entry of design STEPs.
+        pending_design = [
+            m for m in modules if not module_already_passed(runtime, m.node_id, output_dir)
+        ]
+        print(
+            json.dumps(
+                {
+                    "event": "phase_design_started",
+                    "req_ids": all_req_ids,
+                    "pending_req_ids": [m.node_id for m in pending_design],
+                    "steps": [s.step_id for s in design_steps()],
+                    "note": (
+                        "v5ai PHASE DESIGN once for ALL REQs — "
+                        "no per-REQ PRD/SPEC/TEST_DAG re-init"
+                    ),
+                },
+                ensure_ascii=False,
+            ),
+            flush=True,
+        )
+        if pending_design:
+            for module in modules:
+                ensure_gsc_spec(output_dir, module)
+            primary_design = pending_design[0]
+            design_ctx = {
+                "wave_index": 0,
+                "wave_total": len(waves),
+                "wave_domains": [g.domain_id for g in domain_groups],
+                "domain_id": "PROJECT",
+                "worktree": str(output_dir),
+                "sibling_reqs": [m.node_id for m in pending_design],
+                "all_req_ids": all_req_ids,
+                "all_subtrees": all_subtrees,
+                "plan_summary": wave_plan_summary(waves),
+                "phase": "design",
+                "phase_label": "DESIGN",
+                "centralized_once": True,
+            }
+            runtime.events.mark_design_started(
+                primary_design.node_id,
+                f"PHASE DESIGN project-wide for {len(pending_design)} REQs",
+            )
+            rc = execute_steps_for_module(
+                module=primary_design,
+                steps_to_run=list(design_steps()),
+                work_dir=output_dir,
+                wave_ctx=design_ctx,
+                do_post_validation=False,
+            )
+            if rc != 0:
+                return rc
+            stamp_project_design_siblings(
+                output_dir=output_dir,
+                primary=primary_design,
+                siblings=pending_design[1:],
+            )
+            # Mirror design receipts into every DOMAIN worktree later via merge/base;
+            # also stamp on mainline for REQs already covered.
+            for m in pending_design:
+                runtime.events.mark_design_done(
+                    m.node_id,
+                    f"PHASE DESIGN done (project-wide; primary={primary_design.node_id})",
+                )
+            print(
+                json.dumps(
+                    {
+                        "event": "phase_design_completed",
+                        "primary_req": primary_design.node_id,
+                        "stamped_siblings": [m.node_id for m in pending_design[1:]],
+                        "steps": [s.step_id for s in design_steps()],
+                    },
+                    ensure_ascii=False,
+                ),
+                flush=True,
+            )
+
+        # ========== PHASE IMPLEMENT (DOMAIN worktrees for parallel coding ONLY) ==========
+        print(
+            json.dumps(
+                {
+                    "event": "phase_implement_started",
+                    "n_waves": len(waves),
+                    "n_domains": len(domain_groups),
+                    "req_ids": all_req_ids,
+                    "steps": [s.step_id for s in domain_dev_steps()],
+                    "note": (
+                        "v5ai PHASE IMPLEMENT — coding only in DOMAIN worktrees; "
+                        "NEVER re-run PRD/SPEC/TEST_DAG"
+                    ),
+                },
+                ensure_ascii=False,
+            ),
+            flush=True,
+        )
         for wave in waves:
             wave_modules = [m for g in wave.domains for m in g.modules]
             print(
@@ -5430,9 +5635,9 @@ def main() -> int:
                         "wave_total": len(waves),
                         "domains": [g.domain_id for g in wave.domains],
                         "req_ids": [m.node_id for m in wave_modules],
+                        "phase": "implement",
                         "note": (
-                            "non-conflicting DOMAINs are concurrent tracks; "
-                            "agent runtime runs DOMAIN worktrees sequentially when single-threaded"
+                            "IMPLEMENT coding tracks only; design already finished project-wide"
                         ),
                     },
                     ensure_ascii=False,
@@ -5441,14 +5646,35 @@ def main() -> int:
             )
             domain_worktrees: dict[str, Path] = {}
 
-            # --- DOMAIN DEV in worktrees (no BATCH_TEST) ---
             for group in wave.domains:
                 wt = ensure_domain_worktree(output_dir, group.domain_id)
                 domain_worktrees[group.domain_id] = wt
-                # Ensure SPEC/CLAUDE softener exist in the DOMAIN worktree
                 ensure_arc_spawn_gate_softener(wt, home_dir=home_dir)
                 for module in group.modules:
                     ensure_gsc_spec(wt, module)
+                    # Propagate project DESIGN receipts into DOMAIN worktree so
+                    # domain_dev_complete / agents see design done (no re-init).
+                    for step in design_steps():
+                        if has_step_receipt(output_dir, module.node_id, step.step_id) and not has_step_receipt(
+                            wt, module.node_id, step.step_id
+                        ):
+                            dest_dir = step_dir(wt, module.node_id)
+                            dest_dir.mkdir(parents=True, exist_ok=True)
+                            for src, dst_fn in (
+                                (
+                                    step_receipt_json_path(output_dir, module.node_id, step.step_id),
+                                    step_receipt_json_path,
+                                ),
+                                (
+                                    step_receipt_ok_path(output_dir, module.node_id, step.step_id),
+                                    step_receipt_ok_path,
+                                ),
+                            ):
+                                if src.is_file():
+                                    dst_fn(wt, module.node_id, step.step_id).write_text(
+                                        src.read_text(encoding="utf-8"),
+                                        encoding="utf-8",
+                                    )
 
                 wave_ctx_base = {
                     "wave_index": wave.wave_index,
@@ -5457,7 +5683,10 @@ def main() -> int:
                     "domain_id": group.domain_id,
                     "worktree": str(wt),
                     "sibling_reqs": [m.node_id for m in group.modules],
+                    "all_req_ids": all_req_ids,
                     "plan_summary": wave_plan_summary(waves),
+                    "phase": "implement",
+                    "phase_label": "IMPLEMENT",
                 }
                 print(
                     json.dumps(
@@ -5469,6 +5698,7 @@ def main() -> int:
                             "req_ids": [m.node_id for m in group.modules],
                             "depends_on": list(group.depends_on),
                             "conflicts_with": list(group.conflicts_with),
+                            "phase": "implement",
                         },
                         ensure_ascii=False,
                     ),
@@ -5496,40 +5726,8 @@ def main() -> int:
                         continue
                     pending_modules.append(module)
 
-                pre_implement = [
-                    s
-                    for s in domain_dev_steps()
-                    if s.step_id not in ("implement", "audit_refactor")
-                ]
-                implement_batch = [
-                    s
-                    for s in domain_dev_steps()
-                    if s.step_id in ("implement", "audit_refactor")
-                ]
-
-                for module in pending_modules:
-                    print(
-                        f"[arc-claude-gsc] WAVE{wave.wave_index} DOMAIN {group.domain_id} "
-                        f"module {module.index}/{module.total}: {module.node_id} - {module.name}",
-                        flush=True,
-                    )
-                    runtime.events.mark_design_started(
-                        module.node_id,
-                        f"WAVE{wave.wave_index} DOMAIN {group.domain_id} planning {module.name}",
-                    )
-                    runtime.events.mark_design_done(
-                        module.node_id,
-                        f"Delegated {module.name} to DOMAIN worktree {wt.name}",
-                    )
-                    rc = execute_steps_for_module(
-                        module=module,
-                        steps_to_run=list(pre_implement),
-                        work_dir=wt,
-                        wave_ctx=wave_ctx_base,
-                        do_post_validation=False,
-                    )
-                    if rc != 0:
-                        return rc
+                # IMPLEMENT only — design already done project-wide (v5ai).
+                implement_batch = list(domain_dev_steps())
 
                 if pending_modules and implement_batch:
                     primary = pending_modules[0]
@@ -5542,11 +5740,18 @@ def main() -> int:
                                 "primary_req": primary.node_id,
                                 "sibling_reqs": [m.node_id for m in pending_modules],
                                 "steps": [s.step_id for s in implement_batch],
+                                "note": "IMPLEMENT coding only — no PRD/SPEC/TEST_DAG",
                             },
                             ensure_ascii=False,
                         ),
                         flush=True,
                     )
+                    for module in pending_modules:
+                        print(
+                            f"[arc-claude-gsc] WAVE{wave.wave_index} DOMAIN {group.domain_id} "
+                            f"IMPLEMENT {module.index}/{module.total}: {module.node_id} - {module.name}",
+                            flush=True,
+                        )
                     rc = execute_steps_for_module(
                         module=primary,
                         steps_to_run=list(implement_batch),
@@ -5603,6 +5808,7 @@ def main() -> int:
                             "ok": ok,
                             "reason": reason,
                             "worktree": str(wt),
+                            "phase": "implement",
                         },
                         ensure_ascii=False,
                     ),
@@ -5616,7 +5822,7 @@ def main() -> int:
                 commit_domain_worktree(
                     wt,
                     group.domain_id,
-                    f"domain {group.domain_id}: DEV accept (WAVE{wave.wave_index})",
+                    f"domain {group.domain_id}: IMPLEMENT accept (WAVE{wave.wave_index})",
                 )
 
             # --- Merge all passed DOMAIN worktrees to mainline ---
@@ -5637,8 +5843,6 @@ def main() -> int:
                 try:
                     merge_domain_worktree(output_dir, group.domain_id, wt)
                 except Exception as merge_exc:
-                    # v5ab: soft supervisor chooses among safe retries. Flag OFF → fail-closed.
-                    # Never marks green; v5aa theirs path already exhausted before this hook.
                     merge_retry_done = False
                     re_implement_ids = [m.node_id for m in group.modules]
                     if harness_supervisor.supervisor_enabled():
@@ -5702,11 +5906,7 @@ def main() -> int:
                                 ),
                                 flush=True,
                             )
-                            implement_batch = [
-                                s
-                                for s in domain_dev_steps()
-                                if s.step_id in ("implement", "audit_refactor")
-                            ]
+                            implement_batch = list(domain_dev_steps())
                             primary = group.modules[0]
                             wave_ctx_ri = {
                                 "wave_index": wave.wave_index,
@@ -5715,8 +5915,10 @@ def main() -> int:
                                 "domain_id": group.domain_id,
                                 "worktree": str(wt),
                                 "sibling_reqs": [m.node_id for m in group.modules],
+                                "all_req_ids": all_req_ids,
                                 "plan_summary": wave_plan_summary(waves),
-                                "phase": "supervisor_re_implement",
+                                "phase": "implement",
+                                "phase_label": "IMPLEMENT",
                             }
                             if decision.nudge_text:
                                 harness_supervisor.apply_nudge(
@@ -5778,97 +5980,91 @@ def main() -> int:
                     )
                     return 1
 
-
-            # Refresh mainline softener after merges
             ensure_arc_spawn_gate_softener(output_dir, home_dir=home_dir)
-
-            # --- ONE-SHOT centralized BATCH_TEST after WAVE merge (v5ad) ---
-            # FORBIDDEN: serial per-REQ agent batch_test after merge (exactly what live
-            # v5aa sheet did: REQ-1 batch PASS → REQ-2 → REQ-3…). One agent session +
-            # one harness vitest for the whole WAVE; stamp siblings from primary green.
-            pending_batch = [
-                m
-                for m in wave_modules
-                if not module_already_passed(runtime, m.node_id, output_dir)
-            ]
+            # v5ai: NO per-WAVE BATCH_TEST — project-wide BATCH after all IMPLEMENT merges.
             print(
                 json.dumps(
                     {
-                        "event": "wave_batch_test_started",
-                        "wave_index": wave.wave_index,
-                        "req_ids": [m.node_id for m in wave_modules],
-                        "pending_req_ids": [m.node_id for m in pending_batch],
-                        "primary_req": pending_batch[0].node_id if pending_batch else None,
-                        "note": (
-                            "ONE-SHOT central BATCH_TEST on mainline after all DOMAIN "
-                            "merges (v5ad; NOT serial per-REQ)"
-                        ),
-                    },
-                    ensure_ascii=False,
-                ),
-                flush=True,
-            )
-            if pending_batch:
-                primary = pending_batch[0]
-                wave_ctx_batch = {
-                    "wave_index": wave.wave_index,
-                    "wave_total": len(waves),
-                    "wave_domains": [g.domain_id for g in wave.domains],
-                    "domain_id": module_domain_id(primary),
-                    "worktree": str(output_dir),
-                    "sibling_reqs": [m.node_id for m in wave_modules],
-                    "wave_req_ids": [m.node_id for m in wave_modules],
-                    "plan_summary": wave_plan_summary(waves),
-                    "phase": "wave_batch_test",
-                    "centralized_once": True,
-                }
-                rc = execute_steps_for_module(
-                    module=primary,
-                    steps_to_run=list(wave_batch_steps()),
-                    work_dir=output_dir,
-                    wave_ctx=wave_ctx_batch,
-                    do_post_validation=True,
-                )
-                if rc != 0:
-                    return rc
-                siblings = pending_batch[1:]
-                if siblings:
-                    stamp_wave_batch_siblings(
-                        runtime=runtime,
-                        output_dir=output_dir,
-                        primary=primary,
-                        siblings=siblings,
-                        wave_index=wave.wave_index,
-                        completed=completed,
-                    )
-                print(
-                    json.dumps(
-                        {
-                            "event": "wave_batch_test_completed",
-                            "wave_index": wave.wave_index,
-                            "primary_req": primary.node_id,
-                            "stamped_siblings": [m.node_id for m in siblings],
-                            "note": "ONE-SHOT WAVE BATCH done; siblings stamped without serial agent batch",
-                        },
-                        ensure_ascii=False,
-                    ),
-                    flush=True,
-                )
-
-            print(
-                json.dumps(
-                    {
-                        "event": "wave_accepted",
+                        "event": "wave_implement_merged",
                         "wave_index": wave.wave_index,
                         "req_ids": [m.node_id for m in wave_modules],
                         "domains": [g.domain_id for g in wave.domains],
+                        "note": "IMPLEMENT merge done; BATCH_TEST deferred to project phase",
                     },
                     ensure_ascii=False,
                 ),
                 flush=True,
             )
 
-        runtime.events.mark_run_completed("All WAVEs / ROOT modules completed")
+        # ========== PHASE BATCH_TEST (project-wide, once) ==========
+        pending_batch = [
+            m for m in modules if not module_already_passed(runtime, m.node_id, output_dir)
+        ]
+        print(
+            json.dumps(
+                {
+                    "event": "phase_batch_test_started",
+                    "req_ids": all_req_ids,
+                    "pending_req_ids": [m.node_id for m in pending_batch],
+                    "primary_req": pending_batch[0].node_id if pending_batch else None,
+                    "note": (
+                        "v5ai PHASE BATCH_TEST once on mainline after ALL IMPLEMENT "
+                        "merges (NOT serial per-REQ; NOT per-WAVE)"
+                    ),
+                },
+                ensure_ascii=False,
+            ),
+            flush=True,
+        )
+        if pending_batch:
+            primary = pending_batch[0]
+            wave_ctx_batch = {
+                "wave_index": len(waves),
+                "wave_total": len(waves),
+                "wave_domains": [g.domain_id for g in domain_groups],
+                "domain_id": "PROJECT",
+                "worktree": str(output_dir),
+                "sibling_reqs": [m.node_id for m in modules],
+                "wave_req_ids": all_req_ids,
+                "all_req_ids": all_req_ids,
+                "plan_summary": wave_plan_summary(waves),
+                "phase": "batch_test",
+                "phase_label": "BATCH_TEST",
+                "centralized_once": True,
+            }
+            rc = execute_steps_for_module(
+                module=primary,
+                steps_to_run=list(wave_batch_steps()),
+                work_dir=output_dir,
+                wave_ctx=wave_ctx_batch,
+                do_post_validation=True,
+            )
+            if rc != 0:
+                return rc
+            siblings = pending_batch[1:]
+            if siblings:
+                stamp_wave_batch_siblings(
+                    runtime=runtime,
+                    output_dir=output_dir,
+                    primary=primary,
+                    siblings=siblings,
+                    wave_index=0,
+                    completed=completed,
+                )
+            print(
+                json.dumps(
+                    {
+                        "event": "phase_batch_test_completed",
+                        "primary_req": primary.node_id,
+                        "stamped_siblings": [m.node_id for m in siblings],
+                        "note": "PHASE BATCH_TEST done; siblings stamped without serial agent batch",
+                    },
+                    ensure_ascii=False,
+                ),
+                flush=True,
+            )
+
+        runtime.events.mark_run_completed("All project phases completed (DESIGN→IMPLEMENT→BATCH_TEST)")
         return 0
     except Exception as exc:
         runtime.events.mark_run_failed(str(exc))
