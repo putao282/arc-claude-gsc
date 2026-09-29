@@ -149,7 +149,13 @@ class RootCureV5acTests(unittest.TestCase):
             sdir.mkdir(parents=True)
             ui = root / "frontend" / "src" / "pages"
             ui.mkdir(parents=True)
-            (ui / "Stale.tsx").write_text("export default function Stale(){ return null }\n", encoding="utf-8")
+            (ui / "Stale.tsx").write_text(
+                "export default function Stale(){\n"
+                "  return (<main><h1>Stale Page Content Block</h1>"
+                "<p>Leftover page used to test write gate.</p></main>);\n"
+                "}\n",
+                encoding="utf-8",
+            )
             step = next(s for s in mod.official_steps() if s.step_id == "pages")
             # leftover + design_mcp but no write this attempt
             result = _result(
@@ -165,7 +171,13 @@ class RootCureV5acTests(unittest.TestCase):
                 mcp_tools_used=("mcp__arch__design_style",),
                 builtin_writes=("frontend/src/pages/Fresh.tsx",),
             )
-            (ui / "Fresh.tsx").write_text("export default function Fresh(){ return null }\n", encoding="utf-8")
+            (ui / "Fresh.tsx").write_text(
+                "export default function Fresh(){\n"
+                "  return (<main><h1>Fresh Page Content Block</h1>"
+                "<p>In-attempt written page for acceptance.</p></main>);\n"
+                "}\n",
+                encoding="utf-8",
+            )
             acc2 = mod.evaluate_step_acceptance(root, _module(), step, result2)
             self.assertTrue(acc2.ok, acc2.reason)
 

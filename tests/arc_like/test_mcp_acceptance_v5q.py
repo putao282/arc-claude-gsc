@@ -73,13 +73,50 @@ def _step(step_id: str) -> mod.StepDef:
     raise KeyError(step_id)
 
 
+def _real_page_source(name: str = "Home") -> str:
+    return (
+        f"export default function {name}(){{\n"
+        "  return (\n"
+        '    <main className="min-h-screen home-dashboard">\n'
+        f"      <h1>{name} Dashboard Feature</h1>\n"
+        "      <p>Feature-complete page content for acceptance tests.</p>\n"
+        "    </main>\n"
+        "  );\n"
+        "}\n"
+    )
+
+
+def _seed_feature_dag(root: Path, *, keywords: list[str] | None = None) -> Path:
+    """v5af: implement accept needs TEST_DAG feature wiring hits in source."""
+    sdir = root / ".arc" / "steps" / "REQ-1"
+    sdir.mkdir(parents=True, exist_ok=True)
+    kws = keywords or ["home", "dashboard", "app"]
+    api = [{"path": f"/api/{k}", "name": k} for k in kws[:2]]
+    ui = [{"page": k.title(), "path": f"/{k}"} for k in kws[:2]]
+    (sdir / "test_dag.json").write_text(
+        __import__("json").dumps({"api": api, "ui": ui}), encoding="utf-8"
+    )
+    # Ensure keywords appear in source corpus
+    src_dir = root / "frontend" / "src"
+    src_dir.mkdir(parents=True, exist_ok=True)
+    blob = "\n".join(kws) + "\n" + " ".join(f"/{k}" for k in kws) + "\n"
+    marker = src_dir / "_feature_markers.ts"
+    if not marker.is_file():
+        marker.write_text(
+            "// feature wiring markers\n" + "\n".join(f'export const {k.replace("-", "_")} = "{k}";' for k in kws) + "\n",
+            encoding="utf-8",
+        )
+    return sdir
+
+
+
 class McpAcceptanceV5qTests(unittest.TestCase):
     def test_pages_requires_design_mcp(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             page = root / "frontend" / "src" / "pages" / "Home.tsx"
             page.parent.mkdir(parents=True)
-            page.write_text("export default function Home(){return <div/>}\n", encoding="utf-8")
+            page.write_text(_real_page_source("Home"), encoding="utf-8")
             acc = mod.evaluate_step_acceptance(
                 root, _module(), _step("pages"),
                 _result(skills=("designer",), mcp=()),
@@ -123,7 +160,13 @@ class McpAcceptanceV5qTests(unittest.TestCase):
             )
             self.assertFalse(acc2.ok)
             self.assertIn("write progress", acc2.reason.lower())
-            # Write|Edit business path + search_code → pass
+            # Write|Edit business path + search_code → pass (v5af also needs TEST_DAG wiring)
+            _seed_feature_dag(root, keywords=["home", "dashboard", "app"])
+            src.write_text(
+                "export const app = 1;\nexport const home = '/home';\n"
+                "export const dashboard = '/dashboard';\n" + ("// pad\n" * 10),
+                encoding="utf-8",
+            )
             acc3 = mod.evaluate_step_acceptance(
                 root, _module(), _step("implement"),
                 _result(
@@ -132,7 +175,7 @@ class McpAcceptanceV5qTests(unittest.TestCase):
                     writes=("frontend/src/app.ts",),
                 ),
             )
-            self.assertTrue(acc3.ok)
+            self.assertTrue(acc3.ok, acc3.reason)
 
     def test_implement_leftover_pages_plus_search_code_fails(self):
         """G1: pages leftover files + search_code alone must NOT pass."""
@@ -153,7 +196,12 @@ class McpAcceptanceV5qTests(unittest.TestCase):
             root = Path(tmp)
             src = root / "frontend" / "src" / "app.ts"
             src.parent.mkdir(parents=True)
-            src.write_text("export const x = 1;\n" + ("// pad\n" * 10), encoding="utf-8")
+            _seed_feature_dag(root, keywords=["home", "dashboard", "app"])
+            src.write_text(
+                "export const app = 1;\nexport const home = '/home';\n"
+                "export const dashboard = '/dashboard';\n" + ("// pad\n" * 10),
+                encoding="utf-8",
+            )
             acc = mod.evaluate_step_acceptance(
                 root, _module(), _step("implement"),
                 _result(
@@ -162,7 +210,7 @@ class McpAcceptanceV5qTests(unittest.TestCase):
                     writes=(str(src),),
                 ),
             )
-            self.assertTrue(acc.ok)
+            self.assertTrue(acc.ok, acc.reason)
 
     def test_implement_json_files_written_mtime_gate(self):
         import time
@@ -172,9 +220,14 @@ class McpAcceptanceV5qTests(unittest.TestCase):
             src.parent.mkdir(parents=True)
             step_start = time.time()
             time.sleep(0.05)
-            src.write_text("export const server = 1;\n" + ("// pad\n" * 10), encoding="utf-8")
+            _seed_feature_dag(root, keywords=["server", "home", "dashboard"])
+            src.write_text(
+                "export const server = 1;\nexport const home = '/home';\n"
+                "export const dashboard = '/api/home';\n" + ("// pad\n" * 10),
+                encoding="utf-8",
+            )
             sdir = root / ".arc" / "steps" / "REQ-1"
-            sdir.mkdir(parents=True)
+            sdir.mkdir(parents=True, exist_ok=True)
             (sdir / "search_code.json").write_text('{"hits":["server"]}\n', encoding="utf-8")
             (sdir / "implement.json").write_text(
                 json.dumps({"files_written": ["backend/src/server.ts"], "step_id": "implement"}),
@@ -194,16 +247,21 @@ class McpAcceptanceV5qTests(unittest.TestCase):
                 root, _module(), _step("implement"),
                 _result(skills=("arcbench-checkpoint",), mcp=(), step_started_at=step_start),
             )
-            self.assertTrue(acc_new.ok)
+            self.assertTrue(acc_new.ok, acc_new.reason)
 
     def test_implement_accepts_search_code_receipt_file(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             src = root / "frontend" / "src" / "app.ts"
             src.parent.mkdir(parents=True)
-            src.write_text("export const x = 1;\n" + ("// pad\n" * 10), encoding="utf-8")
+            _seed_feature_dag(root, keywords=["home", "dashboard", "app"])
+            src.write_text(
+                "export const app = 1;\nexport const home = '/home';\n"
+                "export const dashboard = '/dashboard';\n" + ("// pad\n" * 10),
+                encoding="utf-8",
+            )
             sdir = root / ".arc" / "steps" / "REQ-1"
-            sdir.mkdir(parents=True)
+            sdir.mkdir(parents=True, exist_ok=True)
             (sdir / "search_code.json").write_text('{"hits":["App"]}\n', encoding="utf-8")
             # receipt alone without write progress fails
             acc = mod.evaluate_step_acceptance(
@@ -215,7 +273,7 @@ class McpAcceptanceV5qTests(unittest.TestCase):
                 root, _module(), _step("implement"),
                 _result(skills=("arcbench-checkpoint",), mcp=(), writes=("frontend/src/app.ts",)),
             )
-            self.assertTrue(acc2.ok)
+            self.assertTrue(acc2.ok, acc2.reason)
 
     def test_implement_step_prompt_mentions_write_gate(self):
         prompt = mod.step_prompt(
@@ -606,7 +664,7 @@ class McpAcceptanceV5qTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             sdir = root / ".arc" / "steps" / "REQ-1"
-            sdir.mkdir(parents=True)
+            sdir.mkdir(parents=True, exist_ok=True)
             (sdir / "prd_govern.json").write_text(
                 '{"ok": true, "source": "forged-receipt"}\n', encoding="utf-8"
             )
@@ -634,7 +692,7 @@ class McpAcceptanceV5qTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             sdir = root / ".arc" / "steps" / "REQ-1"
-            sdir.mkdir(parents=True)
+            sdir.mkdir(parents=True, exist_ok=True)
             (sdir / "prd_govern.json").write_text('{"mirrored": true}\n', encoding="utf-8")
             (sdir / "spec_govern.json").write_text('{"mirrored": true}\n', encoding="utf-8")
             acc = mod.evaluate_step_acceptance(

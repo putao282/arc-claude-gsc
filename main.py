@@ -171,7 +171,7 @@ OFFICIAL_STEPS: tuple[StepDef, ...] = (
         title="PAGES + UX-UI designer",
         required_skills=("designer",),
         goal="Design/build pages/UI for this module (designer skill available via Skill tool).",
-        exit_criteria="UI/page files under frontend/src (or pages receipt) + design MCP proof.",
+        exit_criteria=("UI/page files under frontend/src with export default + non-stub content (v5af) + design MCP proof; soft-accept@max_turns disabled."),
     ),
     StepDef(
         step_id="implement",
@@ -184,7 +184,9 @@ OFFICIAL_STEPS: tuple[StepDef, ...] = (
         exit_criteria=(
             "search_code MCP proof AND in-STEP write progress "
             "(Write|Edit to frontend|backend|src ≥1, OR implement.json files_written "
-            "with mtime≥step_start). Leftover pages files + search_code alone do NOT pass."
+            "with mtime≥step_start) AND TEST_DAG feature wiring in source (v5af). "
+            "Leftover pages files + search_code alone do NOT pass. "
+            "Soft-accept@max_turns disabled for implement."
         ),
         forbid_mid_dev_tests=True,
     ),
@@ -1540,6 +1542,387 @@ def package_scripts(project_dir: Path) -> dict[str, str]:
     return {str(k): str(v) for k, v in scripts.items() if isinstance(v, str)}
 
 
+
+def run_project_build(
+    project_dir: Path,
+    *,
+    timeout_seconds: int | None = None,
+    run_fn=None,
+) -> ValidationResult:
+    """v5af hard gate: `npm run build` after vitest green. Fail closed on non-zero.
+
+    Platform Official evaluate also runs `npm run build`; harness must not stamp
+    test-passed when build is broken (GitHub v5ae App.tsx default-import miss).
+    """
+    if timeout_seconds is None:
+        timeout_seconds = env_int("ARC_BUILD_TIMEOUT_SECONDS", 300, minimum=30, maximum=3600)
+    scripts = package_scripts(project_dir)
+    if "build" not in scripts:
+        return ValidationResult(
+            ok=True,
+            exit_code=0,
+            cmd=[],
+            log_tail="",
+            reason="no package.json build script; build gate skipped",
+            project_dir=str(project_dir),
+        )
+    cmd = ["npm", "run", "build"]
+    runner = run_fn or subprocess.run
+    try:
+        completed = runner(
+            cmd,
+            cwd=str(project_dir),
+            capture_output=True,
+            text=True,
+            timeout=timeout_seconds,
+            env=os.environ.copy(),
+        )
+        stdout = completed.stdout or ""
+        stderr = completed.stderr or ""
+        exit_code = int(completed.returncode)
+    except subprocess.TimeoutExpired as exc:
+        stdout = (exc.stdout or "") if isinstance(exc.stdout, str) else ""
+        stderr = (exc.stderr or "") if isinstance(exc.stderr, str) else ""
+        combined = (stdout + "\n" + stderr).strip()
+        return ValidationResult(
+            ok=False,
+            exit_code=124,
+            cmd=cmd,
+            log_tail=combined[-8000:],
+            reason=f"npm run build timed out after {timeout_seconds}s",
+            project_dir=str(project_dir),
+        )
+    except FileNotFoundError as exc:
+        return ValidationResult(
+            ok=False,
+            exit_code=127,
+            cmd=cmd,
+            log_tail=str(exc),
+            reason=f"npm run build command not found: {exc}",
+            project_dir=str(project_dir),
+        )
+    except Exception as exc:
+        return ValidationResult(
+            ok=False,
+            exit_code=1,
+            cmd=cmd,
+            log_tail=str(exc),
+            reason=f"npm run build runner error: {exc}",
+            project_dir=str(project_dir),
+        )
+    combined = (stdout + "\n" + stderr).strip()
+    log_tail = combined[-8000:]
+    if exit_code == 0:
+        return ValidationResult(
+            ok=True,
+            exit_code=0,
+            cmd=cmd,
+            log_tail=log_tail,
+            reason="npm run build passed",
+            project_dir=str(project_dir),
+        )
+    return ValidationResult(
+        ok=False,
+        exit_code=exit_code,
+        cmd=cmd,
+        log_tail=log_tail,
+        reason=f"npm run build failed: exit={exit_code} (v5af hard gate)",
+        project_dir=str(project_dir),
+    )
+
+
+_DEFAULT_IMPORT_FROM_PAGES_RE = re.compile(
+    r"""import\s+([A-Za-z_][\w]*)\s+from\s+['"]([^'"]+)['"]""",
+    re.MULTILINE,
+)
+_EXPORT_DEFAULT_RE = re.compile(r"""export\s+default\b""")
+
+
+def _resolve_import_path(importer: Path, spec: str) -> Path | None:
+    """Resolve a relative TS/JS import spec to an existing file (try extensions)."""
+    if not spec.startswith("."):
+        return None
+    base = (importer.parent / spec).resolve()
+    candidates: list[Path] = []
+    if base.suffix:
+        candidates.append(base)
+    else:
+        for ext in (".tsx", ".jsx", ".ts", ".js", ".mjs", ".cjs"):
+            candidates.append(Path(str(base) + ext))
+        candidates.append(base / "index.tsx")
+        candidates.append(base / "index.jsx")
+        candidates.append(base / "index.ts")
+        candidates.append(base / "index.js")
+    for c in candidates:
+        try:
+            if c.is_file():
+                return c
+        except OSError:
+            continue
+    return None
+
+
+def check_app_page_default_exports(output_dir: Path) -> tuple[bool, str, list[str]]:
+    """v5af: App/router default-imports of pages must have `export default`.
+
+    Static fail-closed gate matching Official `npm run build` (Vite) breakage when
+    `import HomePage from './pages/HomePage'` lacks default export.
+    """
+    app_candidates = [
+        output_dir / "frontend" / "src" / "App.tsx",
+        output_dir / "frontend" / "src" / "App.jsx",
+        output_dir / "frontend" / "src" / "App.ts",
+        output_dir / "frontend" / "src" / "App.js",
+        output_dir / "frontend" / "src" / "main.tsx",
+        output_dir / "frontend" / "src" / "main.jsx",
+        output_dir / "src" / "App.tsx",
+        output_dir / "src" / "App.jsx",
+        output_dir / "src" / "App.ts",
+        output_dir / "src" / "App.js",
+    ]
+    apps = [p for p in app_candidates if p.is_file()]
+    if not apps:
+        # No App yet — pages STEP may create pages before App wires them; soft skip.
+        return True, "no_app_router_yet", []
+    problems: list[str] = []
+    checked: list[str] = []
+    for app in apps:
+        try:
+            src = app.read_text(encoding="utf-8", errors="replace")
+        except OSError as exc:
+            problems.append(f"unreadable:{app}:{exc}")
+            continue
+        for m in _DEFAULT_IMPORT_FROM_PAGES_RE.finditer(src):
+            local_name, spec = m.group(1), m.group(2)
+            spec_norm = spec.replace("\\", "/")
+            # Only care about page-like imports (default import style).
+            if "/pages/" not in spec_norm and not spec_norm.rstrip("/").endswith("/pages") and "pages/" not in spec_norm:
+                # Also catch './pages/HomePage' and '../pages/X'
+                if "pages" not in spec_norm.split("/") and not re.search(r"(^|/)pages(/|$)", spec_norm):
+                    continue
+            target = _resolve_import_path(app, spec)
+            if target is None:
+                problems.append(f"missing_module:{app.name}:{local_name}<-{spec}")
+                continue
+            checked.append(str(target))
+            try:
+                body = target.read_text(encoding="utf-8", errors="replace")
+            except OSError as exc:
+                problems.append(f"unreadable_page:{target}:{exc}")
+                continue
+            if not _EXPORT_DEFAULT_RE.search(body):
+                problems.append(
+                    f"missing_default_export:{target.name} (imported as default by {app.name} from {spec})"
+                )
+    if problems:
+        return False, "; ".join(problems[:8]), checked
+    return True, f"default_exports_ok:{len(checked)}", checked
+
+
+def check_pages_not_stub(output_dir: Path, *, min_bytes: int = 120) -> tuple[bool, str, list[str]]:
+    """Reject empty/near-empty page components under frontend/src/pages (or src/pages)."""
+    roots = [
+        output_dir / "frontend" / "src" / "pages",
+        output_dir / "src" / "pages",
+    ]
+    pages: list[Path] = []
+    for root in roots:
+        if not root.is_dir():
+            continue
+        for pattern in ("**/*.tsx", "**/*.jsx"):
+            for p in root.glob(pattern):
+                if p.is_file() and "node_modules" not in p.parts:
+                    pages.append(p)
+    if not pages:
+        return False, "no_page_files_under_src/pages", []
+    thin: list[str] = []
+    ok_pages: list[str] = []
+    for p in pages:
+        try:
+            size = p.stat().st_size
+            body = p.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            thin.append(f"unreadable:{p.name}")
+            continue
+        has_default = bool(_EXPORT_DEFAULT_RE.search(body))
+        # Strip whitespace-only / nearly empty shells
+        stripped = re.sub(r"\s+", "", body)
+        if size < min_bytes or len(stripped) < max(40, min_bytes // 3):
+            thin.append(f"stub_too_small:{p.name}:{size}B")
+            continue
+        if not has_default:
+            thin.append(f"no_export_default:{p.name}")
+            continue
+        ok_pages.append(str(p))
+    if not ok_pages:
+        return False, "all_pages_stub_or_missing_default:" + ";".join(thin[:6]), thin
+    if thin and not ok_pages:
+        return False, ";".join(thin[:6]), thin
+    # Pass if ≥1 real page; note thin siblings.
+    note = f"real_pages={len(ok_pages)}"
+    if thin:
+        note += f";thin_skipped={len(thin)}"
+    return True, note, ok_pages
+
+
+def _load_test_dag_entries(sdir: Path) -> tuple[list, list]:
+    dag = sdir / "test_dag.json"
+    if not dag.is_file():
+        return [], []
+    try:
+        payload = json.loads(dag.read_text(encoding="utf-8"))
+    except Exception:
+        return [], []
+    if not isinstance(payload, dict):
+        return [], []
+    api = payload.get("api") or payload.get("api_tests") or []
+    ui = payload.get("ui") or payload.get("ui_tests") or []
+    tests_obj = payload.get("tests")
+    if isinstance(tests_obj, dict):
+        if not api:
+            api = tests_obj.get("api") or tests_obj.get("api_tests") or []
+        if not ui:
+            ui = tests_obj.get("ui") or tests_obj.get("ui_tests") or []
+    if not isinstance(api, list):
+        api = []
+    if not isinstance(ui, list):
+        ui = []
+    return api, ui
+
+
+def _entry_keywords(entry: object) -> list[str]:
+    keys: list[str] = []
+    if isinstance(entry, str):
+        keys.append(entry)
+        return [k for k in keys if len(k) >= 3]
+    if not isinstance(entry, dict):
+        return []
+    for k in (
+        "path", "route", "url", "endpoint", "api", "name", "id", "feature",
+        "handler", "method", "page", "component", "selector", "testId", "test_id",
+        "description", "title",
+    ):
+        v = entry.get(k)
+        if isinstance(v, str) and v.strip():
+            keys.append(v.strip())
+        elif isinstance(v, (list, tuple)):
+            for item in v:
+                if isinstance(item, str) and item.strip():
+                    keys.append(item.strip())
+    # Also flatten nested path-like
+    for v in entry.values():
+        if isinstance(v, str) and v.startswith("/") and len(v) >= 2:
+            keys.append(v)
+    # Dedup preserving order; drop ultra-short noise
+    out: list[str] = []
+    seen: set[str] = set()
+    for k in keys:
+        low = k.lower()
+        if low in seen:
+            continue
+        if len(k) < 2:
+            continue
+        seen.add(low)
+        out.append(k)
+    return out[:12]
+
+
+def check_test_dag_feature_wiring(
+    output_dir: Path,
+    sdir: Path,
+    *,
+    min_hit_ratio: float = 0.34,
+) -> tuple[bool, str]:
+    """v5af: require source wiring for TEST_DAG api+ui features (not vitest-stub-only).
+
+    Scans frontend/backend/src for keywords from test_dag entries. Fail closed when
+    DAG exists but almost no matching routes/handlers/pages appear in source —
+    prevents platform evaluate 0/N feature scores after harness vitest-greens.
+    """
+    api, ui = _load_test_dag_entries(sdir)
+    if not api and not ui:
+        return False, "test_dag_missing_or_empty_for_feature_wiring"
+    # Collect searchable source text (cap size)
+    roots = [
+        output_dir / "frontend" / "src",
+        output_dir / "backend" / "src",
+        output_dir / "src",
+        output_dir / "backend",
+    ]
+    blobs: list[str] = []
+    total_bytes = 0
+    for root in roots:
+        if not root.exists():
+            continue
+        for p in root.rglob("*"):
+            if not p.is_file():
+                continue
+            if p.suffix.lower() not in {".ts", ".tsx", ".js", ".jsx", ".py", ".vue"}:
+                continue
+            if "node_modules" in p.parts or "dist" in p.parts or ".git" in p.parts:
+                continue
+            try:
+                sz = p.stat().st_size
+            except OSError:
+                continue
+            if sz < 20 or sz > 400_000:
+                continue
+            try:
+                blobs.append(p.read_text(encoding="utf-8", errors="replace"))
+                total_bytes += sz
+            except OSError:
+                continue
+            if total_bytes > 2_000_000:
+                break
+        if total_bytes > 2_000_000:
+            break
+    corpus = "\n".join(blobs).lower()
+    if len(corpus) < 80:
+        return False, "no_source_corpus_for_feature_wiring"
+
+    def _hit(entry: object) -> bool:
+        kws = _entry_keywords(entry)
+        if not kws:
+            return False
+        for kw in kws:
+            token = kw.lower().strip()
+            # path fragments: try last segment
+            if token in corpus:
+                return True
+            if "/" in token:
+                seg = token.rstrip("/").split("/")[-1]
+                if len(seg) >= 3 and seg.lower() in corpus:
+                    return True
+            # camel/pascal variants of hyphen/underscore names
+            compact = re.sub(r"[^a-z0-9]", "", token)
+            if len(compact) >= 4 and compact in re.sub(r"[^a-z0-9]", "", corpus):
+                return True
+        return False
+
+    api_hits = sum(1 for e in api if _hit(e))
+    ui_hits = sum(1 for e in ui if _hit(e))
+    api_n = len(api) or 0
+    ui_n = len(ui) or 0
+    notes = [f"api_hits={api_hits}/{api_n}", f"ui_hits={ui_hits}/{ui_n}", f"corpus_bytes={total_bytes}"]
+    # Require both sides when present
+    ok = True
+    if api_n:
+        if api_hits / api_n < min_hit_ratio and api_hits < 1:
+            ok = False
+        elif api_hits < max(1, int(api_n * min_hit_ratio + 0.999)):
+            # need ceil(ratio*n) hits, at least 1
+            need = max(1, int(api_n * min_hit_ratio + 0.999))
+            if api_hits < need:
+                ok = False
+    if ui_n:
+        need = max(1, int(ui_n * min_hit_ratio + 0.999))
+        if ui_hits < need:
+            ok = False
+    if not ok:
+        return False, "feature_wiring_insufficient:" + ",".join(notes)
+    return True, "feature_wiring_ok:" + ",".join(notes)
+
+
 def find_test_files(project_dir: Path) -> list[Path]:
     patterns = (
         "**/*.test.ts",
@@ -1691,21 +2074,37 @@ def run_module_validation(
 
     combined = (stdout + "\n" + stderr).strip()
     log_tail = combined[-8000:]
-    if exit_code == 0:
+    if exit_code != 0:
         return ValidationResult(
-            ok=True,
-            exit_code=0,
+            ok=False,
+            exit_code=exit_code,
             cmd=cmd,
             log_tail=log_tail,
-            reason="harness local validation passed",
+            reason=f"harness validation failed: exit={exit_code} cmd={' '.join(cmd)}",
+            project_dir=str(project_dir),
+        )
+
+    # v5af: hard gate npm run build AFTER vitest green (before WAVE success / stamp).
+    build = run_project_build(
+        Path(project_dir),
+        timeout_seconds=timeout_seconds,
+        run_fn=runner,
+    )
+    if not build.ok:
+        return ValidationResult(
+            ok=False,
+            exit_code=build.exit_code,
+            cmd=list(build.cmd) or ["npm", "run", "build"],
+            log_tail=(log_tail + "\n--- npm run build ---\n" + (build.log_tail or ""))[-8000:],
+            reason=f"v5af build hard gate failed after vitest green: {build.reason}",
             project_dir=str(project_dir),
         )
     return ValidationResult(
-        ok=False,
-        exit_code=exit_code,
-        cmd=cmd,
-        log_tail=log_tail,
-        reason=f"harness validation failed: exit={exit_code} cmd={' '.join(cmd)}",
+        ok=True,
+        exit_code=0,
+        cmd=cmd + (["&&"] + list(build.cmd) if build.cmd else []),
+        log_tail=(log_tail + "\n--- npm run build ---\n" + (build.log_tail or ""))[-8000:],
+        reason="harness local validation+build passed (v5af)",
         project_dir=str(project_dir),
     )
 
@@ -3412,8 +3811,32 @@ def evaluate_step_acceptance(
                 soft_notes=tuple(soft_notes + [f"pages_write_gate:{pages_wr_proof}"]),
             )
         soft_notes.append(f"pages_write_progress:{pages_wr_proof}")
+        # v5af B: page default export + non-stub content (fail closed).
+        de_ok, de_reason, de_checked = check_app_page_default_exports(output_dir)
+        if not de_ok:
+            return StepAcceptance(
+                ok=False,
+                reason=f"PAGES default-export gate failed (v5af): {de_reason}",
+                skills_seen=skills_seen,
+                artifacts=tuple(found[:12] + design_mcp),
+                soft_notes=tuple(soft_notes + [f"default_export_gate:{de_reason}"]),
+            )
+        soft_notes.append(f"default_export:{de_reason}")
+        stub_ok, stub_reason, stub_pages = check_pages_not_stub(output_dir)
+        if not stub_ok:
+            return StepAcceptance(
+                ok=False,
+                reason=(
+                    f"PAGES stub/empty UI rejected (v5af): {stub_reason}. "
+                    "Write real page components with export default (≥120B, not empty shells)."
+                ),
+                skills_seen=skills_seen,
+                artifacts=tuple(found[:12] + design_mcp),
+                soft_notes=tuple(soft_notes + [f"pages_stub_gate:{stub_reason}"]),
+            )
+        soft_notes.append(f"pages_not_stub:{stub_reason}")
         mcp_optional.extend(mcp_tools_matching(used, "read_image", "design_audit", "lifecycle", "query", "navigate", "snapshot", "take_screenshot"))
-        artifacts = found[:12] + design_mcp + [pages_wr_proof]
+        artifacts = found[:12] + design_mcp + [pages_wr_proof, de_reason, stub_reason] + list(de_checked)[:4]
         mcp_required = list(design_mcp)
 
     elif step.step_id == "implement":
@@ -3461,8 +3884,34 @@ def evaluate_step_acceptance(
                 soft_notes=tuple(soft_notes + [f"write_gate:{write_proof}"]),
             )
         soft_notes.append(f"write_progress:{write_proof}")
+        # v5af C: feature/eval quality — TEST_DAG api+ui must appear wired in source.
+        wire_ok, wire_reason = check_test_dag_feature_wiring(output_dir, sdir)
+        if not wire_ok:
+            return StepAcceptance(
+                ok=False,
+                reason=(
+                    f"IMPLEMENT feature-wiring gate failed (v5af): {wire_reason}. "
+                    "Write real page+API handlers matching test_dag.json api/ui before accept; "
+                    "vitest stubs alone do NOT pass."
+                ),
+                skills_seen=skills_seen,
+                artifacts=tuple(list(dict.fromkeys(found + search_hits + [write_proof]))[:12]),
+                soft_notes=tuple(soft_notes + [f"feature_wiring_gate:{wire_reason}"]),
+            )
+        soft_notes.append(wire_reason)
+        # Also enforce App↔page default exports on implement (catch late App edits).
+        de_ok, de_reason, _de = check_app_page_default_exports(output_dir)
+        if not de_ok:
+            return StepAcceptance(
+                ok=False,
+                reason=f"IMPLEMENT default-export gate failed (v5af): {de_reason}",
+                skills_seen=skills_seen,
+                artifacts=tuple(list(dict.fromkeys(found + search_hits))[:12]),
+                soft_notes=tuple(soft_notes + [f"default_export_gate:{de_reason}"]),
+            )
+        soft_notes.append(f"default_export:{de_reason}")
         mcp_optional.extend(mcp_tools_matching(used, "kb_query", "kb_inject", "refactor_code", "format_code", "solver"))
-        artifacts = list(dict.fromkeys(found + search_hits + [write_proof]))[:16]
+        artifacts = list(dict.fromkeys(found + search_hits + [write_proof, wire_reason, de_reason]))[:16]
         mcp_required = mcp_tools_matching(used, "search_code") or search_hits[:]
 
     elif step.step_id == "audit_refactor":
@@ -3537,6 +3986,38 @@ def evaluate_step_acceptance(
                 commit_gate_status=commit_gate_status,
                 soft_notes=tuple(soft_notes),
             )
+        # v5af C: even with vitest+build green, require TEST_DAG feature wiring in source.
+        wire_ok, wire_reason = check_test_dag_feature_wiring(output_dir, sdir)
+        if not wire_ok:
+            soft_notes.append(f"feature_wiring_gate:{wire_reason}")
+            return StepAcceptance(
+                ok=False,
+                reason=(
+                    f"batch_test feature-wiring gate failed (v5af): {wire_reason}. "
+                    "Platform evaluate needs real routes/handlers matching competition features."
+                ),
+                skills_seen=skills_seen,
+                artifacts=tuple(artifacts),
+                mcp_optional_seen=tuple(mcp_optional),
+                commit_gate_status=commit_gate_status,
+                soft_notes=tuple(soft_notes),
+            )
+        soft_notes.append(wire_reason)
+        artifacts.append(wire_reason)
+        de_ok, de_reason, _de = check_app_page_default_exports(output_dir)
+        if not de_ok:
+            soft_notes.append(f"default_export_gate:{de_reason}")
+            return StepAcceptance(
+                ok=False,
+                reason=f"batch_test default-export gate failed (v5af): {de_reason}",
+                skills_seen=skills_seen,
+                artifacts=tuple(artifacts),
+                mcp_optional_seen=tuple(mcp_optional),
+                commit_gate_status=commit_gate_status,
+                soft_notes=tuple(soft_notes),
+            )
+        soft_notes.append(f"default_export:{de_reason}")
+        artifacts.append(de_reason)
     else:
         return StepAcceptance(ok=False, reason=f"unknown step {step.step_id}", skills_seen=skills_seen)
 
@@ -3696,6 +4177,8 @@ def step_prompt(
             "- Soft: `mcp__arch__read_image`; browser `mcp__arch__lifecycle` + snapshot "
             f"(optional `{base}/browser_smoke.json`).\n"
             "- PAGES in-attempt write (v5ac): Write|Edit ≥1 UI file under frontend/src (or refresh pages.json this STEP); leftover files alone do NOT pass.\n"
+            "- DEFAULT EXPORT HARD (v5af): every `src/pages/*` used as default import in App MUST `export default` a React component (or sync App to named import). Missing default export fails Official `npm run build`.\n"
+            "- NO STUB UI (v5af): real pages ≥120B with content matching TEST_DAG ui — empty shells do NOT pass. Soft-accept@max_turns DISABLED for pages/implement.\n"
         )
     elif step.step_id == "implement":
         mcp_extra = (
@@ -3712,6 +4195,9 @@ def step_prompt(
             "- Do NOT re-call identical MCP reads; do NOT run continuous mid-dev tests.\n"
             "- On VALIDATION REPAIR: read repair_note / VITEST OUTPUT and Write|Edit until tests would pass; "
             "do NOT only call commit_gate.\n"
+            "- FEATURE WIRING HARD (v5af): implement FULL TEST_DAG api+ui behaviors — real routes/handlers/pages matching test_dag.json entries. Vitest unit stubs alone do NOT pass harness or Official evaluate.\n"
+            "- Soft-accept@max_turns DISABLED for implement (v5af).\n"
+            "- Keep App default-imports of pages in sync with `export default` (build hard gate).\n"
         )
     elif step.step_id == "audit_refactor":
         mcp_extra = (
@@ -3732,6 +4218,8 @@ def step_prompt(
             f"- Soft once: `mcp__arch__commit_gate` → `{base}/commit_gate.json` "
             "(commit_gate alone does NOT green this STEP).\n"
             "- On failure soft: `mcp__arch__trace_failure` then Write/Edit again.\n"
+            "- BUILD HARD GATE (v5af): after vitest green the harness runs `npm run build` and FAIL-CLOSES on non-zero. Fix export default / TS / Vite errors here before WAVE success.\n"
+            "- FEATURE WIRING (v5af): source must still match TEST_DAG api+ui (not stub-only).\n"
         )
 
     wave_ctx = wave_ctx or {}
@@ -4085,6 +4573,10 @@ def main() -> int:
                     "v5ac_batch_test_vitest_feed_implement_repair",
                     "v5ad_wave_central_one_shot_batch_test",
                     "v5ae_govern_green_force_stop_no_supervisor_fail_closed",
+                    "v5af_npm_build_hard_gate_after_vitest",
+                    "v5af_page_default_export_fail_closed",
+                    "v5af_no_soft_accept_pages_implement_max_turns",
+                    "v5af_test_dag_feature_wiring_gate",
                 ],
             },
             ensure_ascii=False,
@@ -4486,13 +4978,49 @@ def main() -> int:
                             # v5ac: soft-accept@max_turns requires in-attempt write progress
                             # (no lifting stale pages/spec/prd leftovers without a fresh write).
                             if soft_acc.ok:
+                                # v5af C: NEVER soft-accept pages/implement at max_turns —
+                                # Sheet v5ad stamped green on stub UI via soft-accept@max_turns
+                                # then platform evaluate scored 0/24 features.
+                                if step.step_id in ("pages", "implement"):
+                                    soft_acc = StepAcceptance(
+                                        ok=False,
+                                        reason=(
+                                            "v5af: soft-accept@max_turns DISABLED for "
+                                            f"{step.step_id}; refuse stub/empty UI green — "
+                                            "must complete with real page+API wiring "
+                                            "(Write/Edit against TEST_DAG) before accept"
+                                        ),
+                                        skills_seen=soft_acc.skills_seen,
+                                        missing_skills=soft_acc.missing_skills,
+                                        artifacts=soft_acc.artifacts,
+                                        mcp_required=soft_acc.mcp_required,
+                                        mcp_optional_seen=soft_acc.mcp_optional_seen,
+                                        commit_gate_status=soft_acc.commit_gate_status,
+                                        soft_notes=tuple(
+                                            list(soft_acc.soft_notes)
+                                            + ["soft_accept_disabled_v5af:pages_implement"]
+                                        ),
+                                    )
+                                    print(
+                                        json.dumps(
+                                            {
+                                                "event": "soft_accept_disabled_pages_implement",
+                                                "req_id": module.node_id,
+                                                "step_id": step.step_id,
+                                                "wave": wave_ctx.get("wave_index"),
+                                                "domain": wave_ctx.get("domain_id"),
+                                                "policy": "v5af",
+                                            },
+                                            ensure_ascii=False,
+                                        ),
+                                        flush=True,
+                                    )
+                            if soft_acc.ok:
                                 sdir_sa = step_dir(work_dir, module.node_id)
                                 wr_ok, wr_proof = in_attempt_write_progress(
                                     step.step_id, work_dir, sdir_sa, result
                                 )
                                 if not wr_ok and step.step_id in (
-                                    "pages",
-                                    "implement",
                                     "spec",
                                     "prd",
                                     "test_dag",
