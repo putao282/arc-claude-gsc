@@ -181,20 +181,21 @@ class McpRestoreTests(unittest.TestCase):
             else:
                 mod.os.environ["ARC_MCP_P2_TOOLS"] = old_p2
 
-    def test_audit_steps_default_on_and_order(self):
+    def test_audit_steps_default_off_and_order_v5ag(self):
         old = mod.os.environ.pop("ARC_ENABLE_MCP_AUDIT_STEPS", None)
         try:
-            self.assertTrue(mod.mcp_audit_steps_enabled())
+            self.assertFalse(mod.mcp_audit_steps_enabled())
             ids = [s.step_id for s in mod.official_steps()]
             self.assertEqual(
                 ids,
-                ["prd", "spec", "govern", "test_dag", "pages", "implement", "audit_refactor", "batch_test"],
+                ["prd", "spec", "test_dag", "implement", "batch_test"],
             )
-            mod.os.environ["ARC_ENABLE_MCP_AUDIT_STEPS"] = "0"
-            self.assertFalse(mod.mcp_audit_steps_enabled())
+            self.assertNotIn("pages", ids)
+            mod.os.environ["ARC_ENABLE_MCP_AUDIT_STEPS"] = "1"
+            self.assertTrue(mod.mcp_audit_steps_enabled())
             self.assertEqual(
                 [s.step_id for s in mod.official_steps()],
-                ["prd", "spec", "test_dag", "pages", "implement", "batch_test"],
+                ["prd", "spec", "govern", "test_dag", "implement", "audit_refactor", "batch_test"],
             )
         finally:
             if old is None:
@@ -209,9 +210,8 @@ class McpRestoreTests(unittest.TestCase):
             self.assertIn("mcp__arch__", prompt)
             self.assertNotIn("NEVER use MCP", prompt)
             if step.step_id == "implement":
-                self.assertIn("search_code", prompt)
-            if step.step_id == "pages":
-                self.assertIn("design_style", prompt)
+                self.assertIn("CODING + TEST LOOP", prompt)
+                self.assertNotIn("FORBIDDEN this STEP: do not run vitest", prompt)
             if step.step_id == "govern":
                 self.assertIn("prd_govern", prompt)
                 self.assertIn("spec_govern", prompt)

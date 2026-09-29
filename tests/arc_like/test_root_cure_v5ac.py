@@ -98,32 +98,9 @@ class RootCureV5acTests(unittest.TestCase):
             )
             self.assertFalse(bad)
 
-    def test_pages_write_progress_rejects_stale_only(self):
-        with tempfile.TemporaryDirectory() as td:
-            root = Path(td)
-            sdir = root / ".arc" / "steps" / "REQ-1"
-            sdir.mkdir(parents=True)
-            # leftover file exists but no in-attempt write
-            ui = root / "frontend" / "src" / "pages"
-            ui.mkdir(parents=True)
-            (ui / "Old.tsx").write_text("export default function Old(){return null}", encoding="utf-8")
-            # force step_started_at in the future relative to file mtime
-            started = time.time() + 10
-            ok, proof = mod.pages_write_progress(
-                root, sdir, _result(builtin_writes=(), step_started_at=started)
-            )
-            self.assertFalse(ok)
-            self.assertIn("no_in_attempt", proof)
-            ok2, proof2 = mod.pages_write_progress(
-                root,
-                sdir,
-                _result(
-                    builtin_writes=("frontend/src/pages/New.tsx",),
-                    step_started_at=started,
-                ),
-            )
-            self.assertTrue(ok2)
-            self.assertIn("in_session_write", proof2)
+    def test_pages_helpers_removed_v5ag(self):
+        self.assertFalse(hasattr(mod, "pages_write_progress"))
+        self.assertNotIn("pages", [s.step_id for s in mod.official_steps()])
 
     def test_in_attempt_write_progress_dispatch(self):
         with tempfile.TemporaryDirectory() as td:
@@ -137,49 +114,11 @@ class RootCureV5acTests(unittest.TestCase):
                 _result(builtin_writes=("src/lib/x.ts",)),
             )
             self.assertTrue(ok)
+            # pages STEP gone — generic path, no writes → False
             ok2, proof = mod.in_attempt_write_progress(
                 "pages", root, sdir, _result(builtin_writes=())
             )
             self.assertFalse(ok2)
-
-    def test_pages_acceptance_requires_in_attempt_write(self):
-        with tempfile.TemporaryDirectory() as td:
-            root = Path(td)
-            sdir = root / ".arc" / "steps" / "REQ-1"
-            sdir.mkdir(parents=True)
-            ui = root / "frontend" / "src" / "pages"
-            ui.mkdir(parents=True)
-            (ui / "Stale.tsx").write_text(
-                "export default function Stale(){\n"
-                "  return (<main><h1>Stale Page Content Block</h1>"
-                "<p>Leftover page used to test write gate.</p></main>);\n"
-                "}\n",
-                encoding="utf-8",
-            )
-            step = next(s for s in mod.official_steps() if s.step_id == "pages")
-            # leftover + design_mcp but no write this attempt
-            result = _result(
-                mcp_tools_used=("mcp__arch__design_style",),
-                builtin_writes=(),
-                step_started_at=time.time() + 5,
-            )
-            acc = mod.evaluate_step_acceptance(root, _module(), step, result)
-            self.assertFalse(acc.ok)
-            self.assertIn("in-attempt write", acc.reason.lower())
-
-            result2 = _result(
-                mcp_tools_used=("mcp__arch__design_style",),
-                builtin_writes=("frontend/src/pages/Fresh.tsx",),
-            )
-            (ui / "Fresh.tsx").write_text(
-                "export default function Fresh(){\n"
-                "  return (<main><h1>Fresh Page Content Block</h1>"
-                "<p>In-attempt written page for acceptance.</p></main>);\n"
-                "}\n",
-                encoding="utf-8",
-            )
-            acc2 = mod.evaluate_step_acceptance(root, _module(), step, result2)
-            self.assertTrue(acc2.ok, acc2.reason)
 
     def test_batch_test_failure_writes_repair_note_with_vitest_log(self):
         with tempfile.TemporaryDirectory() as td:
@@ -215,10 +154,11 @@ class RootCureV5acTests(unittest.TestCase):
             self.assertIn("Expected 2 got 1", payload["log_tail"])
 
     def test_early_write_append_constant_present(self):
-        self.assertIn("EARLY WRITE SKELETON", mod.IMPLEMENT_EARLY_WRITE_APPEND)
+        self.assertIn("IMPLEMENT LOOP", mod.IMPLEMENT_EARLY_WRITE_APPEND)
         self.assertIn("frontend/src", mod.IMPLEMENT_EARLY_WRITE_APPEND)
+        self.assertIn("Mid-dev tests ARE allowed", mod.IMPLEMENT_EARLY_WRITE_APPEND)
 
-    def test_implement_prompt_mentions_early_write_and_repair(self):
+    def test_implement_prompt_mentions_code_test_loop_and_repair(self):
         step = next(s for s in mod.official_steps() if s.step_id == "implement")
         prompt = mod.step_prompt(
             _module(),
@@ -230,9 +170,9 @@ class RootCureV5acTests(unittest.TestCase):
             validation_failure="VITEST OUTPUT:\nFAIL foo",
             validation_repair=1,
         )
-        self.assertIn("EARLY WRITE SKELETON", prompt)
+        self.assertIn("CODING + TEST LOOP", prompt)
         self.assertIn("VALIDATION REPAIR", prompt)
-        self.assertIn("do NOT only call commit_gate", prompt)
+        self.assertFalse(step.forbid_mid_dev_tests)
 
     def test_batch_test_prompt_forbids_commit_gate_only(self):
         step = next(s for s in mod.official_steps() if s.step_id == "batch_test")
@@ -245,7 +185,7 @@ class RootCureV5acTests(unittest.TestCase):
             step,
         )
         self.assertIn("commit_gate-only thrash", prompt)
-        self.assertIn("FIX failures", prompt)
+        self.assertIn("Fix failures", prompt)
 
     def test_validation_max_repairs_default_raised(self):
         # env helper should default to 4 now

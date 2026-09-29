@@ -58,7 +58,6 @@ STEP_MAX_TURNS = {
     "spec": 140,
     "govern": 100,
     "test_dag": 100,
-    "pages": 120,
     "implement": 140,
     "audit_refactor": 100,
     "batch_test": 120,

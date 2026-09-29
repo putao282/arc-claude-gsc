@@ -111,64 +111,51 @@ def _seed_feature_dag(root: Path, *, keywords: list[str] | None = None) -> Path:
 
 
 class McpAcceptanceV5qTests(unittest.TestCase):
-    def test_pages_requires_design_mcp(self):
+    def test_pages_step_removed_v5ag(self):
+        """v5ag: MCP has no pages stage — harness must not expose pages STEP."""
+        ids = [s.step_id for s in mod.official_steps()]
+        self.assertNotIn("pages", ids)
+        with self.assertRaises(KeyError):
+            _step("pages")
+        fake = mod.StepDef(
+            step_id="pages",
+            title="gone",
+            required_skills=(),
+            goal="gone",
+            exit_criteria="gone",
+        )
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            page = root / "frontend" / "src" / "pages" / "Home.tsx"
-            page.parent.mkdir(parents=True)
-            page.write_text(_real_page_source("Home"), encoding="utf-8")
             acc = mod.evaluate_step_acceptance(
-                root, _module(), _step("pages"),
-                _result(skills=("designer",), mcp=()),
-            )
-            self.assertFalse(acc.ok)
-            self.assertIn("design_style", acc.reason)
-            # v5ac: design_mcp alone + leftover pages is not enough — need in-attempt write.
-            acc2 = mod.evaluate_step_acceptance(
-                root, _module(), _step("pages"),
+                root, _module(), fake,
                 _result(skills=("designer",), mcp=("mcp__arch__design_style",)),
             )
-            self.assertFalse(acc2.ok)
-            self.assertIn("in-attempt write", acc2.reason.lower())
-            acc3 = mod.evaluate_step_acceptance(
-                root, _module(), _step("pages"),
-                _result(
-                    skills=("designer",),
-                    mcp=("mcp__arch__design_style",),
-                    writes=("frontend/src/pages/Home.tsx",),
-                ),
-            )
-            self.assertTrue(acc3.ok, acc3.reason)
-            self.assertTrue(any("design_style" in a for a in acc3.mcp_required + acc3.artifacts))
+            self.assertFalse(acc.ok)
+            self.assertIn("unknown step", acc.reason.lower())
 
-    def test_implement_requires_search_code(self):
+    def test_implement_thin_accepts_business_files_v5ag(self):
+        """v5ag: thin implement — business files OR writes pass; no search_code hard gate."""
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            src = root / "frontend" / "src" / "app.ts"
-            src.parent.mkdir(parents=True)
-            src.write_text("export const x = 1;\n" + ("// pad\n" * 10), encoding="utf-8")
+            # empty → fail
             acc = mod.evaluate_step_acceptance(
                 root, _module(), _step("implement"),
                 _result(skills=("arcbench-checkpoint",), mcp=()),
             )
             self.assertFalse(acc.ok)
-            self.assertIn("search_code", acc.reason)
-            # search_code alone without in-STEP write progress must fail (v5x G1)
+            # business source present → pass (search_code soft)
+            src = root / "frontend" / "src" / "app.ts"
+            src.parent.mkdir(parents=True)
+            src.write_text("export const x = 1;\n" + ("// pad\n" * 10), encoding="utf-8")
             acc2 = mod.evaluate_step_acceptance(
                 root, _module(), _step("implement"),
-                _result(skills=("arcbench-checkpoint",), mcp=("mcp__arch__search_code",)),
+                _result(skills=("arcbench-checkpoint",), mcp=()),
             )
-            self.assertFalse(acc2.ok)
-            self.assertIn("write progress", acc2.reason.lower())
-            # Write|Edit business path + search_code → pass (v5af also needs TEST_DAG wiring)
-            _seed_feature_dag(root, keywords=["home", "dashboard", "app"])
-            src.write_text(
-                "export const app = 1;\nexport const home = '/home';\n"
-                "export const dashboard = '/dashboard';\n" + ("// pad\n" * 10),
-                encoding="utf-8",
-            )
+            self.assertTrue(acc2.ok, acc2.reason)
+            # write progress alone also passes
+            root2 = root  # reuse
             acc3 = mod.evaluate_step_acceptance(
-                root, _module(), _step("implement"),
+                root2, _module(), _step("implement"),
                 _result(
                     skills=("arcbench-checkpoint",),
                     mcp=("mcp__arch__search_code",),
@@ -177,8 +164,8 @@ class McpAcceptanceV5qTests(unittest.TestCase):
             )
             self.assertTrue(acc3.ok, acc3.reason)
 
-    def test_implement_leftover_pages_plus_search_code_fails(self):
-        """G1: pages leftover files + search_code alone must NOT pass."""
+    def test_implement_leftover_source_files_pass_thin_v5ag(self):
+        """v5ag thin: existing frontend/src files satisfy minimal implement gate."""
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             page = root / "frontend" / "src" / "pages" / "Home.tsx"
@@ -188,8 +175,7 @@ class McpAcceptanceV5qTests(unittest.TestCase):
                 root, _module(), _step("implement"),
                 _result(skills=("arcbench-checkpoint",), mcp=("mcp__arch__search_code",)),
             )
-            self.assertFalse(acc.ok)
-            self.assertIn("write progress", acc.reason.lower())
+            self.assertTrue(acc.ok, acc.reason)
 
     def test_implement_write_plus_search_code_passes(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -233,15 +219,14 @@ class McpAcceptanceV5qTests(unittest.TestCase):
                 json.dumps({"files_written": ["backend/src/server.ts"], "step_id": "implement"}),
                 encoding="utf-8",
             )
-            # Old mtime (before step_start) → fail
+            # v5ag thin: existing business source files pass regardless of mtime theater
             import os
             os.utime(src, (step_start - 120, step_start - 120))
             acc_old = mod.evaluate_step_acceptance(
                 root, _module(), _step("implement"),
                 _result(skills=("arcbench-checkpoint",), mcp=(), step_started_at=step_start),
             )
-            self.assertFalse(acc_old.ok)
-            # Fresh mtime ≥ step_start → pass
+            self.assertTrue(acc_old.ok, acc_old.reason)
             os.utime(src, None)
             acc_new = mod.evaluate_step_acceptance(
                 root, _module(), _step("implement"),
@@ -263,24 +248,25 @@ class McpAcceptanceV5qTests(unittest.TestCase):
             sdir = root / ".arc" / "steps" / "REQ-1"
             sdir.mkdir(parents=True, exist_ok=True)
             (sdir / "search_code.json").write_text('{"hits":["App"]}\n', encoding="utf-8")
-            # receipt alone without write progress fails
+            # v5ag thin: source files present → pass (search_code receipt soft)
             acc = mod.evaluate_step_acceptance(
                 root, _module(), _step("implement"),
                 _result(skills=("arcbench-checkpoint",), mcp=()),
             )
-            self.assertFalse(acc.ok)
+            self.assertTrue(acc.ok, acc.reason)
             acc2 = mod.evaluate_step_acceptance(
                 root, _module(), _step("implement"),
                 _result(skills=("arcbench-checkpoint",), mcp=(), writes=("frontend/src/app.ts",)),
             )
             self.assertTrue(acc2.ok, acc2.reason)
 
-    def test_implement_step_prompt_mentions_write_gate(self):
+    def test_implement_step_prompt_mentions_code_test_loop(self):
         prompt = mod.step_prompt(
             _module(), Path("/tmp/req"), None, [], "web", _step("implement")
         )
-        self.assertIn("WRITE PROGRESS HARD GATE", prompt)
+        self.assertIn("CODING + TEST LOOP", prompt)
         self.assertIn("frontend/src", prompt)
+        self.assertIn("Mid-dev tests ARE allowed", prompt)
 
     def test_govern_requires_both_govern_tools(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -373,11 +359,13 @@ class McpAcceptanceV5qTests(unittest.TestCase):
                 '<html><section data-req="REQ-1">' + ("x" * 80) + "</section></html>\n",
                 encoding="utf-8",
             )
+            # v5ag: HTML >50B is enough; spec_write preferred soft
             acc3 = mod.evaluate_step_acceptance(
                 root, _module(), _step("spec"),
                 _result(skills=("architect",), mcp=()),
             )
-            self.assertFalse(acc3.ok)
+            self.assertTrue(acc3.ok, acc3.reason)
+            self.assertTrue(any("soft:spec_write_missing" in n for n in acc3.soft_notes), acc3.soft_notes)
             acc4 = mod.evaluate_step_acceptance(
                 root, _module(), _step("spec"),
                 _result(skills=("architect",), mcp=("mcp__arch__spec_read", "mcp__arch__spec_write")),
@@ -385,7 +373,7 @@ class McpAcceptanceV5qTests(unittest.TestCase):
             self.assertTrue(acc4.ok)
 
 
-    def test_spec_read_only_rejected_v5r(self):
+    def test_spec_html_ok_without_spec_write_v5ag(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             spec_dir = root / "SPEC" / "arcbench"
@@ -398,10 +386,10 @@ class McpAcceptanceV5qTests(unittest.TestCase):
                 root, _module(), _step("spec"),
                 _result(skills=("architect",), mcp=("mcp__arch__spec_read",)),
             )
-            self.assertFalse(acc.ok)
-            self.assertIn("spec_write", acc.reason)
+            self.assertTrue(acc.ok, acc.reason)
+            self.assertTrue(any("soft:spec_write_missing" in n for n in acc.soft_notes))
 
-    def test_spec_prompt_anti_thrash_v5r(self):
+    def test_spec_prompt_thin_init_v5ag(self):
         prompt = mod.step_prompt(
             _module(),
             Path("/tmp/req"),
@@ -410,9 +398,9 @@ class McpAcceptanceV5qTests(unittest.TestCase):
             "github",
             _step("spec"),
         )
-        self.assertIn("anti-thrash", prompt.lower())
-        self.assertIn("AT MOST ONCE", prompt)
         self.assertIn("spec_write", prompt)
+        self.assertIn("INIT", prompt)
+        self.assertIn("one-shot", prompt.lower())
 
 
     def test_no_skill_force_load_fail_closed_v5u(self):
@@ -514,12 +502,8 @@ class McpAcceptanceV5qTests(unittest.TestCase):
                 any(n.startswith("soft:spec_leaf_data_req_incomplete:") for n in acc.soft_notes),
                 acc.soft_notes,
             )
-            self.assertTrue(
-                any("govern_via_spec_govern" in n for n in acc.soft_notes),
-                acc.soft_notes,
-            )
 
-    def test_spec_prd_mcp_does_not_count_as_spec_write_v5v(self):
+    def test_spec_prd_mcp_html_still_passes_thin_v5ag(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             spec_dir = root / "SPEC" / "arcbench"
@@ -532,8 +516,8 @@ class McpAcceptanceV5qTests(unittest.TestCase):
                 root, _module(), _step("spec"),
                 _result(skills=("architect",), mcp=("mcp__arch__prd",)),
             )
-            self.assertFalse(acc.ok)
-            self.assertIn("spec_write", acc.reason)
+            self.assertTrue(acc.ok, acc.reason)
+            self.assertTrue(any("soft:spec_write_missing" in n for n in acc.soft_notes))
 
     def test_ensure_gsc_spec_seeds_leaf_sections_v5v(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -571,7 +555,7 @@ class McpAcceptanceV5qTests(unittest.TestCase):
             self.assertGreater(path.stat().st_size, 50)
             self.assertFalse((output / "SPEC" / "arcbench" / "REQ-MOD.md").exists())
 
-    def test_spec_prompt_mcp_write_derive_v5v(self):
+    def test_spec_prompt_mcp_write_derive_v5ag(self):
         prompt = mod.step_prompt(
             _module(),
             Path("/tmp/req"),
@@ -583,11 +567,11 @@ class McpAcceptanceV5qTests(unittest.TestCase):
         low = prompt.lower()
         self.assertIn("prd", low)
         self.assertIn("spec_write", low)
-        self.assertIn("atomic", low)
+        self.assertIn("leaf", low)
         self.assertIn("invent", low)
-        self.assertIn("mcp is the spec write path", low)
         self.assertNotIn("spec_trace.json mapping", low)
-        self.assertIn("spec_govern", low)
+        # govern OFF by default — prompt may mention it is off
+        self.assertIn("govern is off", low)
 
     def test_govern_prompt_stop_after_coverage_v5y(self):
         prompt = mod.step_prompt(
@@ -706,8 +690,8 @@ class McpAcceptanceV5qTests(unittest.TestCase):
             self.assertTrue(any("prd_govern" in t for t in acc.mcp_required))
             self.assertTrue(any("spec_govern" in t for t in acc.mcp_required))
 
-    def test_spec_file_only_rejected_v5w(self):
-        """SPEC: HTML alone without spec_write must fail (no file-only single signal)."""
+    def test_spec_file_only_ok_thin_v5ag(self):
+        """v5ag: HTML >50B alone passes; missing spec_write is soft note."""
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             spec_dir = root / "SPEC" / "arcbench"
@@ -720,8 +704,8 @@ class McpAcceptanceV5qTests(unittest.TestCase):
                 root, _module(), _step("spec"),
                 _result(skills=("architect",), mcp=()),
             )
-            self.assertFalse(acc.ok)
-            self.assertIn("spec_write", acc.reason)
+            self.assertTrue(acc.ok, acc.reason)
+            self.assertTrue(any("soft:spec_write_missing" in n for n in acc.soft_notes))
 
     def test_govern_prompt_hard_audit_chain_v5w(self):
         prompt = mod.step_prompt(
@@ -738,7 +722,7 @@ class McpAcceptanceV5qTests(unittest.TestCase):
         self.assertIn("hard audit", low)
         self.assertIn("single-signal", low)
 
-    def test_spec_prompt_both_html_and_write_v5w(self):
+    def test_spec_prompt_thin_html_prefer_write_v5ag(self):
         prompt = mod.step_prompt(
             _module(),
             Path("/tmp/req"),
@@ -748,9 +732,9 @@ class McpAcceptanceV5qTests(unittest.TestCase):
             _step("spec"),
         )
         low = prompt.lower()
-        self.assertIn("both", low)
-        self.assertIn("write + govern chain", low)
-        self.assertIn("not file-only", low)
+        self.assertIn("spec_write", low)
+        self.assertIn("spec/arcbench", low)
+        self.assertIn("do not invent", low)
 
 
 if __name__ == "__main__":

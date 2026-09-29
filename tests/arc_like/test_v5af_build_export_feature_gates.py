@@ -238,46 +238,31 @@ class V5afBuildExportFeatureGates(unittest.TestCase):
             self.assertTrue(ok2, reason2)
             self.assertIn("feature_wiring_ok", reason2)
 
-    def test_pages_acceptance_rejects_missing_default_export(self):
-        with tempfile.TemporaryDirectory() as td:
-            root = Path(td)
-            _seed_frontend(root, with_default=False)
-            sdir = root / ".arc" / "steps" / "REQ-1"
-            sdir.mkdir(parents=True)
-            (sdir / "pages.json").write_text(
-                json.dumps({"design_mcp": ["design_style"]}), encoding="utf-8"
-            )
-            step = next(s for s in mod.official_steps() if s.step_id == "pages")
-            result = _result(
-                mcp_tools_used=("mcp__arch__design_style",),
-                builtin_writes=("frontend/src/pages/HomePage.tsx",),
-            )
-            acc = mod.evaluate_step_acceptance(root, _module(), step, result)
-            self.assertFalse(acc.ok)
-            self.assertIn("default-export", acc.reason)
+    def test_pages_step_gone_helpers_remain_as_debt(self):
+        """v5ag: pages STEP deleted; helper scanners may remain as unused debt."""
+        self.assertNotIn("pages", [s.step_id for s in mod.official_steps()])
+        self.assertTrue(hasattr(mod, "check_app_page_default_exports"))
+        self.assertTrue(hasattr(mod, "check_pages_not_stub"))
 
-    def test_soft_accept_disabled_policy_in_prompt(self):
+    def test_implement_prompt_is_code_test_loop_v5ag(self):
         m = _module()
-        pages = next(s for s in mod.official_steps() if s.step_id == "pages")
         impl = next(s for s in mod.official_steps() if s.step_id == "implement")
         batch = next(s for s in mod.official_steps() if s.step_id == "batch_test")
-        pp = mod.step_prompt(m, Path("/tmp/req"), None, [], "web", pages)
         ip = mod.step_prompt(m, Path("/tmp/req"), None, [], "web", impl)
         bp = mod.step_prompt(m, Path("/tmp/req"), None, [], "web", batch)
-        self.assertIn("DEFAULT EXPORT HARD (v5af)", pp)
-        self.assertIn("Soft-accept@max_turns DISABLED", pp)
-        self.assertIn("FEATURE WIRING HARD (v5af)", ip)
-        self.assertIn("BUILD HARD GATE (v5af)", bp)
-        self.assertIn("export default", pages.exit_criteria)
-        self.assertIn("TEST_DAG feature wiring", impl.exit_criteria)
+        self.assertIn("CODING + TEST LOOP", ip)
+        self.assertNotIn("FEATURE WIRING HARD", ip)
+        self.assertFalse(impl.forbid_mid_dev_tests)
+        self.assertIn("npm run build", bp.lower())
 
-    def test_policy_tags_include_v5af(self):
+    def test_policy_tags_include_v5ag(self):
         src = (ROOT / "main.py").read_text(encoding="utf-8")
         for tag in (
             "v5af_npm_build_hard_gate_after_vitest",
-            "v5af_page_default_export_fail_closed",
-            "v5af_no_soft_accept_pages_implement_max_turns",
-            "v5af_test_dag_feature_wiring_gate",
+            "v5ag_thin_cc_orchestrator",
+            "v5ag_no_pages_step",
+            "v5ag_mcp_audit_default_off",
+            "v5ag_implement_code_test_loop",
             "v5ae_govern_green_force_stop_no_supervisor_fail_closed",
             "v5ad_wave_central_one_shot_batch_test",
             "v5aa_merge_domain_worktree_abort_theirs",

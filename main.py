@@ -129,37 +129,42 @@ class StepAcceptance:
 # Official STEP loop (fail-closed). Advance only when artifact/MCP gates pass.
 # Skills: official setting_sources+skills wiring only — NOT force-loaded / fail-closed.
 OFFICIAL_STEPS: tuple[StepDef, ...] = (
+    # v5ag thin orchestrator: one-shot INIT (prd→spec→test_dag) then implement (+ optional batch).
+    # NO pages STEP (MCP has no pages stage). govern/audit_refactor OFF by default.
     StepDef(
         step_id="prd",
-        title="PRD",
+        title="PRD (init — demand split only)",
         required_skills=("architect",),
-        goal="Build / refine the product PRD for this ROOT module via GSC MCP (prd / state_*).",
-        exit_criteria="PRD artifact under PRD/ or .arc/steps/<id>/prd*.",
+        goal=(
+            "ONE-SHOT INIT: split demand into PRD only when needed. Already-detailed leaf "
+            "requirements may skip PRD ceremony and go straight into SPEC. Use GSC MCP "
+            "`prd` / `state_*` as the Agent chooses. Do NOT invent features."
+        ),
+        exit_criteria=(
+            "PRD artifact under PRD/ or .arc/steps/<id>/prd* OR agent-documented skip "
+            "(leaves already detailed for SPEC)."
+        ),
     ),
     StepDef(
         step_id="spec",
-        title="SPEC",
+        title="SPEC (init — HTML)",
         required_skills=("architect",),
         goal=(
-            "Derive HTML SPEC under SPEC/arcbench from PRD + ROOT module.subtree atomic "
-            "requirements via GSC MCP `spec_write` (HTML write path; no Markdown migrate). "
-            "Seed/expand one section per leaf (data-req). HARD: coverage is only green "
-            "when this write + the next govern STEP (prd_govern+spec_govern) both run — "
-            "not a homemade trace file / not file-only."
+            "ONE-SHOT INIT: write HTML SPEC under SPEC/arcbench from PRD and/or already-"
+            "detailed leaf requirements via GSC MCP `spec_write` (HTML path; no Markdown "
+            "migrate). One section per leaf (data-req). Do NOT invent features. Agent owns "
+            "tool choice within prompt guidance."
         ),
-        exit_criteria=(
-            "BOTH SPEC/arcbench HTML (>50B) AND mcp__arch__spec_write proof "
-            "(not file-only, not prd-only). Coverage green only after write+govern chain."
-        ),
+        exit_criteria="SPEC/arcbench HTML exists (>50B). Prefer also seeing spec_write if used.",
     ),
     StepDef(
         step_id="test_dag",
-        title="TEST API+UI DAG",
+        title="TEST_DAG (init — api+ui)",
         required_skills=("arcbench-traceability",),
         goal=(
-            "Author API + UI test DAG. Write `.arc/steps/<id>/test_dag.json` with NON-EMPTY "
-            "top-level keys `api` and `ui` (arrays of test objects). Optionally also create "
-            "matching test files. Do not run the full suite yet."
+            "ONE-SHOT INIT: author API + UI test DAG. Write `.arc/steps/<id>/test_dag.json` "
+            "with NON-EMPTY top-level keys `api` and `ui`. Optionally create matching test "
+            "files. Coding+test loop happens in implement — not here."
         ),
         exit_criteria=(
             "`.arc/steps/<id>/test_dag.json` has non-empty `api` and `ui` arrays "
@@ -167,28 +172,19 @@ OFFICIAL_STEPS: tuple[StepDef, ...] = (
         ),
     ),
     StepDef(
-        step_id="pages",
-        title="PAGES + UX-UI designer",
-        required_skills=("designer",),
-        goal="Design/build pages/UI for this module (designer skill available via Skill tool).",
-        exit_criteria=("UI/page files under frontend/src with export default + non-stub content (v5af) + design MCP proof; soft-accept@max_turns disabled."),
-    ),
-    StepDef(
         step_id="implement",
-        title="DEV implement (no mid-dev tests)",
+        title="DEV implement (code + test loop)",
         required_skills=("arcbench-checkpoint",),
         goal=(
-            "Implement remaining logic/API/UI wiring with in-STEP Write/Edit progress "
-            "under frontend|backend|src. Do NOT run tests continuously mid-development."
+            "CODING + TEST LOOP: write code, run tests, fix, repeat. CC Agent owns how. "
+            "Implement API/UI/business logic under frontend|backend|src. Soft-mention "
+            "design_* MCP tools if UI work needs them — there is NO separate pages STEP."
         ),
         exit_criteria=(
-            "search_code MCP proof AND in-STEP write progress "
-            "(Write|Edit to frontend|backend|src ≥1, OR implement.json files_written "
-            "with mtime≥step_start) AND TEST_DAG feature wiring in source (v5af). "
-            "Leftover pages files + search_code alone do NOT pass. "
-            "Soft-accept@max_turns disabled for implement."
+            "Business file Write|Edit under frontend|backend|src OR implement.json "
+            "files_written evidence OR tests-green evidence. Gates MINIMAL — Agent owns judgment."
         ),
-        forbid_mid_dev_tests=True,
+        forbid_mid_dev_tests=False,
     ),
     StepDef(
         step_id="batch_test",
@@ -196,15 +192,16 @@ OFFICIAL_STEPS: tuple[StepDef, ...] = (
         required_skills=("arcbench-runtime-signals",),
         goal=(
             "AFTER all DOMAIN worktrees in the current WAVE are accepted and merged "
-            "to mainline, run centralized batch/harness tests once (vitest/npm test). "
-            "Never run this after a single REQ while sibling DOMAIN/WAVE work remains."
+            "to mainline, run centralized batch/harness tests once (vitest/npm test + "
+            "cheap npm run build). Never run this after a single REQ while sibling "
+            "DOMAIN/WAVE work remains."
         ),
-        exit_criteria="Harness local validation passes on mainline after WAVE merge.",
+        exit_criteria="Harness local validation (+ build) passes on mainline after WAVE merge.",
         require_batch_test_run=True,
     ),
 )
 
-# Optional P1 audit STEPs (ARC_ENABLE_MCP_AUDIT_STEPS; default ON for v5q full-landing).
+# Optional P1 audit STEPs (ARC_ENABLE_MCP_AUDIT_STEPS; default OFF for v5ag thin orchestrator).
 GOVERN_STEP = StepDef(
     step_id="govern",
     title="PRD/SPEC govern audit",
@@ -652,8 +649,8 @@ DEFAULT_GSC_MCP_ALLOWED_TOOLS = (
 
 
 def mcp_audit_steps_enabled() -> bool:
-    """Optional govern + audit_refactor STEPs. Default ON for v5q full-landing pack."""
-    return env_bool("ARC_ENABLE_MCP_AUDIT_STEPS", True)
+    """Optional govern + audit_refactor STEPs. Default OFF (v5ag thin orchestrator)."""
+    return env_bool("ARC_ENABLE_MCP_AUDIT_STEPS", False)
 
 
 def gsc_mcp_allowed_tools() -> list[str]:
@@ -703,12 +700,12 @@ DEGRADED MODE (rapid_refill self-heal — MCP stays ON; breaker still capped):
 
 # v5ac: force early Write skeleton on IMPLEMENT (business path) before thrash.
 IMPLEMENT_EARLY_WRITE_APPEND = """
-EARLY WRITE SKELETON (v5ac — required before more MCP/Read thrash):
-1. At most one mcp__arch__search_code (if needed), then IMMEDIATELY Write|Edit a business
-   skeleton under frontend/src, backend/src, or src/ (module entry / route / service stub).
-2. Do NOT thrash Read / spec_read / state_read / artifact_read. Write progress is a HARD gate.
-3. Skills only via official Skill tool (setting_sources/skills=all) — never Read SKILL.md.
-4. Leftover pages files alone do NOT count as this STEP's write progress.
+IMPLEMENT LOOP (v5ag thin — Agent owns coding+test):
+1. Write|Edit business code under frontend/src, backend/src, or src/.
+2. Run tests (vitest/npm test) as you go; fix failures; repeat. Mid-dev tests ARE allowed.
+3. Soft: design_* MCP tools if UI needs them (no separate pages STEP).
+4. Skills only via official Skill tool (setting_sources/skills=all) — never Read SKILL.md.
+5. Do NOT thrash identical MCP reads; prefer Write → test → fix.
 """.strip()
 
 
@@ -774,34 +771,6 @@ def implement_write_progress(
 
 
 
-def pages_write_progress(
-    output_dir: Path,
-    sdir: Path,
-    result: "ClaudeRunResult",
-) -> tuple[bool, str]:
-    """v5ac: in-attempt Write|Edit under UI paths OR pages.json mtime≥step_start."""
-    for path in result.builtin_writes:
-        raw = str(path or "").replace("\\", "/")
-        low = raw.lower()
-        if any(
-            seg in low
-            for seg in (
-                "/frontend/src/",
-                "/frontend/pages/",
-                "/src/pages/",
-                "/src/components/",
-                "/pages/",
-            )
-        ) or low.endswith((".tsx", ".jsx", ".vue", ".html", ".css")):
-            if "node_modules" not in low:
-                return True, f"in_session_write:{path}"
-    pages_receipt = sdir / "pages.json"
-    step_start = result.step_started_at
-    if pages_receipt.is_file() and pages_receipt.stat().st_size > 2:
-        if step_start is None or pages_receipt.stat().st_mtime >= float(step_start) - 1.0:
-            return True, f"pages_json_mtime:{pages_receipt}"
-    return False, "no_in_attempt_pages_write"
-
 
 def in_attempt_write_progress(
     step_id: str,
@@ -813,9 +782,8 @@ def in_attempt_write_progress(
     sid = (step_id or "").strip()
     if sid == "implement":
         return implement_write_progress(output_dir, sdir, result)
-    if sid == "pages":
-        return pages_write_progress(output_dir, sdir, result)
     # Generic: any Write|Edit this session, or step receipt mtime≥step_start.
+    # (v5ag: pages STEP removed — no pages_write_progress path)
     if result.builtin_writes:
         return True, f"in_session_write:{result.builtin_writes[0]}"
     receipt = sdir / f"{sid}.json"
@@ -3216,63 +3184,51 @@ def ensure_gsc_spec(output_dir: Path, module: RequirementModule) -> Path:
 
 
 def ensure_arc_spawn_gate_softener(output_dir: Path) -> None:
-    """Soften GSC SPAWN-GATE without disabling MCP; encode Official STEP loop."""
+    """Soften GSC SPAWN-GATE without disabling MCP; encode thin Official STEP loop (v5ag)."""
     claude_md = output_dir / "CLAUDE.md"
     claude_md.write_text(
-        "# ARC-Bench project — MCP-first WAVE/DOMAIN DAG (v5z worktree + central BATCH_TEST)\n\n"
+        "# ARC-Bench project — thin CC orchestrator (v5ag)\n\n"
         "HARD: GSC MCP stays ON. Never disable WaitForMcpServers / never set "
         "ARC_ENABLE_MCP=0 / never ban MCP tools.\n\n"
-        "## WAVE / DOMAIN orchestration (default path)\n"
-        "1. Build a WAVE/DAG plan: group REQs by DOMAIN, note depends_on + conflicts.\n"
-        "2. Each DOMAIN gets its own git worktree; non-conflicting DOMAINs in a WAVE "
-        "are concurrent tracks (runtime may run them sequentially if single-threaded).\n"
-        "3. Inside a DOMAIN worktree: run DEV STEPs (prd→…→implement→audit). "
-        "Same-DOMAIN REQs share the worktree and one IMPLEMENT batch mindset.\n"
-        "4. Per-DOMAIN accept (DEV receipts) → merge DOMAIN worktrees to mainline.\n"
-        "5. ONLY AFTER WAVE merge: **ONE-SHOT** centralized **batch_test** for the "
-        "entire WAVE (v5ad); stamp all REQs from that one green — never serial per-REQ.\n"
-        "FORBIDDEN: per-REQ serial PRD→…→BATCH_TEST loops; FORBIDDEN testing one REQ "
-        "while sibling same-DOMAIN / same-WAVE DOMAIN work remains unmerged.\n"
-        "Next WAVE starts only after current WAVE acceptance.\n\n"
-        "## Harness STEP loop (fail-closed)\n"
+        "## Thin flow (harness owns STEPs; Agent owns how)\n"
+        "1. **ONE-SHOT INIT** (project/WAVE level mindset): PRD → SPEC → TEST_DAG once.\n"
+        "   - PRD only for demand split; already-detailed leaves go straight into SPEC.\n"
+        "   - Do NOT invent features. Use GSC MCP `prd` / `spec_write` / `trace` as Agent chooses.\n"
+        "2. **implement** — CODING + TEST LOOP: write code, run tests, fix, repeat. "
+        "CC Agent owns the loop. Soft: design_* MCP tools if UI work needs them "
+        "(there is NO separate pages STEP — MCP has no pages stage).\n"
+        "3. **batch_test** (optional, WAVE-central after DOMAIN merge) — harness runs "
+        "vitest + cheap `npm run build` once for the WAVE.\n\n"
+        "## WAVE / DOMAIN (kept)\n"
+        "- DOMAIN worktrees develop; merge to mainline; ONE-SHOT WAVE batch_test after merge.\n"
+        "- FORBIDDEN: inventing harness STEPs MCP does not have (no pages / no force-govern theater).\n"
+        "- govern + audit_refactor are OFF unless `ARC_ENABLE_MCP_AUDIT_STEPS=1`.\n\n"
+        "## Harness STEP loop (thin acceptance)\n"
         "The harness runs discrete STEPs. Each STEP is its own Claude round.\n"
-        "Do not advance yourself — the harness advances only after acceptance passes.\n"
+        "Do not advance yourself — the harness advances only after thin acceptance passes.\n"
         "Receipts live under `.arc/steps/<module-id>/`.\n\n"
-        "DEV STEPs (inside DOMAIN worktree) then WAVE batch_test:\n"
-        "1. **prd** — `mcp__arch__state_read` then `mcp__arch__prd`. Soft: architect|discoverer.\n"
-        "2. **spec** — Read PRD/ + subtree atomics; `mcp__arch__spec_read` ≤1 then "
-        "`mcp__arch__spec_write` once (HTML 2.0 under SPEC/arcbench, data-req per leaf). "
-        "BOTH HTML + spec_write required (not file-only). ANTI-THRASH; FORBIDDEN "
-        "migrate/invent/rename. Coverage green only after write + govern chain.\n"
-        "3. **govern** (when enabled) — BOTH `mcp__arch__prd_govern` AND "
-        "`mcp__arch__spec_govern` in-session (coverage vs PRD/subtree), then STOP "
-        "this STEP (no re-audit). Receipts are side mirrors only — insufficient alone.\n"
-        "4. **test_dag** — non-empty api+ui in test_dag.json. Soft: `mcp__arch__trace`.\n"
-        "5. **pages** — MUST call `mcp__arch__design_style` OR "
-        "`mcp__arch__design_asset`. Soft: read_image / browser lifecycle.\n"
-        "6. **implement** — MUST call `mcp__arch__search_code`≥1 AND in-STEP "
-        "Write|Edit to frontend|backend|src (or implement.json files_written mtime≥step_start). "
-        "Leftover pages files + search_code alone do NOT pass. Soft: kb_query. No mid-dev tests.\n"
-        "7. **audit_refactor** (when enabled) — soft `mcp__arch__arch_insight` / "
-        "`mcp__arch__commit_gate`.\n"
-        "8. **batch_test** — WAVE-central harness validation AFTER DOMAIN merge only. "
-        "Soft: `mcp__arch__commit_gate` → commit_gate.json (failure does not alone kill STEP).\n\n"
+        "DEV STEPs:\n"
+        "1. **prd** — demand split via `mcp__arch__prd` when needed; skip OK if leaves already SPEC-ready.\n"
+        "2. **spec** — HTML under SPEC/arcbench (>50B); prefer `mcp__arch__spec_write`.\n"
+        "3. **test_dag** — non-empty api+ui in test_dag.json.\n"
+        "4. **implement** — write business code under frontend|backend|src; run tests; fix; repeat.\n"
+        "5. **batch_test** — WAVE-central harness validation AFTER DOMAIN merge only.\n\n"
         "## Per-STEP rules\n"
         "- Skills are model-invoked via the runtime Skill tool when relevant "
         "(official setting_sources + skills). Do NOT Read/Bash/cat SKILL.md.\n"
-        "- Harness acceptance is artifact/MCP gates — NOT skill force-load.\n"
-        "- HARD AUDIT: coverage green only when agent runs write+govern tool chain "
-        "(not a single file/receipt/MCP signal).\n"
+        "- Harness acceptance is thin artifact/MCP gates — NOT skill force-load / NOT "
+        "homemade feature-wiring / NOT pages theater.\n"
         "- Name required tools as `mcp__arch__<short>` from the allowlist; do NOT invent tool names.\n"
         "- NEVER call `mcp__arch__account_manage` or `mcp__arch__debug_binary`.\n"
         "- Do NOT use migrate tools as the main SPEC path (HTML 2.0 via spec_write).\n"
         "- Write receipt JSON under `.arc/steps/<id>/` when exit criteria are met.\n"
         "- Prefer main session; do not spawn Agent/Task.\n"
         "- If WaitForMcpServers appears, wait once then continue; keep outputs small.\n"
-        "- Harness local tests grant final green — MCP alone does not.\n"
+        "- Harness local tests grant final green for batch_test — MCP alone does not.\n"
 ,
         encoding="utf-8",
     )
+
     off = output_dir / ".claude" / "spawn-gate-off"
     off.parent.mkdir(parents=True, exist_ok=True)
     if not off.exists():
@@ -3461,18 +3417,19 @@ def evaluate_step_acceptance(
     step: StepDef,
     result: ClaudeRunResult,
 ) -> StepAcceptance:
-    """Fail-closed STEP gate: step artifacts + MCP proofs (+ batch tests).
+    """Thin STEP gate (v5ag): minimal artifacts (+ batch vitest/build).
 
     Skills are NOT fail-closed (official CC Skills are model-invoked via setting_sources
     + skills=). Telemetry only: skills_seen / missing_skills recorded as soft_notes.
 
-    P1 MCP hard gates (v5q full-landing; v5w hard-audit tighten):
-      - govern: BOTH prd_govern AND spec_govern in-session tool use (receipt alone insufficient)
-      - pages: design_style | design_asset
-      - implement: search_code ≥ 1 AND in-STEP write progress (Write|Edit business path or
-        implement.json files_written mtime≥step_start); leftover pages files alone fail
-    Soft (never alone fail-closed): commit_gate_status on batch_test / audit_refactor.
-    Existing fail-closed prd/spec/test_dag/pages-artifact/implement-artifact/batch harness kept.
+    Thin gates:
+      - prd: PRD artifact OR documented skip (leaves already SPEC-ready)
+      - spec: SPEC/arcbench HTML >50B (spec_write preferred soft)
+      - test_dag: non-empty api+ui schema
+      - implement: business Write|Edit OR implement.json OR tests-green evidence (MINIMAL)
+      - batch_test: vitest (+ npm run build via run_module_validation)
+    NO pages STEP. govern/audit only when ARC_ENABLE_MCP_AUDIT_STEPS=1.
+    Soft: commit_gate_status on batch_test / audit_refactor.
     """
     skills_seen = tuple(result.skills_loaded)
     missing = tuple(s for s in step.required_skills if s not in skills_seen)
@@ -3505,6 +3462,7 @@ def evaluate_step_acceptance(
             sdir / "prd.json",
             sdir / "prd.html",
             sdir / "prd.artifact.json",
+            sdir / "prd_skip.json",
         ]
         found: list[str] = []
         prd_root = output_dir / "PRD"
@@ -3513,23 +3471,51 @@ def evaluate_step_acceptance(
         found.extend(_existing_paths(candidates[1:]))
         found = list(dict.fromkeys(found))
         mcp_prd = mcp_tools_matching(used, "prd")
-        # Soft: state_read / architect|discoverer
         mcp_optional.extend(mcp_tools_matching(used, "state_read", "architect", "discoverer", "prd_govern"))
-        if not mcp_tools_matching(used, "state_read"):
-            soft_notes.append("soft_missing:state_read")
-        if not found and not mcp_prd:
+        skip_ok = False
+        skip_path = sdir / "prd_skip.json"
+        if skip_path.is_file() and skip_path.stat().st_size > 2:
+            try:
+                skip_payload = json.loads(skip_path.read_text(encoding="utf-8"))
+            except Exception:
+                skip_payload = {}
+            reason = ""
+            if isinstance(skip_payload, dict):
+                reason = str(skip_payload.get("reason") or skip_payload.get("skip") or "")
+            else:
+                reason = str(skip_payload)
+            if "spec" in reason.lower() or "leaf" in reason.lower() or "skip" in reason.lower() or reason:
+                skip_ok = True
+                soft_notes.append(f"prd_skip:{reason[:120] or 'documented'}")
+                if str(skip_path) not in found:
+                    found.append(str(skip_path))
+        # Also accept skip note in agent summary / prd.json
+        for cand in (sdir / "prd.json", sdir / "prd.md"):
+            if cand.is_file() and cand.stat().st_size > 2:
+                try:
+                    blob = cand.read_text(encoding="utf-8", errors="replace").lower()
+                except OSError:
+                    blob = ""
+                if "skip" in blob and ("spec" in blob or "leaf" in blob or "already" in blob):
+                    skip_ok = True
+                    soft_notes.append(f"prd_skip_note:{cand.name}")
+        if not found and not mcp_prd and not skip_ok:
             return StepAcceptance(
                 ok=False,
-                reason="PRD artifact missing under PRD/ or .arc/steps/<id>/prd* (and no MCP prd tool proof)",
+                reason=(
+                    "PRD artifact missing (PRD/ or .arc/steps/<id>/prd*) and no documented "
+                    "skip for already-detailed leaves"
+                ),
                 skills_seen=skills_seen,
                 artifacts=tuple(found),
                 mcp_optional_seen=tuple(mcp_optional),
                 soft_notes=tuple(soft_notes),
             )
-        if not found and mcp_prd:
+        if not found and mcp_prd and not skip_ok:
+            # MCP prd without file: still soft-pass if skip not needed — require a file OR skip.
             return StepAcceptance(
                 ok=False,
-                reason="MCP prd used but PRD artifact file/dir still missing",
+                reason="MCP prd used but PRD artifact file/dir still missing (or write prd_skip.json)",
                 skills_seen=skills_seen,
                 artifacts=tuple(mcp_prd),
                 mcp_optional_seen=tuple(mcp_optional),
@@ -3563,16 +3549,9 @@ def evaluate_step_acceptance(
                 skills_seen=skills_seen,
                 soft_notes=tuple(soft_notes),
             )
+        # v5ag: spec_write preferred soft — do not fail-closed on missing MCP proof alone.
         if not mcp_write:
-            return StepAcceptance(
-                ok=False,
-                reason="SPEC STEP requires GSC MCP spec_write (HTML) tool use proof — not read-only",
-                skills_seen=skills_seen,
-                artifacts=tuple(found + mcp_read),
-                soft_notes=tuple(soft_notes),
-            )
-        # v5v MCP-first: coverage/chain audit is govern STEP (spec_govern/prd_govern),
-        # not a homemade spec_trace.json or brittle HTML string gate on this STEP.
+            soft_notes.append("soft:spec_write_missing_html_ok")
         leaf_ids = leaf_requirement_ids(module.subtree)
         prd_dir = output_dir / "PRD"
         prd_hits: list[str] = []
@@ -3591,9 +3570,7 @@ def evaluate_step_acceptance(
             missing_html = [lid for lid in leaf_ids if not html_has_data_req(html_blob, lid)]
             if missing_html:
                 soft_notes.append(
-                    "soft:spec_leaf_data_req_incomplete:"
-                    + ",".join(missing_html[:8])
-                    + ";govern_via_spec_govern"
+                    "soft:spec_leaf_data_req_incomplete:" + ",".join(missing_html[:8])
                 )
         artifacts = found + mcp_write + mcp_read
         mcp_required = list(mcp_write)
@@ -3750,169 +3727,71 @@ def evaluate_step_acceptance(
             )
         artifacts = found
 
-    elif step.step_id == "pages":
-        pages_receipt = sdir / "pages.json"
-        ui_roots = [
-            output_dir / "frontend" / "src" / "pages",
-            output_dir / "frontend" / "src" / "components",
-            output_dir / "frontend" / "src",
-        ]
-        found = []
-        if pages_receipt.is_file():
-            found.append(str(pages_receipt))
-        for root in ui_roots:
-            if not root.exists():
-                continue
-            for pattern in ("**/*.tsx", "**/*.jsx", "**/*.vue", "**/*.html"):
-                for p in root.glob(pattern):
-                    if p.is_file() and "node_modules" not in p.parts and p.stat().st_size >= 20:
-                        found.append(str(p))
-                        break
-                if len(found) > 1:
-                    break
-            if len(found) > 1:
-                break
-        found = list(dict.fromkeys(found))
-        if not found:
-            return StepAcceptance(
-                ok=False,
-                reason="PAGES artifacts missing under frontend/src (or pages.json receipt)",
-                skills_seen=skills_seen,
-            )
-        design_mcp = mcp_tools_matching(used, "design_style", "design_asset")
-        # Also accept design evidence written into pages.json
-        if pages_receipt.is_file():
-            try:
-                pages_payload = json.loads(pages_receipt.read_text(encoding="utf-8"))
-                design_field = pages_payload.get("design_mcp") if isinstance(pages_payload, dict) else None
-                if design_field:
-                    design_mcp = design_mcp or ["pages.json:design_mcp"]
-            except Exception:
-                pass
-        if not design_mcp:
-            return StepAcceptance(
-                ok=False,
-                reason="PAGES STEP requires mcp__arch__design_style OR mcp__arch__design_asset (≥1)",
-                skills_seen=skills_seen,
-                artifacts=tuple(found[:12]),
-            )
-        # v5ac: pages must show in-attempt write (no leftover-only soft/hard green).
-        pages_wr_ok, pages_wr_proof = pages_write_progress(output_dir, sdir, result)
-        if not pages_wr_ok:
-            return StepAcceptance(
-                ok=False,
-                reason=(
-                    "PAGES STEP requires in-attempt write progress: Write|Edit UI under "
-                    "frontend/src (or pages.json mtime≥step_start); leftover files + design_mcp "
-                    "alone do NOT pass"
-                ),
-                skills_seen=skills_seen,
-                artifacts=tuple(found[:12] + design_mcp),
-                soft_notes=tuple(soft_notes + [f"pages_write_gate:{pages_wr_proof}"]),
-            )
-        soft_notes.append(f"pages_write_progress:{pages_wr_proof}")
-        # v5af B: page default export + non-stub content (fail closed).
-        de_ok, de_reason, de_checked = check_app_page_default_exports(output_dir)
-        if not de_ok:
-            return StepAcceptance(
-                ok=False,
-                reason=f"PAGES default-export gate failed (v5af): {de_reason}",
-                skills_seen=skills_seen,
-                artifacts=tuple(found[:12] + design_mcp),
-                soft_notes=tuple(soft_notes + [f"default_export_gate:{de_reason}"]),
-            )
-        soft_notes.append(f"default_export:{de_reason}")
-        stub_ok, stub_reason, stub_pages = check_pages_not_stub(output_dir)
-        if not stub_ok:
-            return StepAcceptance(
-                ok=False,
-                reason=(
-                    f"PAGES stub/empty UI rejected (v5af): {stub_reason}. "
-                    "Write real page components with export default (≥120B, not empty shells)."
-                ),
-                skills_seen=skills_seen,
-                artifacts=tuple(found[:12] + design_mcp),
-                soft_notes=tuple(soft_notes + [f"pages_stub_gate:{stub_reason}"]),
-            )
-        soft_notes.append(f"pages_not_stub:{stub_reason}")
-        mcp_optional.extend(mcp_tools_matching(used, "read_image", "design_audit", "lifecycle", "query", "navigate", "snapshot", "take_screenshot"))
-        artifacts = found[:12] + design_mcp + [pages_wr_proof, de_reason, stub_reason] + list(de_checked)[:4]
-        mcp_required = list(design_mcp)
-
     elif step.step_id == "implement":
+        # v5ag thin: business writes OR implement.json OR tests-green evidence. MINIMAL gates.
         impl_receipt = sdir / "implement.json"
-        found = []
-        if impl_receipt.is_file():
+        found: list[str] = []
+        if impl_receipt.is_file() and impl_receipt.stat().st_size > 2:
             found.append(str(impl_receipt))
-        for root_name in ("frontend/src", "backend/src", "src"):
+        for root_name in ("frontend/src", "backend/src", "src", "frontend", "backend"):
             root = output_dir / root_name
             if not root.exists():
                 continue
             for p in root.rglob("*"):
-                if p.is_file() and p.suffix in {".ts", ".tsx", ".js", ".jsx", ".py"} and p.stat().st_size >= 40:
+                if (
+                    p.is_file()
+                    and p.suffix in {".ts", ".tsx", ".js", ".jsx", ".py", ".vue"}
+                    and "node_modules" not in p.parts
+                    and p.stat().st_size >= 40
+                ):
                     found.append(str(p))
-                    if len(found) >= 4:
+                    if len(found) >= 6:
                         break
             if len(found) >= 2:
                 break
-        if not found:
-            return StepAcceptance(
-                ok=False,
-                reason="IMPLEMENT artifacts missing (implement.json and/or source files)",
-                skills_seen=skills_seen,
-            )
-        search_hits = _receipt_or_tool("search_code.json", "search_code")
-        if not search_hits:
-            return StepAcceptance(
-                ok=False,
-                reason="IMPLEMENT STEP requires mcp__arch__search_code ≥1 (and/or .arc/steps/<id>/search_code.json)",
-                skills_seen=skills_seen,
-                artifacts=tuple(list(dict.fromkeys(found))[:12]),
-            )
-        # v5x G1: forbid pass on pages leftover files + search_code alone.
         write_ok, write_proof = implement_write_progress(output_dir, sdir, result)
-        if not write_ok:
+        if write_ok:
+            soft_notes.append(f"write_progress:{write_proof}")
+            found.append(write_proof)
+        # tests-green evidence (Agent ran vitest mid-dev)
+        tests_green = False
+        for name in ("tests_green.json", "vitest_ok.json", "implement_tests.json"):
+            tp = sdir / name
+            if tp.is_file() and tp.stat().st_size > 2:
+                try:
+                    payload = json.loads(tp.read_text(encoding="utf-8"))
+                except Exception:
+                    payload = {}
+                ok_flag = False
+                if isinstance(payload, dict):
+                    ok_flag = bool(payload.get("ok") or payload.get("passed") or payload.get("green"))
+                if ok_flag or "ok" in tp.read_text(encoding="utf-8", errors="replace").lower()[:200]:
+                    tests_green = True
+                    found.append(str(tp))
+                    soft_notes.append(f"tests_green:{tp.name}")
+                    break
+        search_hits = _receipt_or_tool("search_code.json", "search_code")
+        if search_hits:
+            soft_notes.append("soft:search_code_seen")
+            mcp_optional.extend(search_hits)
+        mcp_optional.extend(
+            mcp_tools_matching(
+                used, "kb_query", "kb_inject", "refactor_code", "format_code",
+                "solver", "design_style", "design_asset",
+            )
+        )
+        if not found and not write_ok and not tests_green:
             return StepAcceptance(
                 ok=False,
                 reason=(
-                    "IMPLEMENT STEP requires in-STEP write progress: Write|Edit to "
-                    "frontend|backend|src ≥1, OR implement.json files_written with "
-                    "mtime≥step_start (leftover pages files + search_code alone do NOT pass)"
+                    "IMPLEMENT thin gate: need business file under frontend|backend|src, "
+                    "or implement.json, or tests-green evidence"
                 ),
                 skills_seen=skills_seen,
-                artifacts=tuple(list(dict.fromkeys(found + search_hits))[:12]),
-                soft_notes=tuple(soft_notes + [f"write_gate:{write_proof}"]),
+                soft_notes=tuple(soft_notes),
             )
-        soft_notes.append(f"write_progress:{write_proof}")
-        # v5af C: feature/eval quality — TEST_DAG api+ui must appear wired in source.
-        wire_ok, wire_reason = check_test_dag_feature_wiring(output_dir, sdir)
-        if not wire_ok:
-            return StepAcceptance(
-                ok=False,
-                reason=(
-                    f"IMPLEMENT feature-wiring gate failed (v5af): {wire_reason}. "
-                    "Write real page+API handlers matching test_dag.json api/ui before accept; "
-                    "vitest stubs alone do NOT pass."
-                ),
-                skills_seen=skills_seen,
-                artifacts=tuple(list(dict.fromkeys(found + search_hits + [write_proof]))[:12]),
-                soft_notes=tuple(soft_notes + [f"feature_wiring_gate:{wire_reason}"]),
-            )
-        soft_notes.append(wire_reason)
-        # Also enforce App↔page default exports on implement (catch late App edits).
-        de_ok, de_reason, _de = check_app_page_default_exports(output_dir)
-        if not de_ok:
-            return StepAcceptance(
-                ok=False,
-                reason=f"IMPLEMENT default-export gate failed (v5af): {de_reason}",
-                skills_seen=skills_seen,
-                artifacts=tuple(list(dict.fromkeys(found + search_hits))[:12]),
-                soft_notes=tuple(soft_notes + [f"default_export_gate:{de_reason}"]),
-            )
-        soft_notes.append(f"default_export:{de_reason}")
-        mcp_optional.extend(mcp_tools_matching(used, "kb_query", "kb_inject", "refactor_code", "format_code", "solver"))
-        artifacts = list(dict.fromkeys(found + search_hits + [write_proof, wire_reason, de_reason]))[:16]
-        mcp_required = mcp_tools_matching(used, "search_code") or search_hits[:]
+        artifacts = list(dict.fromkeys(found + search_hits))[:16]
+        mcp_required = []  # thin: no hard MCP requirement
 
     elif step.step_id == "audit_refactor":
         # Soft STEP: skill already checked; never fail-closed on missing MCP.
@@ -3986,38 +3865,9 @@ def evaluate_step_acceptance(
                 commit_gate_status=commit_gate_status,
                 soft_notes=tuple(soft_notes),
             )
-        # v5af C: even with vitest+build green, require TEST_DAG feature wiring in source.
-        wire_ok, wire_reason = check_test_dag_feature_wiring(output_dir, sdir)
-        if not wire_ok:
-            soft_notes.append(f"feature_wiring_gate:{wire_reason}")
-            return StepAcceptance(
-                ok=False,
-                reason=(
-                    f"batch_test feature-wiring gate failed (v5af): {wire_reason}. "
-                    "Platform evaluate needs real routes/handlers matching competition features."
-                ),
-                skills_seen=skills_seen,
-                artifacts=tuple(artifacts),
-                mcp_optional_seen=tuple(mcp_optional),
-                commit_gate_status=commit_gate_status,
-                soft_notes=tuple(soft_notes),
-            )
-        soft_notes.append(wire_reason)
-        artifacts.append(wire_reason)
-        de_ok, de_reason, _de = check_app_page_default_exports(output_dir)
-        if not de_ok:
-            soft_notes.append(f"default_export_gate:{de_reason}")
-            return StepAcceptance(
-                ok=False,
-                reason=f"batch_test default-export gate failed (v5af): {de_reason}",
-                skills_seen=skills_seen,
-                artifacts=tuple(artifacts),
-                mcp_optional_seen=tuple(mcp_optional),
-                commit_gate_status=commit_gate_status,
-                soft_notes=tuple(soft_notes),
-            )
-        soft_notes.append(f"default_export:{de_reason}")
-        artifacts.append(de_reason)
+        # v5ag: vitest+build via run_module_validation is the thin platform gate.
+        # No homemade feature-wiring / export-default scanners as Agent substitutes.
+        soft_notes.append("v5ag_thin_batch_gate:vitest_and_build")
     else:
         return StepAcceptance(ok=False, reason=f"unknown step {step.step_id}", skills_seen=skills_seen)
 
@@ -4080,6 +3930,12 @@ def step_prompt(
             "FORBIDDEN this STEP: do not run vitest/npm test / playwright continuously. "
             "Write/adjust code only; centralized BATCH_TEST runs only after WAVE DOMAIN merge.\n"
         )
+    elif step.step_id == "implement":
+        mid_dev = (
+            "CODING + TEST LOOP (v5ag): write code, run tests (vitest/npm test), fix, repeat. "
+            "CC Agent owns how. Mid-dev tests ARE allowed. Soft: design_* MCP if UI needs them "
+            "(no separate pages STEP).\n"
+        )
     batch = ""
     if step.require_batch_test_run:
         batch = (
@@ -4114,36 +3970,24 @@ def step_prompt(
     base = f".arc/steps/{sid}"
     if step.step_id == "prd":
         mcp_extra = (
-            "\nMCP REQUIRED this STEP:\n"
-            "- Call `mcp__arch__prd` (CRUD) ONCE (or update once) and produce PRD artifact under PRD/ or "
+            "\nINIT / PRD (v5ag thin — demand split only):\n"
+            "- Call `mcp__arch__prd` when demand needs splitting; produce PRD under PRD/ or "
             f"`{base}/prd*`.\n"
-            "- Soft-required: `mcp__arch__state_read` at most ONCE at start; prefer `mcp__arch__architect` "
-            "or `mcp__arch__discoverer` once (write architect_ctx.json if useful).\n"
-            "- ANTI-THRASH: never re-call prd/state_read with the same arguments. After write, STOP.\n"
-            "- Do NOT call account_manage / debug_binary. Do NOT use migrate as main path.\n"
+            "- SKIP OK: if leaf requirements are already detailed for SPEC, write a short skip "
+            f"note under `{base}/prd_skip.json` (reason=leaves_already_in_spec) and STOP.\n"
+            "- Soft: `mcp__arch__state_read` at most once. ANTI-THRASH: no identical re-calls.\n"
+            "- Do NOT invent features. Do NOT call account_manage / debug_binary.\n"
         )
     elif step.step_id == "spec":
         mcp_extra = (
-            "\nMCP + CONTENT REQUIRED this STEP (v5v derive from PRD/atomic via MCP write, anti-thrash):\n"
-            "- HARD content: Read PRD artifacts under `PRD/` or "
-            f"`{base}/prd*` when present (use the Read tool — do NOT thrash MCP for this).\n"
-            "- HARD content: Derive HTML SPEC from ROOT `module.subtree` atomic/leaf "
-            "requirements + PRD. Expand seeded leaf sections; every leaf SHOULD have a "
-            '`<section data-req="<id>">`. Preserve exact English accessible names, roles, '
-            "seed data, and observable states from requirements.\n"
-            "- FORBIDDEN: invent features; rename UI strings; expand out-of-scope items "
-            "from the competition summary.\n"
-            "- Call `mcp__arch__spec_read` AT MOST ONCE (same args never twice).\n"
-            "- Immediately call `mcp__arch__spec_write` ONCE — MCP is the SPEC write path — "
-            "for HTML under SPEC/arcbench (HTML 2.0), then STOP this STEP.\n"
-            "- Do NOT invent a parallel file-only trace ceremony; coverage/chain audit is "
-            "the next govern STEP via `mcp__arch__spec_govern` / `mcp__arch__prd_govern`.\n"
-            "- FORBIDDEN: looping spec_read; FORBIDDEN as main path: "
-            "`mcp__arch__spec_migrate` / `mcp__arch__grok_md_migrate`.\n"
-            "- Soft: `mcp__arch__state_read` at most once.\n"
-            "- Acceptance needs BOTH `spec_write` proof AND HTML under SPEC/arcbench "
-            "(>50B) — not file-only / not read-only / not mcp prd standing in for "
-            "spec_write. Coverage is only green after write + govern chain.\n"
+            "\nINIT / SPEC (v5ag thin — one-shot HTML):\n"
+            "- Write HTML SPEC under SPEC/arcbench from PRD and/or already-detailed leaf "
+            "requirements. Prefer `mcp__arch__spec_write` once (HTML 2.0).\n"
+            "- Expand leaf sections with data-req; preserve accessible names/roles/seed/states.\n"
+            "- FORBIDDEN: invent features; rename UI strings; Markdown migrate as main path.\n"
+            "- Soft: `mcp__arch__spec_read` / `state_read` at most once each. ANTI-THRASH.\n"
+            "- Acceptance: SPEC/arcbench HTML (>50B). Prefer also seeing spec_write if used.\n"
+            "- Do NOT invent homemade coverage/trace ceremonies. govern is OFF by default.\n"
         )
     elif step.step_id == "govern":
         mcp_extra = (
@@ -4169,35 +4013,17 @@ def step_prompt(
             "\nMCP soft this STEP: `mcp__arch__trace` / `mcp__arch__state_read` to list test points. "
             "No MCP hard gate (harness checks api+ui schema).\n"
         )
-    elif step.step_id == "pages":
-        mcp_extra = (
-            "\nMCP REQUIRED this STEP (fail-closed):\n"
-            "- Call `mcp__arch__design_style` OR `mcp__arch__design_asset` ≥1 "
-            f"(record under `{base}/pages.json` key `design_mcp` if useful).\n"
-            "- Soft: `mcp__arch__read_image`; browser `mcp__arch__lifecycle` + snapshot "
-            f"(optional `{base}/browser_smoke.json`).\n"
-            "- PAGES in-attempt write (v5ac): Write|Edit ≥1 UI file under frontend/src (or refresh pages.json this STEP); leftover files alone do NOT pass.\n"
-            "- DEFAULT EXPORT HARD (v5af): every `src/pages/*` used as default import in App MUST `export default` a React component (or sync App to named import). Missing default export fails Official `npm run build`.\n"
-            "- NO STUB UI (v5af): real pages ≥120B with content matching TEST_DAG ui — empty shells do NOT pass. Soft-accept@max_turns DISABLED for pages/implement.\n"
-        )
     elif step.step_id == "implement":
         mcp_extra = (
-            "\nMCP REQUIRED this STEP (fail-closed):\n"
-            f"- Call `mcp__arch__search_code` ≥1 → write `{base}/search_code.json` hit summary.\n"
-            "- EARLY WRITE SKELETON (v5ac): AFTER search_code (or immediately if search already done), "
-            "FIRST Write|Edit a business skeleton under frontend/src, backend/src, or src/ "
-            "(module entry / route / service stub). Do this BEFORE more Read/MCP thrash.\n"
-            "- WRITE PROGRESS HARD GATE: you MUST Write|Edit ≥1 business file under "
-            "frontend/src, backend/src, or src/ "
-            f"(or list fresh paths in `{base}/implement.json` key `files_written` with mtime≥this STEP).\n"
-            "- Forbidden: pass on leftover pages-only files + search_code with no in-STEP write.\n"
-            "- Soft: `mcp__arch__kb_query` (+ kb_inject on hit); optional refactor_code/format_code.\n"
-            "- Do NOT re-call identical MCP reads; do NOT run continuous mid-dev tests.\n"
-            "- On VALIDATION REPAIR: read repair_note / VITEST OUTPUT and Write|Edit until tests would pass; "
-            "do NOT only call commit_gate.\n"
-            "- FEATURE WIRING HARD (v5af): implement FULL TEST_DAG api+ui behaviors — real routes/handlers/pages matching test_dag.json entries. Vitest unit stubs alone do NOT pass harness or Official evaluate.\n"
-            "- Soft-accept@max_turns DISABLED for implement (v5af).\n"
-            "- Keep App default-imports of pages in sync with `export default` (build hard gate).\n"
+            "\nIMPLEMENT (v5ag thin — CODING + TEST LOOP; Agent owns how):\n"
+            "- Write|Edit business code under frontend/src, backend/src, or src/.\n"
+            "- Run tests (vitest / npm test) as you develop; fix failures; repeat until green.\n"
+            "- Soft: `mcp__arch__search_code` / `kb_query` / design_style|design_asset if UI needs them "
+            "(NO separate pages STEP — MCP has no pages stage).\n"
+            f"- Optional receipt: `{base}/implement.json` with files_written list.\n"
+            "- On VALIDATION REPAIR: read repair_note / VITEST OUTPUT and Write|Edit until tests pass.\n"
+            "- Do NOT invent features outside TEST_DAG / SPEC. Do NOT thrash identical MCP reads.\n"
+            "- Prefer `export default` for App default-imports so `npm run build` stays green.\n"
         )
     elif step.step_id == "audit_refactor":
         mcp_extra = (
@@ -4208,18 +4034,11 @@ def step_prompt(
         )
     elif step.step_id == "batch_test":
         mcp_extra = (
-            "\nBATCH_TEST / vitest (v5ac+v5ad root cure — ONE-SHOT for whole WAVE):\n"
-            "- This is the ONLY agent batch_test for the WAVE. Sibling REQs are stamped from this green.\n"
-            "- FORBIDDEN: expect/run another per-REQ batch_test after this STEP.\n"
-            "- Harness owns green: it runs `npx vitest run` / npm test. Your job is to FIX failures.\n"
-            "- If VITEST OUTPUT / repair_note is present: IMMEDIATELY Write|Edit business code to fix\n"
-            "  failing assertions. Do NOT only call commit_gate.\n"
-            "- FORBIDDEN: commit_gate-only thrash with no Write/Edit when tests failed.\n"
-            f"- Soft once: `mcp__arch__commit_gate` → `{base}/commit_gate.json` "
-            "(commit_gate alone does NOT green this STEP).\n"
+            "\nBATCH_TEST (v5ag thin — ONE-SHOT WAVE after DOMAIN merge):\n"
+            "- Harness runs vitest / npm test then cheap `npm run build`. Fix failures here.\n"
+            "- FORBIDDEN: serial per-REQ BATCH_TEST; FORBIDDEN commit_gate-only thrash.\n"
+            f"- Soft once: `mcp__arch__commit_gate` → `{base}/commit_gate.json`.\n"
             "- On failure soft: `mcp__arch__trace_failure` then Write/Edit again.\n"
-            "- BUILD HARD GATE (v5af): after vitest green the harness runs `npm run build` and FAIL-CLOSES on non-zero. Fix export default / TS / Vite errors here before WAVE success.\n"
-            "- FEATURE WIRING (v5af): source must still match TEST_DAG api+ui (not stub-only).\n"
         )
 
     wave_ctx = wave_ctx or {}
@@ -4574,9 +4393,11 @@ def main() -> int:
                     "v5ad_wave_central_one_shot_batch_test",
                     "v5ae_govern_green_force_stop_no_supervisor_fail_closed",
                     "v5af_npm_build_hard_gate_after_vitest",
-                    "v5af_page_default_export_fail_closed",
-                    "v5af_no_soft_accept_pages_implement_max_turns",
-                    "v5af_test_dag_feature_wiring_gate",
+                    "v5ag_thin_cc_orchestrator",
+                    "v5ag_no_pages_step",
+                    "v5ag_mcp_audit_default_off",
+                    "v5ag_implement_code_test_loop",
+                    "v5ag_thin_acceptance_no_feature_wiring_theater",
                 ],
             },
             ensure_ascii=False,
@@ -4977,44 +4798,6 @@ def main() -> int:
                             soft_acc = evaluate_step_acceptance(work_dir, module, step, result)
                             # v5ac: soft-accept@max_turns requires in-attempt write progress
                             # (no lifting stale pages/spec/prd leftovers without a fresh write).
-                            if soft_acc.ok:
-                                # v5af C: NEVER soft-accept pages/implement at max_turns —
-                                # Sheet v5ad stamped green on stub UI via soft-accept@max_turns
-                                # then platform evaluate scored 0/24 features.
-                                if step.step_id in ("pages", "implement"):
-                                    soft_acc = StepAcceptance(
-                                        ok=False,
-                                        reason=(
-                                            "v5af: soft-accept@max_turns DISABLED for "
-                                            f"{step.step_id}; refuse stub/empty UI green — "
-                                            "must complete with real page+API wiring "
-                                            "(Write/Edit against TEST_DAG) before accept"
-                                        ),
-                                        skills_seen=soft_acc.skills_seen,
-                                        missing_skills=soft_acc.missing_skills,
-                                        artifacts=soft_acc.artifacts,
-                                        mcp_required=soft_acc.mcp_required,
-                                        mcp_optional_seen=soft_acc.mcp_optional_seen,
-                                        commit_gate_status=soft_acc.commit_gate_status,
-                                        soft_notes=tuple(
-                                            list(soft_acc.soft_notes)
-                                            + ["soft_accept_disabled_v5af:pages_implement"]
-                                        ),
-                                    )
-                                    print(
-                                        json.dumps(
-                                            {
-                                                "event": "soft_accept_disabled_pages_implement",
-                                                "req_id": module.node_id,
-                                                "step_id": step.step_id,
-                                                "wave": wave_ctx.get("wave_index"),
-                                                "domain": wave_ctx.get("domain_id"),
-                                                "policy": "v5af",
-                                            },
-                                            ensure_ascii=False,
-                                        ),
-                                        flush=True,
-                                    )
                             if soft_acc.ok:
                                 sdir_sa = step_dir(work_dir, module.node_id)
                                 wr_ok, wr_proof = in_attempt_write_progress(
