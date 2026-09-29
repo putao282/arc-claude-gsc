@@ -34,6 +34,8 @@ import supervisor as harness_supervisor
 SUBMISSION_DIR = Path(os.environ.get("ARCBENCH_SUBMISSION_DIR", Path(__file__).resolve().parent))
 LOCK_PATH = SUBMISSION_DIR / "runtime.lock.json"
 RUNTIME_DIR = SUBMISSION_DIR / "runtime"
+# Tao contest user-level CLAUDE.md (tracked asset; installed to HOME/.claude + project).
+CONTEST_USER_CLAUDE_MD = SUBMISSION_DIR / "contest" / "CLAUDE.md"
 _children: list[subprocess.Popen] = []
 
 
@@ -680,7 +682,8 @@ def gsc_mcp_allowed_tools() -> list[str]:
     return [t for t in tools if t not in GSC_MCP_NEVER_DEFAULT]
 
 
-# v5x G3: after rapid_refill, temporarily narrow implement MCP surface (MCP stays ON).
+# v5x G3 legacy narrow list — v5ah does NOT apply this to disallowed/allow (满配 kept).
+# Kept for tests/docs only; run_claude_via_sdk ignores it for MCP wiring.
 IMPLEMENT_DEGRADED_MCP_ALLOW: tuple[str, ...] = (
     "search_code",
     "spec_read",
@@ -690,11 +693,12 @@ IMPLEMENT_DEGRADED_MCP_ALLOW: tuple[str, ...] = (
 )
 
 DEGRADED_SYSTEM_APPEND = """
-DEGRADED MODE (rapid_refill self-heal — MCP stays ON; breaker still capped):
+DEGRADED MODE (rapid_refill self-heal — MCP stays ON + 满配; Skills stay all; breaker still capped):
 - Immediately Write or Edit business code under frontend/ / backend/ / src/.
 - Do NOT re-call identical MCP reads (spec_read/state_read/artifact_read) with the same args.
 - Do NOT re-load the same Skill. At most one Skill invocation if needed, then Write.
 - Prefer: search_code once → Write skeleton → stop thrashing on reads.
+- MCP allowlist is NOT narrowed on degrade (v5ah full perception).
 """.strip()
 
 
@@ -838,25 +842,43 @@ def govern_accept_already_green(result: "ClaudeRunResult | object") -> bool:
     )
 
 
-def gsc_mcp_disallowed_tool_names(*, prefixed: bool = True, allow_override: list[str] | tuple[str, ...] | None = None) -> list[str]:
-    """Auto-generate disallowed = inventory − allowlist (plus never-default).
+def prepared_gsc_mcp_tools() -> list[str]:
+    """Prepared MCP inventory the agent must perceive (P0+P1 default allow, no never-default)."""
+    return list(gsc_mcp_allowed_tools())
 
-    Claude historically may still expose ~70 tools from plugin MCP even when
-    allowedTools is set; --disallowedTools / SDK disallowed_tools strips schema.
+
+def gsc_mcp_disallowed_tool_names(*, prefixed: bool = True, allow_override: list[str] | tuple[str, ...] | None = None) -> list[str]:
+    """Disallowed = inventory − allowlist, but NEVER hide prepared (P0+P1) tools.
+
+    v5ah: prepared MCP must stay 100% perceptible. allow_override may narrow
+    *guidance* historically, but prepared short names stay out of disallowed.
+    Never-default (account_manage/debug_binary) always denied.
     """
     allowed = set(allow_override if allow_override is not None else gsc_mcp_allowed_tools())
+    # Hard guarantee: prepared P0+P1 always remain allowed (满配 perception).
+    prepared = set(DEFAULT_GSC_MCP_ALLOWED_TOOLS) - set(GSC_MCP_NEVER_DEFAULT)
+    allowed |= prepared
     denied: list[str] = []
     for name in GSC_MCP_INVENTORY_SHORT_NAMES:
-        if name in allowed and name not in GSC_MCP_NEVER_DEFAULT:
+        if name in GSC_MCP_NEVER_DEFAULT:
+            denied.append(name)
+            continue
+        if name in allowed:
             continue
         denied.append(name)
-    # Ensure never-default always denied even if somehow allowlisted by bug path.
     for name in sorted(GSC_MCP_NEVER_DEFAULT):
         if name not in denied:
             denied.append(name)
     if prefixed:
         return [f"mcp__arch__{n}" for n in denied]
     return denied
+
+
+def n_mcp_disallowed_prepared_leak(*, allow_override: list[str] | tuple[str, ...] | None = None) -> int:
+    """Count of prepared tools incorrectly present in disallowed (must be 0)."""
+    prepared = set(DEFAULT_GSC_MCP_ALLOWED_TOOLS) - set(GSC_MCP_NEVER_DEFAULT)
+    denied = set(gsc_mcp_disallowed_tool_names(prefixed=False, allow_override=allow_override))
+    return len(prepared & denied)
 
 
 def builtin_disallowed_tools_csv() -> str:
@@ -1162,21 +1184,19 @@ def run_claude_via_sdk(
             else sdk_driver.max_turns_for_step(step_id)
         )
         system_append = sdk_driver.contest_system_prompt_append(skills_dir)
-        allow_override = None
         # v5ac: always push early Write skeleton on IMPLEMENT (independent of degrade).
         if (step_id or "") == "implement":
             system_append = system_append + "\n\n" + IMPLEMENT_EARLY_WRITE_APPEND
         if degrade_mode:
+            # v5ah: keep full MCP + Skills; only append behavioral guidance (no allow narrow).
             system_append = system_append + "\n\n" + DEGRADED_SYSTEM_APPEND
-            if (step_id or "") == "implement":
-                allow_override = list(IMPLEMENT_DEGRADED_MCP_ALLOW)
             print(
                 json.dumps(
                     {
                         "event": "rapid_refill_degrade_restart",
                         "step_id": step_id,
-                        "mcp_allow_override": allow_override,
-                        "note": "narrower MCP allow + degraded system; breaker/MCP stay ON",
+                        "mcp_allow_override": None,
+                        "note": "full MCP满配 kept; degraded system append only; Skills=all; breaker/MCP stay ON",
                         "classification": "retryable:rapid_refill_needs_degrade",
                     },
                     ensure_ascii=False,
@@ -1185,9 +1205,20 @@ def run_claude_via_sdk(
             )
         extra_deny = None
         if enable_mcp:
-            extra_deny = gsc_mcp_disallowed_tool_names(
-                prefixed=True, allow_override=allow_override
-            )
+            extra_deny = gsc_mcp_disallowed_tool_names(prefixed=True)
+        # Fail loudly if MCP off without explicit env escape hatch.
+        if not enable_mcp:
+            raw_mcp = (os.environ.get("ARC_ENABLE_MCP") or "").strip().lower()
+            if raw_mcp not in {"0", "false", "no", "off"}:
+                return ClaudeRunResult(
+                    returncode=2,
+                    is_error=True,
+                    terminal_reason="cc_config_incomplete",
+                    subtype="mcp_disabled_without_env",
+                    api_error_status=None,
+                    tail="enable_mcp=False but ARC_ENABLE_MCP not explicitly disabling",
+                    step_started_at=step_started_at,
+                )
         options = sdk_driver.build_agent_options(
             cwd=output_dir,
             model=sdk_model,
@@ -1201,6 +1232,14 @@ def run_claude_via_sdk(
             permission_mode="acceptEdits",
             extra_disallowed_tools=extra_deny,
             step_id=step_id,
+        )
+        cfg = assert_cc_full_config(
+            options=options,
+            enable_mcp=enable_mcp,
+            plugins=plugins,
+            home_dir=Path(sdk_env.get("HOME") or os.environ.get("HOME") or ""),
+            output_dir=output_dir,
+            mcp_servers=mcp_servers,
         )
         print(
             json.dumps(
@@ -1226,6 +1265,16 @@ def run_claude_via_sdk(
             ),
             flush=True,
         )
+        if cfg.get("ok") is False:
+            return ClaudeRunResult(
+                returncode=2,
+                is_error=True,
+                terminal_reason="cc_config_incomplete",
+                subtype=",".join(cfg.get("issues") or []) or "cc_config_incomplete",
+                api_error_status=None,
+                tail=json.dumps(cfg, ensure_ascii=False),
+                step_started_at=step_started_at,
+            )
         turn = sdk_driver.run_sdk_turn(prompt=prompt, options=options, apply_openai_env=apply_openai_env)
     finally:
         for k, v in prev.items():
@@ -3183,51 +3232,127 @@ def ensure_gsc_spec(output_dir: Path, module: RequirementModule) -> Path:
 
 
 
-def ensure_arc_spawn_gate_softener(output_dir: Path) -> None:
-    """Soften GSC SPAWN-GATE without disabling MCP; encode thin Official STEP loop (v5ag)."""
-    claude_md = output_dir / "CLAUDE.md"
-    claude_md.write_text(
-        "# ARC-Bench project — thin CC orchestrator (v5ag)\n\n"
-        "HARD: GSC MCP stays ON. Never disable WaitForMcpServers / never set "
-        "ARC_ENABLE_MCP=0 / never ban MCP tools.\n\n"
-        "## Thin flow (harness owns STEPs; Agent owns how)\n"
-        "1. **ONE-SHOT INIT** (project/WAVE level mindset): PRD → SPEC → TEST_DAG once.\n"
-        "   - PRD only for demand split; already-detailed leaves go straight into SPEC.\n"
-        "   - Do NOT invent features. Use GSC MCP `prd` / `spec_write` / `trace` as Agent chooses.\n"
-        "2. **implement** — CODING + TEST LOOP: write code, run tests, fix, repeat. "
-        "CC Agent owns the loop. Soft: design_* MCP tools if UI work needs them "
-        "(there is NO separate pages STEP — MCP has no pages stage).\n"
-        "3. **batch_test** (optional, WAVE-central after DOMAIN merge) — harness runs "
-        "vitest + cheap `npm run build` once for the WAVE.\n\n"
-        "## WAVE / DOMAIN (kept)\n"
-        "- DOMAIN worktrees develop; merge to mainline; ONE-SHOT WAVE batch_test after merge.\n"
-        "- FORBIDDEN: inventing harness STEPs MCP does not have (no pages / no force-govern theater).\n"
-        "- govern + audit_refactor are OFF unless `ARC_ENABLE_MCP_AUDIT_STEPS=1`.\n\n"
-        "## Harness STEP loop (thin acceptance)\n"
-        "The harness runs discrete STEPs. Each STEP is its own Claude round.\n"
-        "Do not advance yourself — the harness advances only after thin acceptance passes.\n"
-        "Receipts live under `.arc/steps/<module-id>/`.\n\n"
-        "DEV STEPs:\n"
-        "1. **prd** — demand split via `mcp__arch__prd` when needed; skip OK if leaves already SPEC-ready.\n"
-        "2. **spec** — HTML under SPEC/arcbench (>50B); prefer `mcp__arch__spec_write`.\n"
-        "3. **test_dag** — non-empty api+ui in test_dag.json.\n"
-        "4. **implement** — write business code under frontend|backend|src; run tests; fix; repeat.\n"
-        "5. **batch_test** — WAVE-central harness validation AFTER DOMAIN merge only.\n\n"
-        "## Per-STEP rules\n"
-        "- Skills are model-invoked via the runtime Skill tool when relevant "
-        "(official setting_sources + skills). Do NOT Read/Bash/cat SKILL.md.\n"
-        "- Harness acceptance is thin artifact/MCP gates — NOT skill force-load / NOT "
-        "homemade feature-wiring / NOT pages theater.\n"
-        "- Name required tools as `mcp__arch__<short>` from the allowlist; do NOT invent tool names.\n"
-        "- NEVER call `mcp__arch__account_manage` or `mcp__arch__debug_binary`.\n"
-        "- Do NOT use migrate tools as the main SPEC path (HTML 2.0 via spec_write).\n"
-        "- Write receipt JSON under `.arc/steps/<id>/` when exit criteria are met.\n"
-        "- Prefer main session; do not spawn Agent/Task.\n"
-        "- If WaitForMcpServers appears, wait once then continue; keep outputs small.\n"
-        "- Harness local tests grant final green for batch_test — MCP alone does not.\n"
-,
-        encoding="utf-8",
-    )
+def load_contest_user_claude_md() -> str:
+    """Exact Tao contest user-level CLAUDE.md (tracked under contest/CLAUDE.md)."""
+    path = CONTEST_USER_CLAUDE_MD
+    if not path.is_file():
+        raise FileNotFoundError(f"contest user CLAUDE.md missing: {path}")
+    body = path.read_text(encoding="utf-8")
+    if "# 角色" not in body or "§1 故障根治 SOP" not in body or "技能索引" not in body:
+        raise ValueError(f"contest CLAUDE.md missing required headings: {path}")
+    return body
+
+
+ARC_CONTEST_CLAUDE_FOOTER = """
+---
+# ARC contest footer (harness only — keep short)
+- MCP stays ON; WaitForMcpServers OK; never set ARC_ENABLE_MCP=0; never ban MCP tools.
+- Never invent tool names; never call mcp__arch__account_manage or mcp__arch__debug_binary.
+- Skills via official Skill tool only (setting_sources=["user","project"] + skills=all); never Read/Bash/cat SKILL.md.
+""".strip()
+
+
+def install_contest_claude_md(output_dir: Path, *, home_dir: Path | None = None) -> dict[str, str]:
+    """Install Tao CLAUDE.md to user HOME/.claude and project output_dir/CLAUDE.md.
+
+    Replaces the old harness-invented STEP theater softener body.
+    """
+    body = load_contest_user_claude_md()
+    project_body = body.rstrip() + "\n\n" + ARC_CONTEST_CLAUDE_FOOTER + "\n"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    project_path = output_dir / "CLAUDE.md"
+    project_path.write_text(project_body, encoding="utf-8")
+    paths: dict[str, str] = {"project_claude_md": str(project_path)}
+    resolved_home = home_dir
+    if resolved_home is None:
+        env_home = (os.environ.get("HOME") or "").strip()
+        if env_home:
+            resolved_home = Path(env_home)
+    if resolved_home is not None:
+        user_dir = resolved_home / ".claude"
+        user_dir.mkdir(parents=True, exist_ok=True)
+        user_path = user_dir / "CLAUDE.md"
+        user_path.write_text(body if body.endswith("\n") else body + "\n", encoding="utf-8")
+        paths["user_claude_md"] = str(user_path)
+    return paths
+
+
+def assert_cc_full_config(
+    *,
+    options: object,
+    enable_mcp: bool,
+    plugins: list | None,
+    home_dir: Path,
+    output_dir: Path,
+    mcp_servers: object = None,
+) -> dict:
+    """Log cc_full_config and return {ok, issues, ...}. Fail-closed when incomplete."""
+    setting_sources = list(getattr(options, "setting_sources", None) or [])
+    skills = getattr(options, "skills", None)
+    allowed = list(getattr(options, "allowed_tools", None) or [])
+    skill_allowed = "Skill" in allowed
+    n_allowed = len(gsc_mcp_allowed_tools()) if enable_mcp else 0
+    n_disallowed = len(gsc_mcp_disallowed_tool_names(prefixed=False)) if enable_mcp else 0
+    leak = n_mcp_disallowed_prepared_leak() if enable_mcp else 0
+    user_md = home_dir / ".claude" / "CLAUDE.md" if home_dir and str(home_dir) else Path("")
+    project_md = output_dir / "CLAUDE.md"
+    user_exists = bool(home_dir and str(home_dir) and user_md.is_file())
+    project_exists = project_md.is_file()
+    plugins_present = bool(plugins)
+    mcp_servers_present = mcp_servers is not None and mcp_servers != {} and mcp_servers != []
+
+    issues: list[str] = []
+    if list(setting_sources) != ["user", "project"] and set(setting_sources) != {"user", "project"}:
+        if "user" not in setting_sources or "project" not in setting_sources:
+            issues.append("setting_sources_missing_user_or_project")
+    if skills != "all":
+        issues.append("skills_not_all")
+    if not skill_allowed:
+        issues.append("Skill_not_in_allowed_tools")
+    # MCP must be on unless env explicitly disables (checked by caller too).
+    raw_mcp = (os.environ.get("ARC_ENABLE_MCP") or "").strip().lower()
+    env_explicit_off = raw_mcp in {"0", "false", "no", "off"}
+    if not enable_mcp and not env_explicit_off:
+        issues.append("mcp_off_without_env")
+    if enable_mcp and not mcp_servers_present and not plugins_present:
+        # plugins OR mcp_servers should attach GSC; prefer both.
+        issues.append("mcp_servers_and_plugins_missing")
+    if enable_mcp and leak != 0:
+        issues.append(f"prepared_mcp_disallowed_leak={leak}")
+    if not user_exists:
+        issues.append("user_claude_md_missing")
+    if not project_exists:
+        issues.append("project_claude_md_missing")
+
+    payload = {
+        "event": "cc_full_config",
+        "ok": len(issues) == 0,
+        "issues": issues,
+        "setting_sources": setting_sources,
+        "skills": skills,
+        "Skill_in_allowed": skill_allowed,
+        "mcp_enabled": enable_mcp,
+        "n_mcp_allowed": n_allowed,
+        "n_mcp_disallowed": n_disallowed,
+        "n_mcp_disallowed_prepared_leak": leak,
+        "user_claude_md": str(user_md) if home_dir and str(home_dir) else None,
+        "user_claude_md_exists": user_exists,
+        "project_claude_md": str(project_md),
+        "project_claude_md_exists": project_exists,
+        "plugins_present": plugins_present,
+        "mcp_servers_present": mcp_servers_present,
+    }
+    print(json.dumps(payload, ensure_ascii=False), flush=True)
+    return payload
+
+
+def ensure_arc_spawn_gate_softener(output_dir: Path, *, home_dir: Path | None = None) -> None:
+    """Install Tao contest CLAUDE.md (user + project) and SPAWN-GATE softener flag.
+
+    v5ah: STOP overwriting CLAUDE.md with harness STEP theater. Use Tao's
+    contest/CLAUDE.md as user+project guidance; append only a short ARC footer.
+    """
+    install_contest_claude_md(output_dir, home_dir=home_dir)
 
     off = output_dir / ".claude" / "spawn-gate-off"
     off.parent.mkdir(parents=True, exist_ok=True)
@@ -4252,6 +4377,8 @@ def main() -> int:
 
     env = os.environ.copy()
     env["HOME"] = str(home_dir)
+    # v5ah: install Tao contest CLAUDE.md to user+project before any SDK turn.
+    ensure_arc_spawn_gate_softener(output_dir, home_dir=home_dir)
     env["GSC_ARC_PACKAGED_RUNTIME"] = "1"
     env["GSC_RUNTIME_SERVER_BIN"] = str(gsc_dir / "bin" / "gsc-spec-server")
     env["CLAUDE_PLUGIN_ROOT"] = str(gsc_dir)
@@ -4398,6 +4525,10 @@ def main() -> int:
                     "v5ag_mcp_audit_default_off",
                     "v5ag_implement_code_test_loop",
                     "v5ag_thin_acceptance_no_feature_wiring_theater",
+                    "v5ah_full_mcp_skills_perception",
+                    "v5ah_contest_user_claude_md",
+                    "v5ah_cc_full_config_fail_closed",
+                    "v5ah_no_prepared_mcp_disallowed_leak",
                 ],
             },
             ensure_ascii=False,
@@ -5315,7 +5446,7 @@ def main() -> int:
                 wt = ensure_domain_worktree(output_dir, group.domain_id)
                 domain_worktrees[group.domain_id] = wt
                 # Ensure SPEC/CLAUDE softener exist in the DOMAIN worktree
-                ensure_arc_spawn_gate_softener(wt)
+                ensure_arc_spawn_gate_softener(wt, home_dir=home_dir)
                 for module in group.modules:
                     ensure_gsc_spec(wt, module)
 
@@ -5649,7 +5780,7 @@ def main() -> int:
 
 
             # Refresh mainline softener after merges
-            ensure_arc_spawn_gate_softener(output_dir)
+            ensure_arc_spawn_gate_softener(output_dir, home_dir=home_dir)
 
             # --- ONE-SHOT centralized BATCH_TEST after WAVE merge (v5ad) ---
             # FORBIDDEN: serial per-REQ agent batch_test after merge (exactly what live

@@ -58,7 +58,16 @@ with zipfile.ZipFile(src) as zf:
             target.write_bytes(zf.read(info))
 PY
 
-echo "[1b/2] copy contest skills + anthropic-proxy (Messages to chat bridge)"
+echo "[1b/2] copy contest skills + Tao CLAUDE.md + anthropic-proxy (Messages to chat bridge)"
+# Tao contest user-level CLAUDE.md (v5ah) — installed to HOME/.claude + project on every run
+if [[ -f "$ROOT/contest/CLAUDE.md" ]]; then
+  mkdir -p "$STAGE/contest"
+  cp -f "$ROOT/contest/CLAUDE.md" "$STAGE/contest/CLAUDE.md"
+  echo "  + contest/CLAUDE.md ($(wc -c < "$STAGE/contest/CLAUDE.md") bytes)"
+else
+  echo "ERROR: missing $ROOT/contest/CLAUDE.md (Tao contest guidance required for v5ah)" >&2
+  exit 2
+fi
 # Architect/designer skills (not in Factory starter ZIP)
 for skill in architect designer; do
   if [[ -d "$ROOT/skills/$skill" ]]; then

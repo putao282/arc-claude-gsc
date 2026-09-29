@@ -283,15 +283,23 @@ class SelfHealTests(unittest.TestCase):
         self.assertTrue(armed["degrade"])
         # Cap still enforced (not full max_retries+1)
         self.assertLess(attempts, 6)
-        # Disallowed regenerate uses narrower allow for implement
+        # v5ah: degrade must NOT hide prepared MCP (满配). Legacy override still cannot leak.
         deny_full = mod.gsc_mcp_disallowed_tool_names(prefixed=False)
         deny_deg = mod.gsc_mcp_disallowed_tool_names(
             prefixed=False, allow_override=list(mod.IMPLEMENT_DEGRADED_MCP_ALLOW)
         )
-        self.assertGreater(len(deny_deg), len(deny_full) - 5)  # narrower allow → more denied
-        for keep in mod.IMPLEMENT_DEGRADED_MCP_ALLOW:
+        self.assertEqual(mod.n_mcp_disallowed_prepared_leak(), 0)
+        self.assertEqual(
+            mod.n_mcp_disallowed_prepared_leak(
+                allow_override=list(mod.IMPLEMENT_DEGRADED_MCP_ALLOW)
+            ),
+            0,
+        )
+        for keep in ("prd", "spec_write", "search_code", "design_asset"):
+            self.assertNotIn(keep, deny_full)
             self.assertNotIn(keep, deny_deg)
         self.assertIn("DEGRADED MODE", mod.DEGRADED_SYSTEM_APPEND)
+        self.assertIn("MCP allowlist is NOT narrowed", mod.DEGRADED_SYSTEM_APPEND)
 
 
 if __name__ == "__main__":

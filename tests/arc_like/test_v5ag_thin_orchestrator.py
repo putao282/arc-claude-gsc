@@ -90,12 +90,14 @@ class V5agThinOrchestratorTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
-            mod.ensure_arc_spawn_gate_softener(root)
-            body = (root / "CLAUDE.md").read_text(encoding="utf-8")
-            self.assertIn("thin CC orchestrator", body)
-            self.assertIn("NO separate pages STEP", body)
+            home = root / "home"
+            # v5ah: softener installs Tao contest CLAUDE.md (+ short ARC footer), not STEP theater
+            mod.ensure_arc_spawn_gate_softener(root / "proj", home_dir=home)
+            body = (root / "proj" / "CLAUDE.md").read_text(encoding="utf-8")
+            self.assertIn("# 角色", body)
+            self.assertIn("MCP stays ON", body)
             self.assertNotIn("5. **pages**", body)
-            self.assertIn("CODING + TEST LOOP", body)
+            self.assertNotIn("thin CC orchestrator (v5ag)", body)
 
 
 if __name__ == "__main__":
