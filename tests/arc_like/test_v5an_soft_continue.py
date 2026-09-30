@@ -51,7 +51,6 @@ class V5anSoftContinueTests(unittest.TestCase):
     def test_policy_tags(self):
         src = (ROOT / "main.py").read_text(encoding="utf-8")
         for tag in (
-            "v5an_thin_cc_launcher_soft_continue",
             "v5an_no_blocking_limit_fail_closed",
             "v5an_no_max_turns_fail_closed",
             "v5an_phase_soft_continue",
@@ -59,13 +58,18 @@ class V5anSoftContinueTests(unittest.TestCase):
             "phase_soft_continue",
         ):
             self.assertIn(tag, src)
+        # orchestration tag may be v5an or v5ao successor
+        self.assertTrue(
+            "v5an_thin_cc_launcher_soft_continue" in src
+            or "v5ao_thin_cc_launcher_soft_continue" in src
+        )
         # Must not revive forbidden Agent-OS soft_accept marker
         self.assertNotIn("soft_accept:max_turns", src)
 
     def test_soft_continue_reasons(self):
-        self.assertEqual(
-            mod.PHASE_SOFT_CONTINUE_REASONS,
-            frozenset({"blocking_limit", "max_turns"}),
+        # v5an core reasons must remain; v5ao may extend the set.
+        self.assertTrue(
+            {"blocking_limit", "max_turns"} <= set(mod.PHASE_SOFT_CONTINUE_REASONS)
         )
         for reason in ("blocking_limit", "max_turns"):
             r = mod.ClaudeRunResult(

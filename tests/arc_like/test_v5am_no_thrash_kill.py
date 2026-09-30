@@ -65,7 +65,9 @@ class V5amNoThrashKillTests(unittest.TestCase):
         self.assertNotIn("max_rapid_refill_attempts", src)
         self.assertNotIn("ARC_RAPID_REFILL_MAX_ATTEMPTS", src)
 
-    def test_execute_with_retry_no_early_stop(self):
+    def test_execute_with_retry_no_kill_gate_first_hit_return(self):
+        # v5am: no rapid_refill_breaker kill gate.
+        # v5ao: first rapid_refill* hit returns without burning max_retries.
         calls = {"n": 0}
 
         def run_attempt(attempt):
@@ -86,8 +88,8 @@ class V5amNoThrashKillTests(unittest.TestCase):
             max_seconds=0,
             sleep_fn=lambda _s: None,
         )
-        self.assertEqual(attempts, 3)
-        self.assertEqual(calls["n"], 3)
+        self.assertEqual(attempts, 1)
+        self.assertEqual(calls["n"], 1)
         self.assertEqual(result.terminal_reason, "rapid_refill_breaker")
 
     def test_sdk_thrash_hooks_never_deny(self):

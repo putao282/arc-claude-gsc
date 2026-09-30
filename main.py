@@ -151,12 +151,15 @@ NON_RETRYABLE_MARKERS = (
     "context length exceeded",
 )
 
-# v5an: soft session ends must NOT fail-closed the whole run after DESIGN.
+# v5an/v5ao: soft session ends must NOT fail-closed the whole run mid-pipeline.
 # Official v5am GitHub died terminal_reason=blocking_limit after DESIGN; Sheet died max_turns.
+# Official v5an both tracks died terminal_reason=rapid_refill_breaker after IMPLEMENT (attempts=3).
 # Thin launcher relaunches the next phase (prompt + CC) instead of killing early.
 PHASE_SOFT_CONTINUE_REASONS = frozenset({
     "blocking_limit",
     "max_turns",
+    "rapid_refill_breaker",
+    "rapid_refill",
 })
 
 
@@ -823,10 +826,11 @@ def execute_with_retry(
     sleep_fn=time.sleep,
 ) -> tuple[ClaudeRunResult, int]:
     """Retry retryable CC failures. v5am: NO rapid_refill_breaker budget kill gate.
+    v5ao: first rapid_refill* hit returns immediately (no 3-retry burn); soft-continue
+    mid-pipeline relaunches the next phase instead of exit 1.
 
     Official v5al died on terminal_reason=rapid_refill_breaker after Read-streak
-    PreToolUse denies. Rapid refill remains retryable (+ degrade append) and may
-    use the full max_retries budget — harness never early-stops on refill hits.
+    PreToolUse denies. Official v5an burned max_retries then fail-closed on IMPLEMENT.
     """
     total_attempts = max_retries + 1
     last_result: ClaudeRunResult | None = None
@@ -845,12 +849,17 @@ def execute_with_retry(
                         "max_attempts": total_attempts,
                         "classification": classification.reason,
                         "terminal_reason": result.terminal_reason or "unknown",
-                        "note": "v5am: no rapid_refill_breaker kill; continue retries if budget remains",
+                        "note": (
+                            "v5ao: first rapid_refill* hit returns without burning "
+                            "max_retries; soft-continue handles mid-pipeline"
+                        ),
                     },
                     ensure_ascii=False,
                 ),
                 flush=True,
             )
+            # v5ao: do not consume remaining degrade retries — hand off to soft-continue.
+            return result, attempt
         if not classification.retryable or attempt >= total_attempts:
             return result, attempt
         delay = retry_delay_seconds(attempt, base_seconds, max_seconds)
@@ -1848,7 +1857,7 @@ def cleanup() -> None:
 
 
 def main() -> int:
-    """v5an: thin CC launcher ONLY — build phase prompts + start ClaudeSDKClient.
+    """v5ao: thin CC launcher ONLY — build phase prompts + start ClaudeSDKClient.
 
     Agent owns DESIGN / IMPLEMENT / merge / verify / BATCH_TEST.
     Harness does NOT merge, run vitest, stamp receipts, or wave-orchestrate.
@@ -1967,7 +1976,7 @@ def main() -> int:
             {
                 "event": "arc_runtime_policy",
                 "driver": "ClaudeSDKClient",
-                "orchestration": "v5an_thin_cc_launcher_soft_continue",
+                "orchestration": "v5ao_thin_cc_launcher_soft_continue",
                 "v5am_thin_cc_launcher_no_thrash_kill": True,
                 "v5al_thin_cc_launcher_prompts_only": True,
                 "mcp_enabled": enable_mcp,
@@ -1985,6 +1994,9 @@ def main() -> int:
                 "v5an_no_max_turns_fail_closed": True,
                 "v5an_phase_soft_continue": True,
                 "v5an_raised_max_turns": True,
+                "v5ao_soft_continue_rapid_refill": True,
+                "v5ao_no_rapid_refill_retry_burn": True,
+                "v5ao_phase_soft_continue": True,
                 "v5al_agent_owns_merge_test": True,
                 "v5al_no_wave_worktree_orchestrator": True,
                 "v5al_no_python_vitest": True,
@@ -2121,7 +2133,7 @@ def main() -> int:
                     "event": f"phase_{phase}_started",
                     "step_id": step_id,
                     "req_ids": all_req_ids,
-                    "note": "v5an thin: prompt + ClaudeSDKClient; soft-continue blocking_limit/max_turns",
+                    "note": "v5ao thin: prompt + ClaudeSDKClient; soft-continue blocking_limit/max_turns/rapid_refill*",
                 },
                 ensure_ascii=False,
             ),
@@ -2214,8 +2226,8 @@ def main() -> int:
                             "returncode": result.returncode,
                             "next_phase": phases[idx + 1][0],
                             "note": (
-                                "v5an: strip fail-closed after DESIGN soft limit; "
-                                "continue DESIGN→IMPLEMENT→BATCH via relaunch"
+                                "v5ao: soft-continue mid-phase (blocking_limit/max_turns/"
+                                "rapid_refill*); continue DESIGN→IMPLEMENT→BATCH via relaunch"
                             ),
                         },
                         ensure_ascii=False,
@@ -2224,12 +2236,12 @@ def main() -> int:
                 )
                 continue
             runtime.events.mark_run_failed(
-                f"v5an phase {phase} CC failed: {result.terminal_reason or result.returncode}"
+                f"v5ao phase {phase} CC failed: {result.terminal_reason or result.returncode}"
             )
             return int(result.returncode or 1)
         runtime.events.mark_run_completed(
-            "v5an thin CC launcher: DESIGN→IMPLEMENT→BATCH_TEST "
-            "(soft-continue blocking_limit/max_turns; raised max_turns)"
+            "v5ao thin CC launcher: DESIGN→IMPLEMENT→BATCH_TEST "
+            "(soft-continue blocking_limit/max_turns/rapid_refill*; raised max_turns)"
         )
         return 0
     except Exception as exc:
