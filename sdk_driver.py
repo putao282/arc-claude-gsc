@@ -77,8 +77,8 @@ MCP_THRASH_WATCH_SUFFIXES = (
 )
 MCP_THRASH_SOFT_LIMIT = 2  # identical fingerprint
 MCP_THRASH_HARD_LIMIT = 3
-# Optional: consecutive builtin Read with no Write/Edit on implement/spec → deny further Read.
-READ_ONLY_STREAK_LIMIT = 5  # v5ac: force Write skeleton earlier on implement/spec
+# Consecutive builtin Read with no Write/Edit on implement/spec → observe log only (v5am: no deny).
+READ_ONLY_STREAK_LIMIT = 5  # kept for telemetry thresholds; never kills
 READ_STREAK_STEPS = frozenset({"implement", "spec"})
 # After BOTH prd_govern + spec_govern ≥1 in govern STEP, deny further *_govern re-audits.
 GOVERN_ACCEPT_GREEN_TOOLS = frozenset({"prd_govern", "spec_govern"})
@@ -133,7 +133,7 @@ def _is_thrash_watched_mcp(name: str) -> bool:
 
 
 class McpThrashGuard:
-    """Count identical MCP read fingerprints; log soft/hard thrash; enforce via PreToolUse (v5x/v5y)."""
+    """Count identical MCP read fingerprints; log soft/hard thrash (v5am: observe-only, no deny)."""
 
     def __init__(
         self,
@@ -214,7 +214,7 @@ class McpThrashGuard:
         return self.identical_count(name, inp) >= self.hard_limit
 
     def note_builtin_tool(self, name: str) -> dict[str, Any] | None:
-        """Track Read-only streak; return deny event dict when streak limit hit."""
+        """Track Read-only streak; v5am: observe/log only — never deny (no kill gate)."""
         if name in ("Write", "Edit"):
             self._read_streak = 0
             return None
@@ -225,9 +225,10 @@ class McpThrashGuard:
         self._read_streak += 1
         if self._read_streak < self.read_streak_limit:
             return None
+        # v5am: log soft warn only. Denying Read caused rapid_refill_breaker on Official v5al.
         event = {
             "event": "mcp_thrash_guard",
-            "level": "read_streak_deny",
+            "level": "read_streak_observe",
             "tool": name,
             "identical_count": self._read_streak,
             "soft_limit": self.soft_limit,
@@ -236,11 +237,11 @@ class McpThrashGuard:
             "step_id": self.step_id,
             "fingerprint": f"Read|streak={self._read_streak}",
             "advice": READ_STREAK_DENY_ADVICE,
+            "note": "v5am: observe-only; no PreToolUse deny",
         }
         self.events.append(event)
-        self.deny_events.append(event)
         print(json.dumps(event, ensure_ascii=False), flush=True)
-        return event
+        return None  # never deny
 
     @property
     def thrash_hit(self) -> bool:
@@ -260,66 +261,54 @@ def _hook_deny(hook_event_name: str, reason: str) -> dict[str, Any]:
 def build_thrash_pretool_hooks(
     thrash_guard: McpThrashGuard,
 ) -> dict[str, list[Any]]:
-    """ClaudeAgentOptions.hooks PreToolUse: identical MCP read ≥ hard_limit → deny.
+    """ClaudeAgentOptions.hooks PreToolUse: v5am observe-only (no thrash/Read-streak kill).
 
-    Also optional Read-only streak deny on implement/spec, and v5y govern
-    accept-already-green deny for further prd_govern/spec_govern. Keeps log events.
+    Official v5al GitHub failed with terminal_reason=rapid_refill_breaker after
+    repeated read_streak_deny PreToolUse denies. v5am keeps telemetry soft/hard
+    logs but NEVER returns permissionDecision=deny for Read / identical MCP /
+    govern re-audit. Agent owns pacing via prompts.
     """
 
     async def pre_tool_use(input_data: dict[str, Any], tool_use_id: str | None, context: Any) -> dict[str, Any]:
         del tool_use_id, context
         if not isinstance(input_data, dict):
             return {}
-        event_name = str(input_data.get("hook_event_name") or "PreToolUse")
         name = str(input_data.get("tool_name") or "")
         raw_inp = input_data.get("tool_input")
         inp = raw_inp if isinstance(raw_inp, dict) else {}
 
         if name in ("Write", "Edit", "Read"):
-            streak_event = thrash_guard.note_builtin_tool(name)
-            if streak_event is not None and name == "Read":
-                return _hook_deny(event_name, streak_event.get("advice") or READ_STREAK_DENY_ADVICE)
+            # observe-only; note_builtin_tool returns None (no deny)
+            thrash_guard.note_builtin_tool(name)
 
         if _is_thrash_watched_mcp(name):
-            # v5y: if govern accept already green, deny further *_govern re-audits
-            # BEFORE counting this call (first completing pair still allowed).
+            # still count + soft/hard log; never deny (v5am)
             if thrash_guard.should_deny_govern_reaudit(name):
-                deny_ev = {
-                    "event": "mcp_thrash_pretool_deny",
-                    "reason": "govern_accept_already_green",
+                obs = {
+                    "event": "mcp_thrash_guard",
+                    "level": "govern_accept_green_observe",
                     "tool": name,
                     "prd_govern_count": thrash_guard.tool_total("prd_govern"),
                     "spec_govern_count": thrash_guard.tool_total("spec_govern"),
                     "advice": GOVERN_ACCEPT_GREEN_ADVICE,
+                    "note": "v5am: observe-only; no PreToolUse deny",
                 }
-                thrash_guard.deny_events.append(deny_ev)
-                thrash_guard.events.append(
-                    {
-                        "event": "mcp_thrash_guard",
-                        "level": "govern_accept_green_deny",
-                        "tool": name,
-                        "identical_count": thrash_guard.identical_count(name, inp),
-                        "soft_limit": thrash_guard.soft_limit,
-                        "hard_limit": thrash_guard.hard_limit,
-                        "fingerprint": f"govern_accept_green|{name}",
-                        "advice": GOVERN_ACCEPT_GREEN_ADVICE,
-                    }
-                )
-                print(json.dumps(deny_ev, ensure_ascii=False), flush=True)
-                return _hook_deny(event_name, GOVERN_ACCEPT_GREEN_ADVICE)
-            # Increment + log soft/hard (same events as v5r observation path).
+                thrash_guard.events.append(obs)
+                print(json.dumps(obs, ensure_ascii=False), flush=True)
             thrash_guard.note(name, inp)
+            # identical MCP hard_limit: log only (should_deny still used for telemetry)
             if thrash_guard.should_deny_identical_mcp(name, inp):
-                deny_ev = {
-                    "event": "mcp_thrash_pretool_deny",
+                obs = {
+                    "event": "mcp_thrash_guard",
+                    "level": "identical_mcp_observe",
                     "tool": name,
                     "identical_count": thrash_guard.identical_count(name, inp),
                     "hard_limit": thrash_guard.hard_limit,
                     "advice": THRASH_DENY_ADVICE,
+                    "note": "v5am: observe-only; no PreToolUse deny",
                 }
-                thrash_guard.deny_events.append(deny_ev)
-                print(json.dumps(deny_ev, ensure_ascii=False), flush=True)
-                return _hook_deny(event_name, THRASH_DENY_ADVICE)
+                thrash_guard.events.append(obs)
+                print(json.dumps(obs, ensure_ascii=False), flush=True)
         return {}
 
     try:

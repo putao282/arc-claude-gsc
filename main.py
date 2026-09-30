@@ -334,7 +334,7 @@ def mcp_enabled() -> bool:
 
 
 # GSC MCP exposes ~70 tools (~63k schema tokens). Autocompact then re-injects
-# them and trips rapid_refill_breaker. Keep MCP ON; advertise P0+P1 surface via
+# them and historically tripped rapid_refill_breaker. Keep MCP ON; advertise P0+P1 via
 # allowedTools, and strip the rest with --disallowedTools (inventory − allowlist).
 # Canonical inventory: MCP_TOOLS_INVENTORY.md / MCP_FULL_UPGRADE_PLAN.md §10.
 
@@ -531,12 +531,13 @@ IMPLEMENT_DEGRADED_MCP_ALLOW: tuple[str, ...] = (
 )
 
 DEGRADED_SYSTEM_APPEND = """
-DEGRADED MODE (rapid_refill self-heal — MCP stays ON + 满配; Skills stay all; breaker still capped):
+DEGRADED MODE (rapid_refill self-heal — MCP stays ON + 满配; Skills stay all; v5am: no thrash kill gate):
 - Immediately Write or Edit business code under frontend/ / backend/ / src/.
 - Do NOT re-call identical MCP reads (spec_read/state_read/artifact_read) with the same args.
 - Do NOT re-load the same Skill. At most one Skill invocation if needed, then Write.
 - Prefer: search_code once → Write skeleton → stop thrashing on reads.
 - MCP allowlist is NOT narrowed on degrade (v5ah full perception).
+- Harness will NOT deny Read / identical MCP via PreToolUse (v5am observe-only).
 """.strip()
 
 
@@ -777,7 +778,7 @@ def classify_claude_failure(result: ClaudeRunResult) -> FailureClassification:
     for marker in RETRYABLE_MARKERS:
         if marker in text:
             reason = f"retryable:{marker}"
-            # v5x G3: signal degrade restart on next attempt (breaker/cap unchanged).
+            # v5x G3 / v5am: signal degrade restart on next attempt (no refill budget kill).
             if marker == "rapid_refill":
                 reason = "retryable:rapid_refill_needs_degrade"
             return FailureClassification(True, reason)
@@ -802,14 +803,13 @@ def execute_with_retry(
     on_retry=None,
     sleep_fn=time.sleep,
 ) -> tuple[ClaudeRunResult, int]:
+    """Retry retryable CC failures. v5am: NO rapid_refill_breaker budget kill gate.
+
+    Official v5al died on terminal_reason=rapid_refill_breaker after Read-streak
+    PreToolUse denies. Rapid refill remains retryable (+ degrade append) and may
+    use the full max_retries budget — harness never early-stops on refill hits.
+    """
     total_attempts = max_retries + 1
-    # Cap rapid_refill self-heal: schema refill usually repeats every attempt and
-    # burned ~$2 on 6 doomed loops in v5e. Prefer tool-surface shrink; this is the
-    # budget backstop (default 2 attempts = 1 + 1 retry).
-    max_rapid_refill_attempts = env_int(
-        "ARC_RAPID_REFILL_MAX_ATTEMPTS", 2, minimum=1, maximum=total_attempts
-    )
-    rapid_refill_hits = 0
     last_result: ClaudeRunResult | None = None
     for attempt in range(1, total_attempts + 1):
         result = run_attempt(attempt)
@@ -818,24 +818,20 @@ def execute_with_retry(
         if not (result.returncode != 0 or result.is_error):
             return result, attempt
         if "rapid_refill" in classification.reason:
-            rapid_refill_hits += 1
-            if rapid_refill_hits >= max_rapid_refill_attempts:
-                print(
-                    json.dumps(
-                        {
-                            "event": "rapid_refill_budget_exhausted",
-                            "attempt": attempt,
-                            "rapid_refill_hits": rapid_refill_hits,
-                            "max_rapid_refill_attempts": max_rapid_refill_attempts,
-                            "classification": classification.reason,
-                            "terminal_reason": result.terminal_reason or "unknown",
-                            "note": "stopping self-heal to avoid doomed refill loops; MCP stays ON",
-                        },
-                        ensure_ascii=False,
-                    ),
-                    flush=True,
-                )
-                return result, attempt
+            print(
+                json.dumps(
+                    {
+                        "event": "rapid_refill_retryable",
+                        "attempt": attempt,
+                        "max_attempts": total_attempts,
+                        "classification": classification.reason,
+                        "terminal_reason": result.terminal_reason or "unknown",
+                        "note": "v5am: no rapid_refill_breaker kill; continue retries if budget remains",
+                    },
+                    ensure_ascii=False,
+                ),
+                flush=True,
+            )
         if not classification.retryable or attempt >= total_attempts:
             return result, attempt
         delay = retry_delay_seconds(attempt, base_seconds, max_seconds)
@@ -926,7 +922,7 @@ def run_claude_via_sdk(
                         "event": "rapid_refill_degrade_restart",
                         "step_id": step_id,
                         "mcp_allow_override": None,
-                        "note": "full MCP满配 kept; degraded system append only; Skills=all; breaker/MCP stay ON",
+                        "note": "full MCP满配 kept; degraded system append only; Skills=all; MCP ON; v5am no thrash kill",
                         "classification": "retryable:rapid_refill_needs_degrade",
                     },
                     ensure_ascii=False,
@@ -1950,7 +1946,8 @@ def main() -> int:
             {
                 "event": "arc_runtime_policy",
                 "driver": "ClaudeSDKClient",
-                "orchestration": "v5al_thin_cc_launcher_prompts_only",
+                "orchestration": "v5am_thin_cc_launcher_no_thrash_kill",
+                "v5al_thin_cc_launcher_prompts_only": True,
                 "mcp_enabled": enable_mcp,
                 "mcp_config": str(mcp_config_path) if mcp_config_path else None,
                 "max_budget_usd": max_budget_usd,
@@ -1959,6 +1956,9 @@ def main() -> int:
                 "n_modules": len(modules),
                 "req_ids": all_req_ids,
                 "v5al_thin_cc_launcher_shell_only": True,
+                "v5am_no_rapid_refill_breaker": True,
+                "v5am_no_read_streak_kill_gate": True,
+                "v5am_thrash_observe_only": True,
                 "v5al_agent_owns_merge_test": True,
                 "v5al_no_wave_worktree_orchestrator": True,
                 "v5al_no_python_vitest": True,
@@ -2061,50 +2061,89 @@ def main() -> int:
 
     def _launch(phase: str, step_id: str) -> ClaudeRunResult:
         prompt = _phase_prompt(phase)
-        attempt_env = claude_env.copy()
-        attempt_env["MODEL"] = model
-        if gateway_proc is not None:
-            attempt_env["ANTHROPIC_BASE_URL"] = "http://127.0.0.1:8787"
-            attempt_env["ANTHROPIC_API_KEY"] = "arc-local"
-            for _k in ("ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY_OLD", "CLAUDE_CODE_API_KEY"):
-                attempt_env.pop(_k, None)
-            attempt_env["OPENAI_API_KEY"] = "arc-local"
-            attempt_env["OPENAI_BASE_URL"] = "http://127.0.0.1:8787"
-            attempt_env = sdk_driver.apply_contest_model_env(attempt_env, "sonnet")
-        else:
-            attempt_env["OPENAI_API_KEY"] = api_key
-            attempt_env["OPENAI_BASE_URL"] = base_url
-            attempt_env = apply_official_claude_env(
-                attempt_env, base_url=base_url, api_key=api_key, model=model
-            )
-            attempt_env["ANTHROPIC_API_KEY"] = ""
-            if api_key:
-                attempt_env["ANTHROPIC_AUTH_TOKEN"] = api_key
-            attempt_env = sdk_driver.apply_contest_model_env(attempt_env, model)
+        degrade_mode = {"on": False}
+        max_retries = env_int("ARC_CLAUDE_MAX_RETRIES", 2, minimum=0, maximum=8)
+        base_seconds = env_int("ARC_CLAUDE_RETRY_BASE_SECONDS", 2, minimum=0, maximum=120)
+        max_seconds = env_int("ARC_CLAUDE_RETRY_MAX_SECONDS", 30, minimum=0, maximum=600)
+
+        def _attempt_env() -> dict[str, str]:
+            attempt_env = claude_env.copy()
+            attempt_env["MODEL"] = model
+            if gateway_proc is not None:
+                attempt_env["ANTHROPIC_BASE_URL"] = "http://127.0.0.1:8787"
+                attempt_env["ANTHROPIC_API_KEY"] = "arc-local"
+                for _k in ("ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY_OLD", "CLAUDE_CODE_API_KEY"):
+                    attempt_env.pop(_k, None)
+                attempt_env["OPENAI_API_KEY"] = "arc-local"
+                attempt_env["OPENAI_BASE_URL"] = "http://127.0.0.1:8787"
+                attempt_env = sdk_driver.apply_contest_model_env(attempt_env, "sonnet")
+            else:
+                attempt_env["OPENAI_API_KEY"] = api_key
+                attempt_env["OPENAI_BASE_URL"] = base_url
+                attempt_env = apply_official_claude_env(
+                    attempt_env, base_url=base_url, api_key=api_key, model=model
+                )
+                attempt_env["ANTHROPIC_API_KEY"] = ""
+                if api_key:
+                    attempt_env["ANTHROPIC_AUTH_TOKEN"] = api_key
+                attempt_env = sdk_driver.apply_contest_model_env(attempt_env, model)
+            return attempt_env
+
         print(
             json.dumps(
                 {
                     "event": f"phase_{phase}_started",
                     "step_id": step_id,
                     "req_ids": all_req_ids,
-                    "note": "v5al thin: prompt + ClaudeSDKClient only",
+                    "note": "v5am thin: prompt + ClaudeSDKClient; no thrash kill gates",
                 },
                 ensure_ascii=False,
             ),
             flush=True,
         )
-        result = run_claude_via_sdk(
-            prompt=prompt,
-            output_dir=output_dir,
-            model=model,
-            claude_bin=claude_bin,
-            gsc_dir=gsc_dir,
-            mcp_config=mcp_config_path,
-            enable_mcp=enable_mcp,
-            attempt_env=attempt_env,
-            skills_dir=skills_dir,
-            max_budget_usd=max_budget_usd,
-            step_id=step_id,
+
+        def run_attempt(attempt: int) -> ClaudeRunResult:
+            return run_claude_via_sdk(
+                prompt=prompt,
+                output_dir=output_dir,
+                model=model,
+                claude_bin=claude_bin,
+                gsc_dir=gsc_dir,
+                mcp_config=mcp_config_path,
+                enable_mcp=enable_mcp,
+                attempt_env=_attempt_env(),
+                skills_dir=skills_dir,
+                max_budget_usd=max_budget_usd,
+                step_id=step_id,
+                degrade_mode=bool(degrade_mode["on"]),
+            )
+
+        def on_retry(attempt, result, classification, delay):
+            if "rapid_refill" in classification.reason:
+                degrade_mode["on"] = True
+            print(
+                json.dumps(
+                    {
+                        "event": "phase_cc_retry",
+                        "phase": phase,
+                        "step_id": step_id,
+                        "attempt": attempt,
+                        "delay_seconds": delay,
+                        "classification": classification.reason,
+                        "terminal_reason": result.terminal_reason,
+                        "degrade_mode": degrade_mode["on"],
+                    },
+                    ensure_ascii=False,
+                ),
+                flush=True,
+            )
+
+        result, used_attempts = execute_with_retry(
+            run_attempt,
+            max_retries=max_retries,
+            base_seconds=base_seconds,
+            max_seconds=max_seconds,
+            on_retry=on_retry,
         )
         print(
             json.dumps(
@@ -2114,6 +2153,8 @@ def main() -> int:
                     "returncode": result.returncode,
                     "is_error": result.is_error,
                     "terminal_reason": result.terminal_reason,
+                    "attempts": used_attempts,
+                    "degrade_mode": degrade_mode["on"],
                 },
                 ensure_ascii=False,
             ),
@@ -2130,11 +2171,11 @@ def main() -> int:
             result = _launch(phase, step_id)
             if result.is_error or (result.returncode not in (0, None) and int(result.returncode) != 0):
                 runtime.events.mark_run_failed(
-                    f"v5al phase {phase} CC failed: {result.terminal_reason or result.returncode}"
+                    f"v5am phase {phase} CC failed: {result.terminal_reason or result.returncode}"
                 )
                 return int(result.returncode or 1)
         runtime.events.mark_run_completed(
-            "v5al thin CC launcher: DESIGN→IMPLEMENT→BATCH_TEST prompts finished"
+            "v5am thin CC launcher: DESIGN→IMPLEMENT→BATCH_TEST (no thrash kill gates)"
         )
         return 0
     except Exception as exc:

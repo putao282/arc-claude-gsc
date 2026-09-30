@@ -193,7 +193,8 @@ class SelfHealTests(unittest.TestCase):
         )
 
 
-    def test_rapid_refill_stops_before_full_retry_budget(self):
+    def test_rapid_refill_uses_full_retry_budget_v5am(self):
+        """v5am: no rapid_refill_breaker early-stop; uses full max_retries+1."""
         calls = {"n": 0}
 
         def run_attempt(attempt):
@@ -207,23 +208,15 @@ class SelfHealTests(unittest.TestCase):
                 tail="autocompact is thrashing: rapid_refill",
             )
 
-        old = mod.os.environ.get("ARC_RAPID_REFILL_MAX_ATTEMPTS")
-        try:
-            mod.os.environ["ARC_RAPID_REFILL_MAX_ATTEMPTS"] = "2"
-            result, attempts = mod.execute_with_retry(
-                run_attempt,
-                max_retries=5,
-                base_seconds=0,
-                max_seconds=0,
-                sleep_fn=lambda _s: None,
-            )
-        finally:
-            if old is None:
-                mod.os.environ.pop("ARC_RAPID_REFILL_MAX_ATTEMPTS", None)
-            else:
-                mod.os.environ["ARC_RAPID_REFILL_MAX_ATTEMPTS"] = old
-        self.assertEqual(attempts, 2)
-        self.assertEqual(calls["n"], 2)
+        result, attempts = mod.execute_with_retry(
+            run_attempt,
+            max_retries=5,
+            base_seconds=0,
+            max_seconds=0,
+            sleep_fn=lambda _s: None,
+        )
+        self.assertEqual(attempts, 6)
+        self.assertEqual(calls["n"], 6)
         self.assertEqual(result.terminal_reason, "rapid_refill_breaker")
 
     def test_rapid_refill_classifies_as_needs_degrade(self):
@@ -239,14 +232,11 @@ class SelfHealTests(unittest.TestCase):
         self.assertTrue(clf.retryable)
         self.assertEqual(clf.reason, "retryable:rapid_refill_needs_degrade")
 
-    def test_rapid_refill_retry_arms_degrade_without_disabling_breaker(self):
+    def test_rapid_refill_retry_arms_degrade_no_breaker_v5am(self):
         calls = []
-        degrade_flags = []
 
         def run_attempt(attempt):
             calls.append(attempt)
-            # Simulate harness: attempt>=2 would be degrade_mode True after on_retry
-            degrade_flags.append(attempt > 1)
             return mod.ClaudeRunResult(
                 returncode=1,
                 is_error=True,
@@ -262,27 +252,17 @@ class SelfHealTests(unittest.TestCase):
             if "rapid_refill" in classification.reason:
                 armed["degrade"] = True
 
-        old = mod.os.environ.get("ARC_RAPID_REFILL_MAX_ATTEMPTS")
-        try:
-            mod.os.environ["ARC_RAPID_REFILL_MAX_ATTEMPTS"] = "2"
-            result, attempts = mod.execute_with_retry(
-                run_attempt,
-                max_retries=5,
-                base_seconds=0,
-                max_seconds=0,
-                on_retry=on_retry,
-                sleep_fn=lambda _s: None,
-            )
-        finally:
-            if old is None:
-                mod.os.environ.pop("ARC_RAPID_REFILL_MAX_ATTEMPTS", None)
-            else:
-                mod.os.environ["ARC_RAPID_REFILL_MAX_ATTEMPTS"] = old
-        self.assertEqual(attempts, 2)
-        self.assertEqual(calls, [1, 2])
+        result, attempts = mod.execute_with_retry(
+            run_attempt,
+            max_retries=3,
+            base_seconds=0,
+            max_seconds=0,
+            on_retry=on_retry,
+            sleep_fn=lambda _s: None,
+        )
+        self.assertEqual(attempts, 4)
+        self.assertEqual(calls, [1, 2, 3, 4])
         self.assertTrue(armed["degrade"])
-        # Cap still enforced (not full max_retries+1)
-        self.assertLess(attempts, 6)
         # v5ah: degrade must NOT hide prepared MCP (满配). Legacy override still cannot leak.
         deny_full = mod.gsc_mcp_disallowed_tool_names(prefixed=False)
         deny_deg = mod.gsc_mcp_disallowed_tool_names(
