@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""v5ak: merge_domain_worktree clears untracked overwrite blockers before merge."""
+"""v5ak: merge_domain_worktree clears untracked blockers; excludes .*/CLAUDE.md from mainline."""
 from __future__ import annotations
 
 import importlib.util
@@ -32,6 +32,8 @@ def _load_main():
 
         sys.modules["claude_agent_sdk"] = types.ModuleType("claude_agent_sdk")
     name = "arc_main_v5ak_merge"
+    # reload-friendly unique name
+    name = "arc_main_v5ak_merge_excl"
     spec = importlib.util.spec_from_file_location(name, ROOT / "main.py")
     mod = importlib.util.module_from_spec(spec)
     assert spec and spec.loader
@@ -75,6 +77,12 @@ COMBAT_UNTRACKED = (
     "CLAUDE.md",
     "SPEC/arcbench/REQ-1.html",
 )
+EXCLUDED_FROM_MAINLINE = (
+    ".claude/spawn-gate-off",
+    ".gsc/project-state.json",
+    "CLAUDE.md",
+)
+PRODUCT_FROM_DOMAIN = ("SPEC/arcbench/REQ-1.html",)
 
 
 class MergeDomainWorktreeV5akTests(unittest.TestCase):
@@ -85,7 +93,20 @@ class MergeDomainWorktreeV5akTests(unittest.TestCase):
     def test_helpers_present(self):
         self.assertTrue(callable(self.mod._clear_untracked_blocking_merge))
         self.assertTrue(callable(self.mod._parse_untracked_overwrite_paths))
+        self.assertTrue(callable(self.mod._is_mainline_excluded_path))
+        self.assertTrue(callable(self.mod._strip_mainline_excluded_paths))
         self.assertIn("v5ak_merge_domain_worktree_clear_untracked", (ROOT / "main.py").read_text(encoding="utf-8"))
+
+    def test_is_mainline_excluded_path_policy(self):
+        self.assertTrue(self.mod._is_mainline_excluded_path(".claude/spawn-gate-off"))
+        self.assertTrue(self.mod._is_mainline_excluded_path(".gsc/project-state.json"))
+        self.assertTrue(self.mod._is_mainline_excluded_path(".env"))
+        self.assertTrue(self.mod._is_mainline_excluded_path("CLAUDE.md"))
+        self.assertTrue(self.mod._is_mainline_excluded_path("subdir/CLAUDE.md"))
+        self.assertFalse(self.mod._is_mainline_excluded_path("SPEC/arcbench/REQ-1.html"))
+        self.assertFalse(self.mod._is_mainline_excluded_path("shared.txt"))
+        self.assertFalse(self.mod._is_mainline_excluded_path(".gitignore"))
+        self.assertFalse(self.mod._is_mainline_excluded_path(".gitattributes"))
 
     def test_parse_untracked_overwrite_paths(self):
         err = (
@@ -108,15 +129,14 @@ class MergeDomainWorktreeV5akTests(unittest.TestCase):
             ],
         )
 
-    def test_combat_untracked_paths_cleared_and_merge_succeeds(self):
-        """Reproduce Official v5aj failure: untracked harness/spec paths block -X theirs."""
+    def test_combat_untracked_cleared_product_lands_excluded_stripped(self):
+        """Combat: clear blockers; SPEC lands; .*/CLAUDE.md never promote onto mainline."""
         with tempfile.TemporaryDirectory(prefix="v5ak-combat-") as td:
             tmp = Path(td)
             main = _init_mainline(tmp)
             domain_id = "REQ-1"
             wt = self.mod.ensure_domain_worktree(main, domain_id)
 
-            # Domain tip owns the combat paths (incoming tree).
             for rel in COMBAT_UNTRACKED:
                 p = wt / rel
                 p.parent.mkdir(parents=True, exist_ok=True)
@@ -125,13 +145,11 @@ class MergeDomainWorktreeV5akTests(unittest.TestCase):
             _git(wt, "add", "-A")
             _git(wt, "commit", "-m", "domain adds combat paths")
 
-            # Mainline has untracked copies that would be overwritten (old bug).
             for rel in COMBAT_UNTRACKED:
                 p = main / rel
                 p.parent.mkdir(parents=True, exist_ok=True)
                 p.write_text(f"untracked-mainline:{rel}\n", encoding="utf-8")
 
-            # Prove raw git merge fails with the combat error shape.
             branch = f"arc-domain-{self.mod.safe_node_id(domain_id)}"
             probe = _git(
                 main,
@@ -150,14 +168,18 @@ class MergeDomainWorktreeV5akTests(unittest.TestCase):
             self.assertIn("overwritten", blob)
             _git(main, "merge", "--abort", check=False)
 
-            # Harness must clear blockers and succeed with -X theirs.
             self.mod.merge_domain_worktree(main, domain_id, wt)
 
-            for rel in COMBAT_UNTRACKED:
+            for rel in PRODUCT_FROM_DOMAIN:
                 self.assertEqual(
                     (main / rel).read_text(encoding="utf-8"),
                     f"domain:{rel}\n",
-                    msg=f"domain tip must land for {rel}",
+                    msg=f"product path must land from domain for {rel}",
+                )
+            for rel in EXCLUDED_FROM_MAINLINE:
+                self.assertFalse(
+                    (main / rel).exists(),
+                    msg=f"excluded path must NOT promote onto mainline: {rel}",
                 )
             self.assertEqual(
                 (main / "shared.txt").read_text(encoding="utf-8"),
@@ -166,7 +188,7 @@ class MergeDomainWorktreeV5akTests(unittest.TestCase):
             self.assertFalse(self.mod._git_unmerged_paths(main))
             self.assertFalse(self.mod._worktree_registered(main, wt))
 
-    def test_clear_helper_removes_intersection_only(self):
+    def test_clear_helper_removes_intersection_and_excluded(self):
         with tempfile.TemporaryDirectory(prefix="v5ak-clear-") as td:
             tmp = Path(td)
             main = _init_mainline(tmp)
@@ -174,7 +196,6 @@ class MergeDomainWorktreeV5akTests(unittest.TestCase):
             (main / "from_side.txt").write_text("side\n", encoding="utf-8")
             _git(main, "add", "-A")
             _git(main, "commit", "-m", "side file")
-            # back to default branch
             cur = _git(main, "rev-parse", "--abbrev-ref", "HEAD").stdout.strip()
             if cur == "side":
                 sw = _git(main, "checkout", "master", check=False)
@@ -185,14 +206,21 @@ class MergeDomainWorktreeV5akTests(unittest.TestCase):
 
             (main / "from_side.txt").write_text("untracked-blocker\n", encoding="utf-8")
             (main / "keep_untracked.txt").write_text("keep-me\n", encoding="utf-8")
+            (main / ".claude").mkdir(parents=True, exist_ok=True)
+            (main / ".claude" / "spawn-gate-off").write_text("x\n", encoding="utf-8")
+            (main / "CLAUDE.md").write_text("untracked\n", encoding="utf-8")
 
             cleared = self.mod._clear_untracked_blocking_merge(main, "side", domain_id="T")
             self.assertIn("from_side.txt", cleared)
+            self.assertIn(".claude/spawn-gate-off", cleared)
+            self.assertIn("CLAUDE.md", cleared)
             self.assertFalse((main / "from_side.txt").exists())
+            self.assertFalse((main / ".claude" / "spawn-gate-off").exists())
+            self.assertFalse((main / "CLAUDE.md").exists())
             self.assertTrue((main / "keep_untracked.txt").exists())
 
-    def test_v5aa_abort_theirs_still_works_with_v5ak(self):
-        """Regression: dirty unmerged + overlapping content still resolves with theirs."""
+    def test_v5aa_abort_theirs_still_works_excluded_stripped(self):
+        """Regression: content theirs still works; CLAUDE.md excluded from mainline."""
         with tempfile.TemporaryDirectory(prefix="v5ak-v5aa-") as td:
             tmp = Path(td)
             main = _init_mainline(tmp)
@@ -208,7 +236,6 @@ class MergeDomainWorktreeV5akTests(unittest.TestCase):
             _git(wt, "add", "-A")
             _git(wt, "commit", "-m", "domain diverges")
 
-            # Also plant combat untracked on mainline overlapping domain-only path name family
             (main / "CLAUDE.md").write_text("untracked-claude\n", encoding="utf-8")
             (wt / "CLAUDE.md").write_text("domain-claude\n", encoding="utf-8")
             _git(wt, "add", "-A")
@@ -225,11 +252,8 @@ class MergeDomainWorktreeV5akTests(unittest.TestCase):
                 branch,
                 check=False,
             )
-            # May fail for content conflict and/or untracked; either dirties or aborts.
             _ = dirty
-            # Force unmerged if possible
             if not self.mod._git_unmerged_paths(main):
-                # Ensure dirty state by conflict without -X
                 _git(main, "merge", "--abort", check=False)
                 _git(
                     main,
@@ -247,10 +271,8 @@ class MergeDomainWorktreeV5akTests(unittest.TestCase):
                 (main / "shared.txt").read_text(encoding="utf-8"),
                 "domain-version\n",
             )
-            self.assertEqual(
-                (main / "CLAUDE.md").read_text(encoding="utf-8"),
-                "domain-claude\n",
-            )
+            self.assertFalse((main / "CLAUDE.md").exists())
+            self.assertTrue((main / "domain_only.txt").exists())
             self.assertFalse(self.mod._git_unmerged_paths(main))
 
 

@@ -2547,6 +2547,28 @@ def _resolve_merge_conflicts_ours(output_dir: Path, domain_id: str) -> bool:
 
 
 
+# Mainline keep-list: never strip these even though they start with ".".
+_MAINLINE_DOT_KEEP = frozenset({".gitignore", ".gitattributes", ".gitmodules"})
+
+
+def _is_mainline_excluded_path(rel: str) -> bool:
+    """Paths that must never land on / stay on the mainline product tree.
+
+    Tao v5ak policy: exclude ALL paths whose first component starts with ``.``
+    (e.g. ``.claude/``, ``.gsc/``) and ``CLAUDE.md``. Keep core git meta
+    (``.gitignore`` / ``.gitattributes`` / ``.gitmodules``).
+    """
+    p = (rel or "").replace("\\", "/").strip()
+    if not p or p.startswith("/") or ".." in Path(p).parts:
+        return False
+    if p == "CLAUDE.md" or p.endswith("/CLAUDE.md"):
+        return True
+    first = p.split("/", 1)[0]
+    if first.startswith(".") and first not in _MAINLINE_DOT_KEEP:
+        return True
+    return False
+
+
 def _paths_in_tree(cwd: Path, ref: str) -> set[str]:
     """Return paths present in a git tree-ish (empty on failure)."""
     proc = subprocess.run(
@@ -2564,6 +2586,26 @@ def _untracked_working_paths(cwd: Path) -> list[str]:
     """Untracked paths including ignored (anything that can block merge overwrite)."""
     proc = subprocess.run(
         ["git", "ls-files", "--others", "-z"],
+        cwd=str(cwd),
+        capture_output=True,
+    )
+    if proc.returncode != 0:
+        return []
+    raw = proc.stdout or b""
+    out: list[str] = []
+    for part in raw.split(b"\0"):
+        if not part:
+            continue
+        try:
+            out.append(part.decode("utf-8"))
+        except UnicodeDecodeError:
+            out.append(part.decode("utf-8", errors="replace"))
+    return out
+
+
+def _tracked_working_paths(cwd: Path) -> list[str]:
+    proc = subprocess.run(
+        ["git", "ls-files", "-z"],
         cwd=str(cwd),
         capture_output=True,
     )
@@ -2639,17 +2681,23 @@ def _clear_untracked_blocking_merge(
     domain_id: str = "",
     extra_paths: list[str] | None = None,
 ) -> list[str]:
-    """Remove untracked/ignored paths that exist in ref (would block merge overwrite).
+    """Remove untracked/ignored paths that would block merge, plus excluded harness paths.
 
-    Prefer remove over stash: harness state files (.claude/spawn-gate-off,
-    .gsc/project-state.json, CLAUDE.md, SPEC/...) are regenerated; domain tip
-    wins via -X theirs. Fail-closed if a blocker cannot be removed.
+    Clear when:
+    - path exists in incoming ref (would be overwritten), OR
+    - path is mainline-excluded (``.claude/``, ``.gsc/``, other ``.*``, ``CLAUDE.md``)
+
+    Product paths (e.g. ``SPEC/...``) may later land from domain tip via ``-X theirs``.
+    Excluded paths are cleared here and stripped again after merge so they never
+    promote onto the mainline product tree. Fail-closed if a blocker cannot be removed.
     """
     incoming = _paths_in_tree(output_dir, ref)
     candidates: list[str] = []
     seen: set[str] = set()
     for p in _untracked_working_paths(output_dir):
-        if p in incoming and p not in seen:
+        if p in seen:
+            continue
+        if p in incoming or _is_mainline_excluded_path(p):
             seen.add(p)
             candidates.append(p)
     for p in extra_paths or []:
@@ -2682,6 +2730,7 @@ def _clear_untracked_blocking_merge(
                 "ref": ref,
                 "cleared": cleared[:40],
                 "failed": failed[:20],
+                "excluded_policy": True,
             },
             ensure_ascii=False,
         ),
@@ -2694,6 +2743,68 @@ def _clear_untracked_blocking_merge(
         )
     return cleared
 
+
+def _strip_mainline_excluded_paths(output_dir: Path, *, domain_id: str = "") -> list[str]:
+    """After domain merge: drop excluded paths so they never stay on mainline product tree."""
+    removed: list[str] = []
+    for p in list(_untracked_working_paths(output_dir)):
+        if _is_mainline_excluded_path(p) and _remove_working_path(output_dir, p):
+            removed.append(p)
+    tracked_excluded = [p for p in _tracked_working_paths(output_dir) if _is_mainline_excluded_path(p)]
+    if tracked_excluded:
+        rm = subprocess.run(
+            ["git", "rm", "-rf", "--ignore-unmatch", "--"] + tracked_excluded,
+            cwd=str(output_dir),
+            capture_output=True,
+            text=True,
+        )
+        if rm.returncode != 0:
+            raise RuntimeError(
+                f"merge domain {domain_id or '?'}: cannot strip excluded paths: "
+                + ((rm.stderr or rm.stdout or "")[:400])
+            )
+        removed.extend(tracked_excluded)
+        dirty = subprocess.run(
+            ["git", "diff", "--cached", "--quiet"],
+            cwd=str(output_dir),
+            capture_output=True,
+        )
+        if dirty.returncode != 0:
+            commit = subprocess.run(
+                [
+                    "git",
+                    "commit",
+                    "-m",
+                    f"wave-merge domain {domain_id}: drop excluded harness/dot paths",
+                ],
+                cwd=str(output_dir),
+                capture_output=True,
+                text=True,
+            )
+            if commit.returncode != 0:
+                raise RuntimeError(
+                    f"merge domain {domain_id or '?'}: strip-excluded commit failed: "
+                    + ((commit.stderr or commit.stdout or "")[:400])
+                )
+    seen: set[str] = set()
+    out: list[str] = []
+    for p in removed:
+        if p not in seen:
+            seen.add(p)
+            out.append(p)
+    if out:
+        print(
+            json.dumps(
+                {
+                    "event": "domain_merge_strip_excluded",
+                    "domain_id": domain_id,
+                    "removed": out[:40],
+                },
+                ensure_ascii=False,
+            ),
+            flush=True,
+        )
+    return out
 
 def merge_domain_worktree(
     output_dir: Path,
@@ -2710,10 +2821,12 @@ def merge_domain_worktree(
     file list if still dirty. Never runs ``git merge HEAD`` inside the worktree.
 
     Hardened (v5ak): before every merge attempt, clear untracked/ignored working
-    paths that exist in the incoming tree (and would be overwritten). Covers
-    harness state like ``.claude/spawn-gate-off``, ``.gsc/project-state.json``,
-    ``CLAUDE.md``, ``SPEC/...``. On residual untracked-overwrite stderr, clear
-    those paths and retry the same ref once. Fail-closed if clear is impossible.
+    paths that would be overwritten, and always clear mainline-excluded harness
+    paths (``.claude/**``, ``.gsc/**``, other ``.*``, ``CLAUDE.md``). Product
+    paths like ``SPEC/...`` may land from domain tip via ``-X theirs``; excluded
+    paths are stripped after a successful merge so they never promote onto the
+    mainline product tree. On residual untracked-overwrite stderr, clear + one
+    same-ref retry. Fail-closed if clear/strip is impossible.
 
     strategy: "theirs" (default/v5aa) or "ours" (supervisor-only alternate).
     """
@@ -2888,6 +3001,8 @@ def merge_domain_worktree(
         ),
         flush=True,
     )
+    # Tao v5ak: never promote excluded harness/dot paths onto mainline product tree.
+    _strip_mainline_excluded_paths(output_dir, domain_id=domain_id)
     # Best-effort cleanup
     subprocess.run(
         ["git", "worktree", "remove", "--force", str(wt)],
