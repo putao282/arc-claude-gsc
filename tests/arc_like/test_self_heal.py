@@ -92,28 +92,11 @@ class SelfHealTests(unittest.TestCase):
         )
         self.assertFalse(c.retryable)
 
-    def test_passed_module_is_skipped_on_resume(self):
-        import tempfile
-        from pathlib import Path
-
-        class Traceability:
-            @staticmethod
-            def get_node_state(node_id):
-                return {"req_id": node_id, "state": "PASSED"}
-
-        class Runtime:
-            traceability = Traceability()
-
-        # PASSED without harness receipt must NOT skip (anti false-green freeze).
-        self.assertFalse(mod.module_already_passed(Runtime(), "REQ-1"))
-        with tempfile.TemporaryDirectory() as tmp:
-            output = Path(tmp)
-            self.assertFalse(mod.module_already_passed(Runtime(), "REQ-1", output))
-            ok = mod.ValidationResult(
-                True, 0, ["npx", "--yes", "vitest", "run"], "ok", "harness local validation passed", str(output)
-            )
-            mod.write_validation_receipt(output, "REQ-1", ok)
-            self.assertTrue(mod.module_already_passed(Runtime(), "REQ-1", output))
+    def test_module_already_passed_deleted_thin_launcher(self):
+        """v5al+: Agent-OS resume helpers removed from thin launcher."""
+        self.assertFalse(hasattr(mod, "module_already_passed"))
+        self.assertFalse(hasattr(mod, "ValidationResult"))
+        self.assertFalse(hasattr(mod, "write_validation_receipt"))
 
     def test_explicit_fallback_switches_only_when_configured(self):
         old = mod.os.environ.get("ARC_FALLBACK_BASE_URLS")
@@ -193,8 +176,22 @@ class SelfHealTests(unittest.TestCase):
         )
 
 
-    def test_rapid_refill_uses_full_retry_budget_v5am(self):
-        """v5am: no rapid_refill_breaker early-stop; uses full max_retries+1."""
+
+    def test_rapid_refill_is_non_retryable_v5ap(self):
+        """v5ap: rapid_refill* is NON_RETRYABLE — Agent owns self-heal."""
+        result = mod.ClaudeRunResult(
+            returncode=1,
+            is_error=True,
+            terminal_reason="rapid_refill_breaker",
+            subtype="success",
+            api_error_status=None,
+            tail="autocompact is thrashing: rapid_refill",
+        )
+        clf = mod.classify_claude_failure(result)
+        self.assertFalse(clf.retryable)
+        self.assertIn("rapid_refill", clf.reason)
+
+    def test_rapid_refill_execute_with_retry_single_attempt_v5ap(self):
         calls = {"n": 0}
 
         def run_attempt(attempt):
@@ -215,71 +212,21 @@ class SelfHealTests(unittest.TestCase):
             max_seconds=0,
             sleep_fn=lambda _s: None,
         )
-        self.assertEqual(attempts, 6)
-        self.assertEqual(calls["n"], 6)
+        self.assertEqual(attempts, 1)
+        self.assertEqual(calls["n"], 1)
         self.assertEqual(result.terminal_reason, "rapid_refill_breaker")
 
-    def test_rapid_refill_classifies_as_needs_degrade(self):
-        result = mod.ClaudeRunResult(
-            returncode=1,
-            is_error=True,
-            terminal_reason="rapid_refill_breaker",
-            subtype="success",
-            api_error_status=None,
-            tail="autocompact is thrashing: rapid_refill",
-        )
-        clf = mod.classify_claude_failure(result)
-        self.assertTrue(clf.retryable)
-        self.assertEqual(clf.reason, "retryable:rapid_refill_needs_degrade")
-
-    def test_rapid_refill_retry_arms_degrade_no_breaker_v5am(self):
-        calls = []
-
-        def run_attempt(attempt):
-            calls.append(attempt)
-            return mod.ClaudeRunResult(
-                returncode=1,
-                is_error=True,
-                terminal_reason="rapid_refill_breaker",
-                subtype="success",
-                api_error_status=None,
-                tail="rapid_refill",
-            )
-
-        armed = {"degrade": False}
-
-        def on_retry(attempt, result, classification, delay):
-            if "rapid_refill" in classification.reason:
-                armed["degrade"] = True
-
-        result, attempts = mod.execute_with_retry(
-            run_attempt,
-            max_retries=3,
-            base_seconds=0,
-            max_seconds=0,
-            on_retry=on_retry,
-            sleep_fn=lambda _s: None,
-        )
-        self.assertEqual(attempts, 4)
-        self.assertEqual(calls, [1, 2, 3, 4])
-        self.assertTrue(armed["degrade"])
-        # v5ah: degrade must NOT hide prepared MCP (满配). Legacy override still cannot leak.
-        deny_full = mod.gsc_mcp_disallowed_tool_names(prefixed=False)
-        deny_deg = mod.gsc_mcp_disallowed_tool_names(
-            prefixed=False, allow_override=list(mod.IMPLEMENT_DEGRADED_MCP_ALLOW)
-        )
+    def test_no_degraded_system_append_v5ap(self):
+        self.assertFalse(hasattr(mod, "DEGRADED_SYSTEM_APPEND"))
+        src = (ROOT / "main.py").read_text(encoding="utf-8")
+        self.assertNotIn("DEGRADED_SYSTEM_APPEND", src)
+        self.assertNotIn("rapid_refill_degrade_restart", src)
+        self.assertIn("v5ap_no_degrade_mode", src)
+        # MCP满配 still must not leak prepared tools.
         self.assertEqual(mod.n_mcp_disallowed_prepared_leak(), 0)
-        self.assertEqual(
-            mod.n_mcp_disallowed_prepared_leak(
-                allow_override=list(mod.IMPLEMENT_DEGRADED_MCP_ALLOW)
-            ),
-            0,
-        )
+        deny_full = mod.gsc_mcp_disallowed_tool_names(prefixed=False)
         for keep in ("prd", "spec_write", "search_code", "design_asset"):
             self.assertNotIn(keep, deny_full)
-            self.assertNotIn(keep, deny_deg)
-        self.assertIn("DEGRADED MODE", mod.DEGRADED_SYSTEM_APPEND)
-        self.assertIn("MCP allowlist is NOT narrowed", mod.DEGRADED_SYSTEM_APPEND)
 
 
 if __name__ == "__main__":

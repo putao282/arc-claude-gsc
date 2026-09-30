@@ -67,7 +67,7 @@ class V5amNoThrashKillTests(unittest.TestCase):
 
     def test_execute_with_retry_no_kill_gate_first_hit_return(self):
         # v5am: no rapid_refill_breaker kill gate.
-        # v5ao: first rapid_refill* hit returns without burning max_retries.
+        # v5ap: rapid_refill* is NON_RETRYABLE → single attempt, fail closed.
         calls = {"n": 0}
 
         def run_attempt(attempt):

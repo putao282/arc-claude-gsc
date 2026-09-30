@@ -128,11 +128,7 @@ RETRYABLE_MARKERS = (
     "status 503",
     "status 504",
     "status 529",
-    # Autocompact thrash / rapid refill: retry with preserved workspace (self-heal).
-    "rapid_refill",
-    "autocompact is thrashing",
-    "context refilled",
-)
+)  # v5ap: rapid_refill/autocompact NOT retryable — Agent owns self-heal
 
 NON_RETRYABLE_MARKERS = (
     "invalid api key",
@@ -149,29 +145,14 @@ NON_RETRYABLE_MARKERS = (
     "unknown model",
     "invalid model",
     "context length exceeded",
+    # v5ap: Agent owns self-heal — harness must not Python-retry thrash/refill.
+    "rapid_refill",
+    "rapid_refill_breaker",
+    "autocompact is thrashing",
+    "context refilled",
 )
 
-# v5an/v5ao: soft session ends must NOT fail-closed the whole run mid-pipeline.
-# Official v5am GitHub died terminal_reason=blocking_limit after DESIGN; Sheet died max_turns.
-# Official v5an both tracks died terminal_reason=rapid_refill_breaker after IMPLEMENT (attempts=3).
-# Thin launcher relaunches the next phase (prompt + CC) instead of killing early.
-PHASE_SOFT_CONTINUE_REASONS = frozenset({
-    "blocking_limit",
-    "max_turns",
-    "rapid_refill_breaker",
-    "rapid_refill",
-})
-
-
-def phase_soft_continue_reason(result: "ClaudeRunResult") -> str | None:
-    """Return soft-continue reason if CC ended on a non-fatal session limit."""
-    reason = str(result.terminal_reason or "").strip().lower()
-    if reason in PHASE_SOFT_CONTINUE_REASONS:
-        return reason
-    subtype = str(result.subtype or "").strip().lower()
-    if subtype in PHASE_SOFT_CONTINUE_REASONS:
-        return subtype
-    return None
+# v5ap: no Python soft-continue — Agent owns self-heal; mid-phase CC fail = fail closed.
 
 
 def env_int(name: str, default: int, *, minimum: int = 0, maximum: int = 10_000) -> int:
@@ -552,17 +533,6 @@ IMPLEMENT_DEGRADED_MCP_ALLOW: tuple[str, ...] = (
     "artifact_grep",
 )
 
-DEGRADED_SYSTEM_APPEND = """
-DEGRADED MODE (rapid_refill self-heal — MCP stays ON + 满配; Skills stay all; v5am: no thrash kill gate):
-- Immediately Write or Edit business code under frontend/ / backend/ / src/.
-- Do NOT re-call identical MCP reads (spec_read/state_read/artifact_read) with the same args.
-- Do NOT re-load the same Skill. At most one Skill invocation if needed, then Write.
-- Prefer: search_code once → Write skeleton → stop thrashing on reads.
-- MCP allowlist is NOT narrowed on degrade (v5ah full perception).
-- Harness will NOT deny Read / identical MCP via PreToolUse (v5am observe-only).
-""".strip()
-
-
 # v5ac: force early Write skeleton on IMPLEMENT (business path) before thrash.
 IMPLEMENT_EARLY_WRITE_APPEND = """
 IMPLEMENT LOOP (v5ai — Agent owns coding+test; design already finished):
@@ -799,11 +769,7 @@ def classify_claude_failure(result: ClaudeRunResult) -> FailureClassification:
 
     for marker in RETRYABLE_MARKERS:
         if marker in text:
-            reason = f"retryable:{marker}"
-            # v5x G3 / v5am: signal degrade restart on next attempt (no refill budget kill).
-            if marker == "rapid_refill":
-                reason = "retryable:rapid_refill_needs_degrade"
-            return FailureClassification(True, reason)
+            return FailureClassification(True, f"retryable:{marker}")
 
     if result.terminal_reason.lower() == "api_error" and result.api_error_status is None:
         return FailureClassification(True, "retryable:api_error")
@@ -825,12 +791,11 @@ def execute_with_retry(
     on_retry=None,
     sleep_fn=time.sleep,
 ) -> tuple[ClaudeRunResult, int]:
-    """Retry retryable CC failures. v5am: NO rapid_refill_breaker budget kill gate.
-    v5ao: first rapid_refill* hit returns immediately (no 3-retry burn); soft-continue
-    mid-pipeline relaunches the next phase instead of exit 1.
+    """Retry only HTTP/transport retryable failures.
 
-    Official v5al died on terminal_reason=rapid_refill_breaker after Read-streak
-    PreToolUse denies. Official v5an burned max_retries then fail-closed on IMPLEMENT.
+    v5ap: phase LOOP does NOT call this — each phase is a single CC start.
+    rapid_refill* is NON_RETRYABLE (Agent owns self-heal; harness fail-closed).
+    Kept for unit tests / optional transport recovery outside the phase loop.
     """
     total_attempts = max_retries + 1
     last_result: ClaudeRunResult | None = None
@@ -839,26 +804,6 @@ def execute_with_retry(
         last_result = result
         classification = classify_claude_failure(result)
         if not (result.returncode != 0 or result.is_error):
-            return result, attempt
-        if "rapid_refill" in classification.reason:
-            print(
-                json.dumps(
-                    {
-                        "event": "rapid_refill_retryable",
-                        "attempt": attempt,
-                        "max_attempts": total_attempts,
-                        "classification": classification.reason,
-                        "terminal_reason": result.terminal_reason or "unknown",
-                        "note": (
-                            "v5ao: first rapid_refill* hit returns without burning "
-                            "max_retries; soft-continue handles mid-pipeline"
-                        ),
-                    },
-                    ensure_ascii=False,
-                ),
-                flush=True,
-            )
-            # v5ao: do not consume remaining degrade retries — hand off to soft-continue.
             return result, attempt
         if not classification.retryable or attempt >= total_attempts:
             return result, attempt
@@ -885,7 +830,6 @@ def run_claude_via_sdk(
     max_budget_usd: str | float | None,
     max_turns: int | None = None,
     step_id: str | None = None,
-    degrade_mode: bool = False,
 ) -> ClaudeRunResult:
     """Primary contest driver: ClaudeSDKClient (+ anthropic-proxy when active)."""
     step_started_at = time.time()
@@ -941,22 +885,7 @@ def run_claude_via_sdk(
         # v5ac: always push early Write skeleton on IMPLEMENT (independent of degrade).
         if (step_id or "") == "implement":
             system_append = system_append + "\n\n" + IMPLEMENT_EARLY_WRITE_APPEND
-        if degrade_mode:
-            # v5ah: keep full MCP + Skills; only append behavioral guidance (no allow narrow).
-            system_append = system_append + "\n\n" + DEGRADED_SYSTEM_APPEND
-            print(
-                json.dumps(
-                    {
-                        "event": "rapid_refill_degrade_restart",
-                        "step_id": step_id,
-                        "mcp_allow_override": None,
-                        "note": "full MCP满配 kept; degraded system append only; Skills=all; MCP ON; v5am no thrash kill",
-                        "classification": "retryable:rapid_refill_needs_degrade",
-                    },
-                    ensure_ascii=False,
-                ),
-                flush=True,
-            )
+        # v5ap: no degrade_mode / rapid_refill Python self-heal.
         extra_deny = None
         if enable_mcp:
             extra_deny = gsc_mcp_disallowed_tool_names(prefixed=True)
@@ -1857,13 +1786,13 @@ def cleanup() -> None:
 
 
 def main() -> int:
-    """v5ao: thin CC launcher ONLY — build phase prompts + start ClaudeSDKClient.
+    """v5ap: thin CC launcher ONLY — build phase prompts + start ClaudeSDKClient.
 
-    Agent owns DESIGN / IMPLEMENT / merge / verify / BATCH_TEST.
-    Harness does NOT merge, run vitest, stamp receipts, or wave-orchestrate.
-    Fixed CC launch: MCP ON + official Skills (setting_sources/skills=all) + CLAUDE.md.
-    Soft session ends (blocking_limit / max_turns) mid-pipeline do NOT fail-closed;
-    harness relaunches the next phase (still prompt + one CC start).
+    Agent owns DESIGN / IMPLEMENT / merge / verify / BATCH_TEST / success / self-heal.
+    Harness does NOT merge, run vitest, stamp receipts, wave-orchestrate, soft-continue,
+    degrade, or Python-retry mid-phase.
+    LOOP = sequential prompt + start CC only (design → implement → batch_test).
+    If CC fails mid-phase → fail closed (exit non-zero). Fixed CC: MCP ON + Skills=all.
     """
     args = parse_args()
     requirements_dir = Path(args.requirement_path).expanduser().resolve()
@@ -1890,7 +1819,7 @@ def main() -> int:
     runtime.traceability.init_store(reset=False)
     runtime.traceability.store_requirement_tree(requirement_tree)
     runtime.git.ensure_repo(create_initial_commit=True)
-    runtime.events.mark_run_started("arc-claude-gsc thin CC launcher (v5al)")
+    runtime.events.mark_run_started("arc-claude-gsc thin CC launcher (v5ap)")
 
     artifacts_dir = Path(
         os.environ.get("ARCBENCH_ARTIFACTS_DIR", str(output_dir.parent / "artifacts"))
@@ -1976,7 +1905,13 @@ def main() -> int:
             {
                 "event": "arc_runtime_policy",
                 "driver": "ClaudeSDKClient",
-                "orchestration": "v5ao_thin_cc_launcher_soft_continue",
+                "orchestration": "v5ap_thin_cc_launcher_fail_closed",
+                "v5ap_thin_cc_launcher_prompts_only": True,
+                "v5ap_no_soft_continue": True,
+                "v5ap_no_python_retry": True,
+                "v5ap_no_degrade_mode": True,
+                "v5ap_agent_owns_self_heal": True,
+                "v5ap_fail_closed_mid_phase": True,
                 "v5am_thin_cc_launcher_no_thrash_kill": True,
                 "v5al_thin_cc_launcher_prompts_only": True,
                 "mcp_enabled": enable_mcp,
@@ -1990,13 +1925,7 @@ def main() -> int:
                 "v5am_no_rapid_refill_breaker": True,
                 "v5am_no_read_streak_kill_gate": True,
                 "v5am_thrash_observe_only": True,
-                "v5an_no_blocking_limit_fail_closed": True,
-                "v5an_no_max_turns_fail_closed": True,
-                "v5an_phase_soft_continue": True,
                 "v5an_raised_max_turns": True,
-                "v5ao_soft_continue_rapid_refill": True,
-                "v5ao_no_rapid_refill_retry_burn": True,
-                "v5ao_phase_soft_continue": True,
                 "v5al_agent_owns_merge_test": True,
                 "v5al_no_wave_worktree_orchestrator": True,
                 "v5al_no_python_vitest": True,
@@ -2098,11 +2027,8 @@ def main() -> int:
         raise ValueError(phase)
 
     def _launch(phase: str, step_id: str) -> ClaudeRunResult:
+        """v5ap: ONE prompt + ONE fixed full MCP/Skills CC start. No Python retry/degrade."""
         prompt = _phase_prompt(phase)
-        degrade_mode = {"on": False}
-        max_retries = env_int("ARC_CLAUDE_MAX_RETRIES", 2, minimum=0, maximum=8)
-        base_seconds = env_int("ARC_CLAUDE_RETRY_BASE_SECONDS", 2, minimum=0, maximum=120)
-        max_seconds = env_int("ARC_CLAUDE_RETRY_MAX_SECONDS", 30, minimum=0, maximum=600)
 
         def _attempt_env() -> dict[str, str]:
             attempt_env = claude_env.copy()
@@ -2133,55 +2059,25 @@ def main() -> int:
                     "event": f"phase_{phase}_started",
                     "step_id": step_id,
                     "req_ids": all_req_ids,
-                    "note": "v5ao thin: prompt + ClaudeSDKClient; soft-continue blocking_limit/max_turns/rapid_refill*",
+                    "note": "v5ap thin: prompt + ClaudeSDKClient once; fail-closed; Agent owns self-heal",
                 },
                 ensure_ascii=False,
             ),
             flush=True,
         )
 
-        def run_attempt(attempt: int) -> ClaudeRunResult:
-            return run_claude_via_sdk(
-                prompt=prompt,
-                output_dir=output_dir,
-                model=model,
-                claude_bin=claude_bin,
-                gsc_dir=gsc_dir,
-                mcp_config=mcp_config_path,
-                enable_mcp=enable_mcp,
-                attempt_env=_attempt_env(),
-                skills_dir=skills_dir,
-                max_budget_usd=max_budget_usd,
-                step_id=step_id,
-                degrade_mode=bool(degrade_mode["on"]),
-            )
-
-        def on_retry(attempt, result, classification, delay):
-            if "rapid_refill" in classification.reason:
-                degrade_mode["on"] = True
-            print(
-                json.dumps(
-                    {
-                        "event": "phase_cc_retry",
-                        "phase": phase,
-                        "step_id": step_id,
-                        "attempt": attempt,
-                        "delay_seconds": delay,
-                        "classification": classification.reason,
-                        "terminal_reason": result.terminal_reason,
-                        "degrade_mode": degrade_mode["on"],
-                    },
-                    ensure_ascii=False,
-                ),
-                flush=True,
-            )
-
-        result, used_attempts = execute_with_retry(
-            run_attempt,
-            max_retries=max_retries,
-            base_seconds=base_seconds,
-            max_seconds=max_seconds,
-            on_retry=on_retry,
+        result = run_claude_via_sdk(
+            prompt=prompt,
+            output_dir=output_dir,
+            model=model,
+            claude_bin=claude_bin,
+            gsc_dir=gsc_dir,
+            mcp_config=mcp_config_path,
+            enable_mcp=enable_mcp,
+            attempt_env=_attempt_env(),
+            skills_dir=skills_dir,
+            max_budget_usd=max_budget_usd,
+            step_id=step_id,
         )
         print(
             json.dumps(
@@ -2191,8 +2087,7 @@ def main() -> int:
                     "returncode": result.returncode,
                     "is_error": result.is_error,
                     "terminal_reason": result.terminal_reason,
-                    "attempts": used_attempts,
-                    "degrade_mode": degrade_mode["on"],
+                    "attempts": 1,
                 },
                 ensure_ascii=False,
             ),
@@ -2206,42 +2101,21 @@ def main() -> int:
         ("batch_test", "batch_test"),
     )
     try:
-        for idx, (phase, step_id) in enumerate(phases):
+        for phase, step_id in phases:
             result = _launch(phase, step_id)
             failed = result.is_error or (
                 result.returncode not in (0, None) and int(result.returncode) != 0
             )
             if not failed:
                 continue
-            soft = phase_soft_continue_reason(result)
-            # Mid-pipeline soft session end → relaunch next phase (still thin: prompt+CC).
-            if soft is not None and idx < len(phases) - 1:
-                print(
-                    json.dumps(
-                        {
-                            "event": "phase_soft_continue",
-                            "phase": phase,
-                            "step_id": step_id,
-                            "terminal_reason": soft,
-                            "returncode": result.returncode,
-                            "next_phase": phases[idx + 1][0],
-                            "note": (
-                                "v5ao: soft-continue mid-phase (blocking_limit/max_turns/"
-                                "rapid_refill*); continue DESIGN→IMPLEMENT→BATCH via relaunch"
-                            ),
-                        },
-                        ensure_ascii=False,
-                    ),
-                    flush=True,
-                )
-                continue
+            # v5ap: fail closed — do NOT soft-continue or Python-retry.
             runtime.events.mark_run_failed(
-                f"v5ao phase {phase} CC failed: {result.terminal_reason or result.returncode}"
+                f"v5ap phase {phase} CC failed: {result.terminal_reason or result.returncode}"
             )
             return int(result.returncode or 1)
         runtime.events.mark_run_completed(
-            "v5ao thin CC launcher: DESIGN→IMPLEMENT→BATCH_TEST "
-            "(soft-continue blocking_limit/max_turns/rapid_refill*; raised max_turns)"
+            "v5ap thin CC launcher: DESIGN→IMPLEMENT→BATCH_TEST "
+            "(fail-closed; Agent owns self-heal; no soft-continue/degrade/Python-retry)"
         )
         return 0
     except Exception as exc:
