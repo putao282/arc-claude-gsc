@@ -151,6 +151,25 @@ NON_RETRYABLE_MARKERS = (
     "context length exceeded",
 )
 
+# v5an: soft session ends must NOT fail-closed the whole run after DESIGN.
+# Official v5am GitHub died terminal_reason=blocking_limit after DESIGN; Sheet died max_turns.
+# Thin launcher relaunches the next phase (prompt + CC) instead of killing early.
+PHASE_SOFT_CONTINUE_REASONS = frozenset({
+    "blocking_limit",
+    "max_turns",
+})
+
+
+def phase_soft_continue_reason(result: "ClaudeRunResult") -> str | None:
+    """Return soft-continue reason if CC ended on a non-fatal session limit."""
+    reason = str(result.terminal_reason or "").strip().lower()
+    if reason in PHASE_SOFT_CONTINUE_REASONS:
+        return reason
+    subtype = str(result.subtype or "").strip().lower()
+    if subtype in PHASE_SOFT_CONTINUE_REASONS:
+        return subtype
+    return None
+
 
 def env_int(name: str, default: int, *, minimum: int = 0, maximum: int = 10_000) -> int:
     raw = os.environ.get(name, "").strip()
@@ -1829,11 +1848,13 @@ def cleanup() -> None:
 
 
 def main() -> int:
-    """v5al: thin CC launcher ONLY — build phase prompts + start ClaudeSDKClient.
+    """v5an: thin CC launcher ONLY — build phase prompts + start ClaudeSDKClient.
 
     Agent owns DESIGN / IMPLEMENT / merge / verify / BATCH_TEST.
     Harness does NOT merge, run vitest, stamp receipts, or wave-orchestrate.
     Fixed CC launch: MCP ON + official Skills (setting_sources/skills=all) + CLAUDE.md.
+    Soft session ends (blocking_limit / max_turns) mid-pipeline do NOT fail-closed;
+    harness relaunches the next phase (still prompt + one CC start).
     """
     args = parse_args()
     requirements_dir = Path(args.requirement_path).expanduser().resolve()
@@ -1946,7 +1967,8 @@ def main() -> int:
             {
                 "event": "arc_runtime_policy",
                 "driver": "ClaudeSDKClient",
-                "orchestration": "v5am_thin_cc_launcher_no_thrash_kill",
+                "orchestration": "v5an_thin_cc_launcher_soft_continue",
+                "v5am_thin_cc_launcher_no_thrash_kill": True,
                 "v5al_thin_cc_launcher_prompts_only": True,
                 "mcp_enabled": enable_mcp,
                 "mcp_config": str(mcp_config_path) if mcp_config_path else None,
@@ -1959,6 +1981,10 @@ def main() -> int:
                 "v5am_no_rapid_refill_breaker": True,
                 "v5am_no_read_streak_kill_gate": True,
                 "v5am_thrash_observe_only": True,
+                "v5an_no_blocking_limit_fail_closed": True,
+                "v5an_no_max_turns_fail_closed": True,
+                "v5an_phase_soft_continue": True,
+                "v5an_raised_max_turns": True,
                 "v5al_agent_owns_merge_test": True,
                 "v5al_no_wave_worktree_orchestrator": True,
                 "v5al_no_python_vitest": True,
@@ -2095,7 +2121,7 @@ def main() -> int:
                     "event": f"phase_{phase}_started",
                     "step_id": step_id,
                     "req_ids": all_req_ids,
-                    "note": "v5am thin: prompt + ClaudeSDKClient; no thrash kill gates",
+                    "note": "v5an thin: prompt + ClaudeSDKClient; soft-continue blocking_limit/max_turns",
                 },
                 ensure_ascii=False,
             ),
@@ -2162,20 +2188,48 @@ def main() -> int:
         )
         return result
 
+    phases = (
+        ("design", "prd"),
+        ("implement", "implement"),
+        ("batch_test", "batch_test"),
+    )
     try:
-        for phase, step_id in (
-            ("design", "prd"),
-            ("implement", "implement"),
-            ("batch_test", "batch_test"),
-        ):
+        for idx, (phase, step_id) in enumerate(phases):
             result = _launch(phase, step_id)
-            if result.is_error or (result.returncode not in (0, None) and int(result.returncode) != 0):
-                runtime.events.mark_run_failed(
-                    f"v5am phase {phase} CC failed: {result.terminal_reason or result.returncode}"
+            failed = result.is_error or (
+                result.returncode not in (0, None) and int(result.returncode) != 0
+            )
+            if not failed:
+                continue
+            soft = phase_soft_continue_reason(result)
+            # Mid-pipeline soft session end → relaunch next phase (still thin: prompt+CC).
+            if soft is not None and idx < len(phases) - 1:
+                print(
+                    json.dumps(
+                        {
+                            "event": "phase_soft_continue",
+                            "phase": phase,
+                            "step_id": step_id,
+                            "terminal_reason": soft,
+                            "returncode": result.returncode,
+                            "next_phase": phases[idx + 1][0],
+                            "note": (
+                                "v5an: strip fail-closed after DESIGN soft limit; "
+                                "continue DESIGN→IMPLEMENT→BATCH via relaunch"
+                            ),
+                        },
+                        ensure_ascii=False,
+                    ),
+                    flush=True,
                 )
-                return int(result.returncode or 1)
+                continue
+            runtime.events.mark_run_failed(
+                f"v5an phase {phase} CC failed: {result.terminal_reason or result.returncode}"
+            )
+            return int(result.returncode or 1)
         runtime.events.mark_run_completed(
-            "v5am thin CC launcher: DESIGN→IMPLEMENT→BATCH_TEST (no thrash kill gates)"
+            "v5an thin CC launcher: DESIGN→IMPLEMENT→BATCH_TEST "
+            "(soft-continue blocking_limit/max_turns; raised max_turns)"
         )
         return 0
     except Exception as exc:

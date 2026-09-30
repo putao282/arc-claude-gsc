@@ -52,15 +52,16 @@ DEFAULT_DISALLOWED_TOOLS = [
 ]
 
 # v5r: SPEC thrash burned 33× identical spec_read into default max_turns=60.
-DEFAULT_MAX_TURNS = 100
+# v5an: raise ceilings so DESIGN→IMPLEMENT→BATCH can finish (Official v5am hit max_turns=100 on DESIGN).
+DEFAULT_MAX_TURNS = 250
 STEP_MAX_TURNS = {
-    "prd": 100,
-    "spec": 140,
-    "govern": 100,
-    "test_dag": 100,
-    "implement": 140,
-    "audit_refactor": 100,
-    "batch_test": 120,
+    "prd": 250,
+    "spec": 250,
+    "govern": 200,
+    "test_dag": 200,
+    "implement": 300,
+    "audit_refactor": 200,
+    "batch_test": 250,
 }
 
 # Read-heavy MCP tools that looped in Smoke v5q SPEC.
