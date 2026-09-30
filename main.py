@@ -2546,6 +2546,155 @@ def _resolve_merge_conflicts_ours(output_dir: Path, domain_id: str) -> bool:
     return not _git_unmerged_paths(output_dir) and not (output_dir / ".git" / "MERGE_HEAD").exists()
 
 
+
+def _paths_in_tree(cwd: Path, ref: str) -> set[str]:
+    """Return paths present in a git tree-ish (empty on failure)."""
+    proc = subprocess.run(
+        ["git", "ls-tree", "-r", "--name-only", ref],
+        cwd=str(cwd),
+        capture_output=True,
+        text=True,
+    )
+    if proc.returncode != 0:
+        return set()
+    return {ln.strip() for ln in (proc.stdout or "").splitlines() if ln.strip()}
+
+
+def _untracked_working_paths(cwd: Path) -> list[str]:
+    """Untracked paths including ignored (anything that can block merge overwrite)."""
+    proc = subprocess.run(
+        ["git", "ls-files", "--others", "-z"],
+        cwd=str(cwd),
+        capture_output=True,
+    )
+    if proc.returncode != 0:
+        return []
+    raw = proc.stdout or b""
+    out: list[str] = []
+    for part in raw.split(b"\0"):
+        if not part:
+            continue
+        try:
+            out.append(part.decode("utf-8"))
+        except UnicodeDecodeError:
+            out.append(part.decode("utf-8", errors="replace"))
+    return out
+
+
+def _parse_untracked_overwrite_paths(err_text: str) -> list[str]:
+    """Extract paths from git 'untracked ... would be overwritten by merge' stderr."""
+    if not err_text:
+        return []
+    low = err_text.lower()
+    if "untracked" not in low or "overwritten" not in low:
+        return []
+    paths: list[str] = []
+    seen: set[str] = set()
+    in_block = False
+    for line in err_text.splitlines():
+        s = line.strip()
+        if "untracked" in s.lower() and "overwritten" in s.lower():
+            in_block = True
+            continue
+        if in_block:
+            if not s or s.lower().startswith("please move") or s.lower().startswith("aborting"):
+                break
+            if s.startswith("error:") or s.startswith("fatal:"):
+                break
+            # git prints tab-indented paths; strip any leading noise
+            p = s.lstrip("\t ").strip()
+            if p and p not in seen and not p.endswith(":"):
+                seen.add(p)
+                paths.append(p)
+    return paths
+
+
+def _remove_working_path(output_dir: Path, rel: str) -> bool:
+    """Best-effort remove an untracked file/dir/symlink under output_dir. Return True if gone."""
+    if not rel or rel.startswith("/") or ".." in Path(rel).parts:
+        return False
+    target = (output_dir / rel).resolve()
+    try:
+        target.relative_to(output_dir.resolve())
+    except ValueError:
+        return False
+    if not target.exists() and not target.is_symlink():
+        return True
+    try:
+        if target.is_symlink() or target.is_file():
+            target.unlink()
+        elif target.is_dir():
+            shutil.rmtree(target, ignore_errors=False)
+        else:
+            target.unlink(missing_ok=True)
+    except OSError:
+        return not target.exists() and not target.is_symlink()
+    return not target.exists() and not target.is_symlink()
+
+
+def _clear_untracked_blocking_merge(
+    output_dir: Path,
+    ref: str,
+    *,
+    domain_id: str = "",
+    extra_paths: list[str] | None = None,
+) -> list[str]:
+    """Remove untracked/ignored paths that exist in ref (would block merge overwrite).
+
+    Prefer remove over stash: harness state files (.claude/spawn-gate-off,
+    .gsc/project-state.json, CLAUDE.md, SPEC/...) are regenerated; domain tip
+    wins via -X theirs. Fail-closed if a blocker cannot be removed.
+    """
+    incoming = _paths_in_tree(output_dir, ref)
+    candidates: list[str] = []
+    seen: set[str] = set()
+    for p in _untracked_working_paths(output_dir):
+        if p in incoming and p not in seen:
+            seen.add(p)
+            candidates.append(p)
+    for p in extra_paths or []:
+        p = (p or "").strip()
+        if p and p not in seen:
+            # Only clear if still untracked (not already in index as tracked)
+            tracked = subprocess.run(
+                ["git", "ls-files", "--error-unmatch", "--", p],
+                cwd=str(output_dir),
+                capture_output=True,
+                text=True,
+            )
+            if tracked.returncode != 0:
+                seen.add(p)
+                candidates.append(p)
+    if not candidates:
+        return []
+    cleared: list[str] = []
+    failed: list[str] = []
+    for p in candidates:
+        if _remove_working_path(output_dir, p):
+            cleared.append(p)
+        else:
+            failed.append(p)
+    print(
+        json.dumps(
+            {
+                "event": "domain_merge_clear_untracked",
+                "domain_id": domain_id,
+                "ref": ref,
+                "cleared": cleared[:40],
+                "failed": failed[:20],
+            },
+            ensure_ascii=False,
+        ),
+        flush=True,
+    )
+    if failed:
+        raise RuntimeError(
+            f"merge domain {domain_id or '?'} preflight: cannot clear untracked "
+            f"paths that would be overwritten: " + ",".join(failed[:40])
+        )
+    return cleared
+
+
 def merge_domain_worktree(
     output_dir: Path,
     domain_id: str,
@@ -2559,6 +2708,12 @@ def merge_domain_worktree(
     ``git merge --no-ff -X theirs`` so domain tip wins overlapping paths;
     on conflict, checkout --theirs + add + commit; fail-closed with conflict
     file list if still dirty. Never runs ``git merge HEAD`` inside the worktree.
+
+    Hardened (v5ak): before every merge attempt, clear untracked/ignored working
+    paths that exist in the incoming tree (and would be overwritten). Covers
+    harness state like ``.claude/spawn-gate-off``, ``.gsc/project-state.json``,
+    ``CLAUDE.md``, ``SPEC/...``. On residual untracked-overwrite stderr, clear
+    those paths and retry the same ref once. Fail-closed if clear is impossible.
 
     strategy: "theirs" (default/v5aa) or "ours" (supervisor-only alternate).
     """
@@ -2621,24 +2776,57 @@ def merge_domain_worktree(
                 f"merge domain {domain_id} failed: mainline index still unmerged after abort: "
                 + ",".join(_git_unmerged_paths(output_dir)[:40])
             )
-        merge = subprocess.run(
-            [
-                "git",
-                "merge",
-                "--no-ff",
-                "-X",
-                strat,
-                "-m",
-                merge_msg,
-                ref,
-            ],
-            cwd=str(output_dir),
-            capture_output=True,
-            text=True,
-        )
-        if merge.returncode == 0 and not _git_unmerged_paths(output_dir):
-            merged_ok = True
+        # v5ak: clear untracked/ignored paths that incoming tree would overwrite.
+        _clear_untracked_blocking_merge(output_dir, ref, domain_id=domain_id)
+        merge = None
+        for untracked_round in range(2):
+            merge = subprocess.run(
+                [
+                    "git",
+                    "merge",
+                    "--no-ff",
+                    "-X",
+                    strat,
+                    "-m",
+                    merge_msg,
+                    ref,
+                ],
+                cwd=str(output_dir),
+                capture_output=True,
+                text=True,
+            )
+            if merge.returncode == 0 and not _git_unmerged_paths(output_dir):
+                merged_ok = True
+                break
+            err_blob = ((merge.stderr or "") + "\n" + (merge.stdout or "")).strip()
+            overwrite_paths = _parse_untracked_overwrite_paths(err_blob)
+            if overwrite_paths and untracked_round == 0:
+                # Reactive clear + one same-ref retry (preflight may have missed a path).
+                _abort_merge_and_clean_index(output_dir)
+                _clear_untracked_blocking_merge(
+                    output_dir,
+                    ref,
+                    domain_id=domain_id,
+                    extra_paths=overwrite_paths,
+                )
+                print(
+                    json.dumps(
+                        {
+                            "event": "domain_merge_untracked_overwrite_retry",
+                            "domain_id": domain_id,
+                            "ref": ref,
+                            "paths": overwrite_paths[:40],
+                            "attempt_index": i,
+                        },
+                        ensure_ascii=False,
+                    ),
+                    flush=True,
+                )
+                continue
             break
+        if merged_ok:
+            break
+        assert merge is not None
         # Conflict or soft failure: try to resolve with chosen strategy.
         if _git_unmerged_paths(output_dir) or (output_dir / ".git" / "MERGE_HEAD").exists():
             resolver = (
@@ -4286,6 +4474,7 @@ def main() -> int:
                     "v5y_govern_stop_thrash_accept_green_deny",
                     "v5z_wave_domain_worktree_dag_central_batch_test",
                     "v5aa_merge_domain_worktree_abort_theirs",
+                    "v5ak_merge_domain_worktree_clear_untracked",
                     "v5ac_root_cure_write_skeleton_batch_repair",
                     "v5ac_soft_accept_requires_in_attempt_write",
                     "v5ac_batch_test_vitest_feed_implement_repair",
